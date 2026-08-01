@@ -18,3 +18,10 @@
 14. 不允许环境变量开启签名、广播、钱包或 Live 能力后继续启动。
 15. 不自动启动长期进程，不终止旧进程，不修改 launchd。
 16. BINANCE_WEB3_API_AUDIT.md 缺失时，不得根据历史字段名称猜测 Binance API 能力。
+17. 不把 Binance Web3 官方 schema fixture 当作真实网络 capture；必须标记 fixture 来源和网络探测状态。
+18. 不把 Binance Meme Rush 的 `createTime` 或 `migrateTime` 在官方未确认单位时当作可计算 token age。
+19. 不把 Binance 的 24h `countBuy`/`countSell` 当作 15 秒买卖比，不把 `holders` 当作 15 秒独立买家。
+20. 不把 Token Dynamic 或 Kline 指示性数据当作可执行买卖报价、路由或 price impact。
+21. 不让 Smart Money 信号触发 Paper 入场；它只能写入独立 Shadow 观察结果。
+22. Binance Web3 client 必须有有限超时、重试、响应大小上限和安全错误输出；禁止无界重试。
+23. 本地网络探测若为 connect timeout，只能记录为 blocked/unavailable，不得用成功响应替代。

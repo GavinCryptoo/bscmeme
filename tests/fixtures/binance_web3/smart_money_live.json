@@ -1,0 +1,32 @@
+{
+  "code": "000000",
+  "success": true,
+  "data": [
+    {
+      "signalId": 42090,
+      "chainId": "CT_501",
+      "contractAddress": "FUq3fLVDLuVP5RNTUVZnumvzK71ArveTsAmpmrEpump",
+      "ticker": "KONEKO",
+      "direction": "buy",
+      "signalTriggerTime": 1785556310000,
+      "alertPrice": "0.000051674222103593",
+      "alertMarketCap": "51085.491951233548759864",
+      "currentPrice": "0.000002027107364849987897093944992095",
+      "currentMarketCap": "1973.7250320974142388754431206578230127129820",
+      "highestPrice": "0.000073303000000000",
+      "highestPriceTime": 1785556405000,
+      "maxGain": "0.4186",
+      "exitRate": 68,
+      "smartMoneyCount": 3,
+      "signalCount": 1,
+      "status": "outDecline",
+      "smartSignalType": "SMART_KOL",
+      "launchPlatform": "Pumpfun",
+      "timeFrame": 85000,
+      "tokenDecimals": 6,
+      "isAlpha": false,
+      "isExclusiveLaunchpad": false,
+      "totalTokenValue": "1387.959250110223227435"
+    }
+  ]
+}

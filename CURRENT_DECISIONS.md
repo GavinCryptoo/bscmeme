@@ -1,6 +1,6 @@
 # CURRENT_DECISIONS.md
 
-版本：0.1.0  
+版本：0.2.0
 状态：冻结，作为当前实现最高优先级
 
 优先级顺序：
@@ -21,6 +21,7 @@
 - 当前工作区按全新项目重建
 - 不恢复历史 V2、V2.1、V2.2、V4 为可运行策略
 - 只建立一个新的基线策略
+- 当前实现阶段为阶段 3：Binance Web3 官方只读适配；本阶段不进入 Dashboard 实现
 
 ## 基线策略身份
 
@@ -91,12 +92,13 @@ large_loss_threshold_pct: -40
 
 ## 数据源与报价
 
-- 阶段 A 只使用 FixtureSignalSource、ReplaySignalSource、FixtureMarketDataAdapter、ReplayQuoteProvider。
-- 阶段 B 在检索官方文档和可靠开源实现、确认 API/鉴权/配额/字段后，才接入真实 Solana RPC/WSS、Jupiter 只读报价和 Pump/PumpSwap 适配器。
-- RPC/WSS Provider 只能通过环境变量配置。
-- Bitget 只能作为 aggregated_market_shadow，不触发 Paper、不触发退出、不参加原生 Provider 排名。
-- Jupiter 只允许只读报价，不实现 Execute、签名或广播。
-- 无有效报价、报价过期、无路由或无流动性时不得模拟成交。
+- Fixture/Replay 仍是默认数据源和确定性测试事实来源；`DATA_SOURCE=fixture` 为默认值。
+- 阶段 3 允许 Binance Web3 官方只读接口：Solana `CT_501` 的 Meme Rush、Smart Money、Token Dynamic 和 Kline。
+- Binance Web3 当前冻结为公开 `auth_mode=none`；适配器不读取或发送钱包、Jupiter、API Key、Cookie、Session 或签名材料。
+- Binance Smart Money 只作为 Shadow 观察信号，`trigger_entry=false`，不得触发 Paper 入场或退出。
+- Meme Rush 的 `createTime`/`migrateTime` 单位未被官方参考明确为毫秒，因此在可证实前保持 unavailable。
+- Binance 不能提供的 15 秒独立买家、15 秒买卖比、15 秒净买、可执行买卖路由、price impact 和可靠创建者卖出确认，不得用其它字段填补，也不得触发 Paper。
+- 本阶段不接入真实 Solana RPC/WSS、Jupiter QuoteProvider 或 Pump/PumpSwap；无有效可执行报价不得模拟成交。
 
 ## 报价、成交和成本
 
@@ -166,6 +168,12 @@ BROADCAST_ENABLED=false
 TELEGRAM_ENABLED=false
 
 MVP 代码中不得存在可到达的签名和广播实现；不得创建 PrivateKey、Keypair 或 Wallet 类实例；不得安装非必要的钱包执行依赖。
+
+## 阶段三当前授权范围
+
+允许：审计官方 Binance Web3 文档和官方开源实现；实现只读 HTTP client、字段归一化、错误分类、有限重试、Fixture/Replay fixture、历史 bootstrap、Smart Money Shadow-only 适配；执行单次或明确时限内的有限探测；更新审计和验收文档。
+
+禁止：任何写链、执行、钱包、私钥、签名、广播、Live、BSC、RPC/WSS、Jupiter、Dashboard HTTP 服务、长期轮询 runner、Telegram 发送和任何未在官方资料确认的字段或 endpoint。
 
 ## 阶段 0 授权范围
 

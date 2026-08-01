@@ -1,0 +1,18 @@
+{
+  "code": "000000",
+  "data": {
+    "price": "1.25",
+    "nativeTokenPrice": "0.008",
+    "volume5m": "20.5",
+    "volume5mBuy": "16.0",
+    "volume5mSell": "4.5",
+    "volume5mNetBuy": "11.5",
+    "volume5mBinance": "0",
+    "volume5mNetBinance": "0",
+    "volume24h": "1000",
+    "volume24hBuy": "600",
+    "volume24hSell": "400",
+    "liquidity": "5000",
+    "holders": 99
+  }
+}

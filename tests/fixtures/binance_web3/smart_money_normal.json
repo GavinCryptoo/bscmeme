@@ -1,0 +1,20 @@
+{
+  "code": "000000",
+  "data": [
+    {
+      "signalId": "smart-fixture-1",
+      "chainId": "CT_501",
+      "contractAddress": "MintFixtureA",
+      "ticker": "FIXA",
+      "direction": "buy",
+      "signalTriggerTime": 1785557000123,
+      "alertPrice": "0.00001",
+      "currentPrice": "0.000012",
+      "currentMarketCap": "12000",
+      "maxGain": "0.25",
+      "exitRate": 10,
+      "smartMoneyCount": 5,
+      "status": "valid"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 # IMPLEMENTATION_PLAN.md
 
-当前阶段：阶段 2 / 基线策略冻结与 Paper/Shadow 完整生命周期  
-当前状态：执行中，完成后停止等待确认
+当前阶段：阶段 3 / Binance Web3 官方只读数据源接入
+当前状态：执行中，完成后停止，不进入 Dashboard 或真实执行接入
 
 ## 阶段 0：项目冻结与骨架
 
@@ -30,11 +30,6 @@
 
 当前阶段不启动 runner，不启动 Dashboard HTTP 服务，不连接真实网络。
 
-## 阶段 2：Dashboard
-
-- 实现只读 API 和 127.0.0.1:8788 Dashboard。
-- 展示运行状态、信号、候选、Paper 持仓、Shadow 持仓、交易、退出详情、Shadow 对比、延迟、数据源健康和版本信息。
-
 ## 阶段 2 当前完成范围
 
 - 基线策略评估和逐项过滤原因。
@@ -43,15 +38,18 @@
 - SQLite WAL 版本迁移、生命周期事件和重启恢复。
 - 确定性 ReplayRunner 和只读 LedgerQueries。
 
-BINANCE_WEB3_API_AUDIT.md 当前缺失，因此本阶段不冻结、不实现任何 Binance API-specific 字段或适配器；该项必须在真实数据源阶段补齐审计后处理。
+阶段二已经在本地 commit `2de0709` 完成，并标记 `phase-2-complete`。Dashboard HTTP 服务仍未启动，也不属于阶段三范围。
 
-当前阶段不启动 runner，不启动 Dashboard HTTP 服务，不连接真实网络。
+## 阶段 3：Binance Web3 官方只读适配
 
-## 阶段 3：真实只读数据源
+- 固化官方 endpoint、Host、Method、Solana chain ID、可确认字段、错误码和未确认字段。
+- 实现 `binance_web3` client、auth mode、models、normalizer、signal source、market data、Kline、Smart Money、rate limit 和 redaction。
+- `DATA_SOURCE` 支持 `fixture`、`replay`、`binance_web3`，默认 `fixture`。
+- 只做有限、可终止的单次或短时探测；不启动长期 runner，不启动 Dashboard。
+- Binance Smart Money 仅 Shadow；历史 bootstrap 只标记，不导入 Paper。
+- 用官方 schema 样例构造脱敏 fixture；若网络受阻，不伪造真实 live capture。
 
-- 先提交官方文档与可靠开源实现调查报告。
-- 确认 API、鉴权、配额、字段和错误语义后，再实现 Solana RPC/WSS、Jupiter QuoteProvider、Pump/PumpSwap 适配器。
-- Provider 全部由环境变量配置。
+阶段三验收：审计文档、字段覆盖、错误目录、有限探测报告、适配器单测、Phase 2 回归测试和本地 commit 均可审计；钱包、签名、广播、Live、RPC/WSS、Jupiter、BSC 和 Dashboard 均未进入。
 
 ## 阶段 4：观察、回放与评估
 

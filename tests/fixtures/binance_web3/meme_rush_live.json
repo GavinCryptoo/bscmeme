@@ -1,0 +1,43 @@
+{
+  "code": "000000",
+  "success": true,
+  "data": [
+    {
+      "chainId": "CT_501",
+      "contractAddress": "Er4q21XgvtaSRq3vpJYRzn2Vy64ezcVZ7XFfeNhZpump",
+      "symbol": "sol",
+      "name": "qualex",
+      "decimals": 6,
+      "price": "0.0000020649156980082115",
+      "priceChange": "0",
+      "marketCap": "2065.0087966316635477",
+      "liquidity": "24.355162438404214",
+      "volume": "23.797547717619",
+      "holders": 2,
+      "progress": "0.749671",
+      "count": 2,
+      "countBuy": 1,
+      "countSell": 1,
+      "devSellPercent": "0",
+      "devPosition": 1,
+      "migrateStatus": 0,
+      "createTime": 1785563759000,
+      "migrateTime": 0,
+      "bnHolders": 0,
+      "bnHoldingPercent": "0",
+      "bundlerHolders": 0,
+      "bundlerHoldingPercent": "0",
+      "holdersDevPercent": "0.8759183629596",
+      "holdersInsiderPercent": "0",
+      "holdersSniperPercent": "0.8759183629596",
+      "holdersTop10Percent": "0.8759183629596",
+      "kolHolders": 0,
+      "kolHoldingPercent": "0",
+      "proHolders": 0,
+      "proHoldingPercent": "0",
+      "sniperCount": 1,
+      "protocol": 1001,
+      "pairAnchorAddress": "So11111111111111111111111111111111111111111"
+    }
+  ]
+}

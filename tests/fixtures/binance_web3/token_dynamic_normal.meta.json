@@ -1,0 +1,8 @@
+{
+  "captured_at": null,
+  "fixture_kind": "official_schema_sample",
+  "endpoint_type": "token_dynamic",
+  "redacted": true,
+  "contains_credentials": false,
+  "network_probe_status": "blocked_in_local_environment"
+}

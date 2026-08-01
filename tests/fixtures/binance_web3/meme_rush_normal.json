@@ -1,0 +1,51 @@
+{
+  "code": "000000",
+  "data": [
+    {
+      "chainId": "CT_501",
+      "contractAddress": "MintFixtureA",
+      "symbol": "FIXA",
+      "name": "Fixture Alpha",
+      "decimals": 6,
+      "price": "0.0000123",
+      "priceChange": "4.2",
+      "marketCap": "12345.67",
+      "liquidity": "6789.01",
+      "volume": "2345.67",
+      "holders": 123,
+      "progress": "42.5",
+      "protocol": 1001,
+      "count": 42,
+      "countBuy": 12,
+      "countSell": 8,
+      "devSellPercent": "0",
+      "devPosition": 1,
+      "migrateStatus": 0,
+      "createTime": 1785557000000,
+      "migrateTime": null
+    },
+    {
+      "chainId": "CT_501",
+      "contractAddress": "MintFixtureB",
+      "symbol": "FIXB",
+      "name": "Fixture Beta",
+      "decimals": 6,
+      "price": "0.001",
+      "priceChange": "-2.0",
+      "marketCap": "45678.90",
+      "liquidity": "9876.54",
+      "volume": "3456.78",
+      "holders": 456,
+      "progress": "100",
+      "protocol": 1004,
+      "count": 84,
+      "countBuy": 20,
+      "countSell": 22,
+      "devSellPercent": "10",
+      "devPosition": 2,
+      "migrateStatus": 1,
+      "createTime": 1785556000000,
+      "migrateTime": 1785557000000
+    }
+  ]
+}

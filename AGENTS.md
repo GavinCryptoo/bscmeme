@@ -21,4 +21,6 @@
 
 ## 当前阶段
 
-当前已获确认进入阶段 2：只允许基于已标准化 Fixture/Replay 输入的策略评估、Paper/Shadow 完整生命周期、持仓指标、SQLite 恢复和只读查询契约。禁止真实 Binance API、RPC/WSS/Jupiter、长期 runner、Dashboard 服务、钱包、签名、广播、Live 和 BSC 网络接入。
+当前已获确认进入阶段 3：只允许接入已审计的 Binance Web3 官方只读接口，范围限定 Solana `CT_501`、有限探测、Fixture/Replay 和 Paper/Shadow 的数据适配，不进入 Dashboard 实现。
+
+阶段 3 仍禁止真实 Solana RPC/WSS、Jupiter、Pump/PumpSwap、钱包、私钥、Keypair/PrivateKey/Wallet、签名、广播、链上写入、Live、BSC、Telegram 和长期 runner。Binance Web3 的当前公开接口鉴权模式冻结为 `none`；不得自行添加 API Key、Cookie、Session 或 Jupiter 凭据头。
