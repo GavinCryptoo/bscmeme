@@ -65,61 +65,65 @@ class BaselineStrategy:
         checks.append(
             self._check(
                 "token_age",
-                self.config.token_age_min_sec <= features.token_age_sec <= self.config.token_age_max_sec,
+                features.token_age_sec is not None
+                and self.config.token_age_min_sec <= features.token_age_sec <= self.config.token_age_max_sec,
                 features.token_age_sec,
                 f"{self.config.token_age_min_sec}..{self.config.token_age_max_sec}",
-                "token_age_out_of_range",
-                "币龄不在 5–120 秒范围",
+                "token_age_unavailable" if features.token_age_sec is None else "token_age_out_of_range",
+                "币龄不可用" if features.token_age_sec is None else "币龄不在 5–120 秒范围",
             )
         )
         checks.append(
             self._check(
                 "unique_buyers_15s",
-                features.unique_buyers_15s >= self.config.unique_buyers_15s_min,
+                features.unique_buyers_15s is not None
+                and features.unique_buyers_15s >= self.config.unique_buyers_15s_min,
                 features.unique_buyers_15s,
                 self.config.unique_buyers_15s_min,
-                "unique_buyers_below_min",
-                "15 秒独立买家数不足",
+                "unique_buyers_unavailable" if features.unique_buyers_15s is None else "unique_buyers_below_min",
+                "15 秒独立买家数不可用" if features.unique_buyers_15s is None else "15 秒独立买家数不足",
             )
         )
         checks.append(
             self._check(
                 "buy_sell_count_ratio_15s",
-                features.buy_sell_count_ratio_15s >= self.config.buy_sell_count_ratio_15s_min,
+                features.buy_sell_count_ratio_15s is not None
+                and features.buy_sell_count_ratio_15s >= self.config.buy_sell_count_ratio_15s_min,
                 features.buy_sell_count_ratio_15s,
                 self.config.buy_sell_count_ratio_15s_min,
-                "buy_sell_ratio_below_min",
-                "15 秒买卖笔数比不足",
+                "buy_sell_ratio_unavailable" if features.buy_sell_count_ratio_15s is None else "buy_sell_ratio_below_min",
+                "15 秒买卖笔数比不可用" if features.buy_sell_count_ratio_15s is None else "15 秒买卖笔数比不足",
             )
         )
         checks.append(
             self._check(
                 "net_buy_15s",
-                features.net_buy_15s > ZERO,
+                features.net_buy_15s is not None and features.net_buy_15s > ZERO,
                 features.net_buy_15s,
                 "> 0",
-                "net_buy_not_positive",
-                "15 秒净买入不为正",
+                "net_buy_unavailable" if features.net_buy_15s is None else "net_buy_not_positive",
+                "15 秒净买入不可用" if features.net_buy_15s is None else "15 秒净买入不为正",
             )
         )
         checks.append(
             self._check(
                 "two_non_negative_flow_windows",
-                all(features.flow_windows_non_negative),
+                all(value is True for value in features.flow_windows_non_negative),
                 features.flow_windows_non_negative,
                 (True, True),
-                "flow_window_negative",
-                "两个短窗口中存在非正净流量",
+                "flow_window_unavailable" if any(value is None for value in features.flow_windows_non_negative) else "flow_window_negative",
+                "短窗口净流量不可用" if any(value is None for value in features.flow_windows_non_negative) else "两个短窗口中存在非正净流量",
             )
         )
         checks.append(
             self._check(
                 "creator_not_confirmed_sold",
-                features.creator_confirmed_sold is self.config.creator_confirmed_sold_at_entry,
+                features.creator_confirmed_sold is not None
+                and features.creator_confirmed_sold is self.config.creator_confirmed_sold_at_entry,
                 features.creator_confirmed_sold,
                 self.config.creator_confirmed_sold_at_entry,
-                "creator_confirmed_sold",
-                "入场时已确认创建者卖出",
+                "creator_sell_unavailable" if features.creator_confirmed_sold is None else "creator_confirmed_sold",
+                "创建者卖出状态不可用" if features.creator_confirmed_sold is None else "入场时已确认创建者卖出",
             )
         )
         checks.append(

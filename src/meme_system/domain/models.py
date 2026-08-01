@@ -108,12 +108,12 @@ class RuleCheck:
 
 @dataclass(frozen=True)
 class EntryFeatures:
-    token_age_sec: int
-    unique_buyers_15s: int
-    buy_sell_count_ratio_15s: Decimal
-    net_buy_15s: Decimal
-    flow_windows_non_negative: tuple[bool, bool]
-    creator_confirmed_sold: bool
+    token_age_sec: int | None
+    unique_buyers_15s: int | None
+    buy_sell_count_ratio_15s: Decimal | None
+    net_buy_15s: Decimal | None
+    flow_windows_non_negative: tuple[bool | None, bool | None]
+    creator_confirmed_sold: bool | None
     buy_quote: "ExecutableQuote | None"
     sell_quote: "ExecutableQuote | None"
     evaluated_at: datetime

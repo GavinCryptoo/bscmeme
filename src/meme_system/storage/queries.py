@@ -120,6 +120,29 @@ class LedgerQueries:
             decoded.append(row)
         return tuple(decoded)
 
+    def runtime_state(self) -> tuple[dict[str, object], ...]:
+        return self._rows(
+            "SELECT * FROM runtime_state WHERE mode = ? ORDER BY updated_at DESC",
+            (self.mode,),
+        )
+
+    def health_events(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        self._validate_limit(limit)
+        rows = self._rows(
+            "SELECT * FROM health_events WHERE mode = ? ORDER BY recorded_at DESC, health_id DESC LIMIT ?",
+            (self.mode, limit),
+        )
+        for row in rows:
+            row["details"] = _decode_json(row.pop("details_json", None))
+        return rows
+
+    def latency_events(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        self._validate_limit(limit)
+        return self._rows(
+            "SELECT * FROM latency_events WHERE mode = ? ORDER BY recorded_at DESC, latency_id DESC LIMIT ?",
+            (self.mode, limit),
+        )
+
     @staticmethod
     def _validate_limit(limit: int) -> None:
         if not isinstance(limit, int) or not 1 <= limit <= 1000:

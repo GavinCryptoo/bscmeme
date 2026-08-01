@@ -4,7 +4,7 @@
 
 - 默认只允许 Paper；Shadow 必须独立运行。
 - Live、钱包、私钥读取、Keypair/PrivateKey/Wallet 实例、签名、广播和链上写入均不属于当前项目。
-- PAPER_ONLY=true、LIVE_TRADING=false、WALLET_ENABLED=false、SIGNING_ENABLED=false、BROADCAST_ENABLED=false、TELEGRAM_ENABLED=false 必须强制校验。
+- PAPER_ONLY=true、LIVE_TRADING=false、WALLET_ENABLED=false、SIGNING_ENABLED=false、BROADCAST_ENABLED=false 必须强制校验；TELEGRAM_ENABLED 默认 false，显式开启时也只能用于 Paper/Shadow 控制。
 - 不安装非必要的钱包或交易执行依赖。
 - 不输出密钥、Token、API Secret 或私钥内容。
 
@@ -21,6 +21,6 @@
 
 ## 当前阶段
 
-当前已获确认进入阶段 3：只允许接入已审计的 Binance Web3 官方只读接口，范围限定 Solana `CT_501`、有限探测、Fixture/Replay 和 Paper/Shadow 的数据适配，不进入 Dashboard 实现。
+当前已获确认进入阶段 4 Gate A：允许已审计 Binance Web3、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 的只读接入，以及实时 Paper/Shadow、Dashboard、健康检查和有限 Telegram Paper/Shadow 控制。
 
-阶段 3 仍禁止真实 Solana RPC/WSS、Jupiter、Pump/PumpSwap、钱包、私钥、Keypair/PrivateKey/Wallet、签名、广播、链上写入、Live、BSC、Telegram 和长期 runner。Binance Web3 的当前公开接口鉴权模式冻结为 `none`；不得自行添加 API Key、Cookie、Session 或 Jupiter 凭据头。
+阶段 4 仍禁止 Jupiter 执行接口、钱包、私钥、Keypair/PrivateKey/Wallet、签名、广播、链上写入、Live、BSC 和自动 Gate B。Binance Web3 的当前公开接口鉴权模式冻结为 `none`；不得自行添加 API Key、Cookie 或 Session。

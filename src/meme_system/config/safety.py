@@ -50,12 +50,10 @@ class SafetyConfig:
             "WALLET_ENABLED": not self.wallet_enabled,
             "SIGNING_ENABLED": not self.signing_enabled,
             "BROADCAST_ENABLED": not self.broadcast_enabled,
-            "TELEGRAM_ENABLED": not self.telegram_enabled,
         }
         invalid = [name for name, safe in required_safe_values.items() if not safe]
         if invalid:
             raise SafetyViolation(
-                "Stage 0 permits only Paper/Shadow with all dangerous capabilities disabled: "
+                "Gate A permits only Paper/Shadow with all execution capabilities disabled: "
                 + ", ".join(invalid)
             )
-

@@ -1,15 +1,15 @@
 # ARCHITECTURE.md
 
-## 阶段 3 目标
+## 阶段 4 Gate A 目标
 
-阶段 3 在已完成的 Fixture/Replay、Paper/Shadow 生命周期之上增加 Binance Web3 官方只读适配。真实执行能力、Dashboard HTTP 服务和其它链数据源仍延后。
+阶段 4 Gate A 在已完成的 Fixture/Replay、Paper/Shadow 生命周期和 Binance Web3 官方只读适配之上增加实时只读数据、Dashboard 和运维闭环。真实执行能力仍延后。
 
 ## 目标分层
 
 Fixture / Replay / Binance Web3 SignalSource
         |
         v
-MarketData / QuoteProvider
+Binance Dynamic + Solana RPC/WSS + Pump/PumpSwap state + Jupiter Quote GET
         |
         v
 Domain Models -> Strategy Registry -> Candidate Ledger
@@ -21,16 +21,16 @@ Domain Models -> Strategy Registry -> Candidate Ledger
              +--> Shadow Lifecycle -> Shadow runtime.db
         |
         v
-JSONL Audit / CSV Export / Dashboard Read Model
+SQLite WAL / JSONL Audit / CSV-Parquet Export / Dashboard / Telegram safe controls
 
 ## 安全边界
 
 - 当前仅允许 Paper + Shadow。
 - SafetyConfig.validate() 在应用启动前拒绝任何危险开关。
-- 阶段 3 不包含签名、广播、钱包或链上写入模块。
+- 阶段 4 不包含签名、广播、钱包或链上写入模块。
 - Binance Web3 client 只允许官方公开只读 endpoint，当前鉴权模式为 `none`。
 - Smart Money adapter 是 Shadow-only，不能改变 Paper 入口或退出。
-- 真实 RPC/WSS、Jupiter、Pump/PumpSwap 和 BSC 适配器不属于本阶段。
+- Jupiter 仅 Quote GET；Pump/PumpSwap 仅状态读取；BSC 仍只有未来 Protocol。
 
 ## 数据隔离
 
@@ -45,7 +45,7 @@ Shadow：data/solana/shadow/runtime.db
 - MarketDataAdapter：提供只读市场快照。
 - QuoteProvider：提供可执行报价，不等于执行。
 - BscAdapterProtocol：仅定义未来链适配边界，不连接 BSC。
-- LedgerQueries：为未来 Dashboard 提供只读、最新优先的数据结构，不启动 HTTP 服务。
+- LedgerQueries：为 Dashboard 提供只读、最新优先的数据结构；Dashboard 的唯一写操作是安全暂停标志。
 
 ## Binance Web3 边界
 
@@ -54,3 +54,15 @@ Shadow：data/solana/shadow/runtime.db
 - `BinanceWeb3MarketDataAdapter`：Token Dynamic 指示性市场字段，不声称可执行报价。
 - `BinanceWeb3KlineAdapter`：Kline candles，只读历史/短窗数据。
 - `run_source_probe.py`：一次请求或显式上限内的有限探测，不写数据库。
+
+## Gate A 运行组件
+
+- `run_realtime.py` / `run_paper.py` / `run_shadow.py`：显式启动、可停止、单实例锁。
+- `run_dashboard.py`：默认 `127.0.0.1:8788`；GET 查询与仅 Paper/Shadow 暂停控制。
+- `src/meme_system/realtime.py`：一周期协调与确定性引擎复用。
+- `src/meme_system/dashboard_server.py`：最新优先 LedgerQueries API。
+- `src/meme_system/telegram_control.py`：默认关闭的 Paper/Shadow 控制。
+
+## 禁止自动进入 Gate B
+
+Gate A 完成后停止；不创建 Live Engine、Wallet、PrivateKey、Keypair、Signer、交易构建或广播路径。

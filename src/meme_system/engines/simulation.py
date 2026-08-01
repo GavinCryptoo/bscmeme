@@ -57,10 +57,22 @@ class DeterministicSimulation:
         features: EntryFeatures,
         candidate_id: str,
         position_id: str,
+        block_reason: str | None = None,
     ) -> EntryResult:
         decision = self.strategy.evaluate_entry(features)
         checks = list(decision.checks)
-        if decision.accepted:
+        if block_reason is not None:
+            checks.append(
+                self._check(
+                    "runtime_entry_gate",
+                    False,
+                    block_reason,
+                    "entry_enabled",
+                    block_reason,
+                    "运行控制已暂停新入场",
+                )
+            )
+        if decision.accepted and block_reason is None:
             checks.extend(self._lifecycle_checks(signal, features))
         accepted = all(check.passed for check in checks)
         final_decision = EntryDecision(

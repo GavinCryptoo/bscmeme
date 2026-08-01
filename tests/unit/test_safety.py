@@ -21,7 +21,6 @@ class SafetyConfigTests(unittest.TestCase):
             "WALLET_ENABLED",
             "SIGNING_ENABLED",
             "BROADCAST_ENABLED",
-            "TELEGRAM_ENABLED",
         ):
             with self.subTest(name=name):
                 with self.assertRaises(SafetyViolation):
@@ -31,7 +30,10 @@ class SafetyConfigTests(unittest.TestCase):
         with self.assertRaises(SafetyViolation):
             SafetyConfig.from_mapping({"PAPER_ONLY": "false"})
 
+    def test_telegram_can_be_enabled_for_gate_a_controls(self) -> None:
+        config = SafetyConfig.from_mapping({"TELEGRAM_ENABLED": "true"})
+        self.assertTrue(config.telegram_enabled)
+
     def test_invalid_boolean_fails_closed(self) -> None:
         with self.assertRaises(SafetyViolation):
             SafetyConfig.from_mapping({"LIVE_TRADING": "yes"})
-

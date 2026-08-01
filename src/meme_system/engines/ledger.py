@@ -168,6 +168,17 @@ class SimulationLedger:
         )
         self.connection.commit()
 
+    def candidate_exists(self, candidate_id: str) -> bool:
+        if any(candidate.candidate_id == candidate_id for candidate in self.candidates):
+            return True
+        if self.connection is None:
+            return False
+        row = self.connection.execute(
+            "SELECT 1 FROM candidates WHERE candidate_id = ? LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        return row is not None
+
     def open_position(self, position: VirtualPosition) -> None:
         if position.position_id in self.positions or position.position_id in self.closed_positions:
             raise ValueError("position_id already exists")

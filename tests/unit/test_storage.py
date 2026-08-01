@@ -30,7 +30,7 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2])
+            self.assertEqual(versions, [1, 2, 3])
             connection.close()
 
     def test_paper_and_shadow_paths_are_distinct(self) -> None:

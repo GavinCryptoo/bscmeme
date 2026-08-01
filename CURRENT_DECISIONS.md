@@ -15,13 +15,14 @@
 - 第一阶段链：Solana
 - 第一阶段模式：Paper + Shadow
 - Dashboard：实现，默认 127.0.0.1:8788
-- Telegram：不进入 MVP，只保留空接口
+- Telegram：Gate A 默认关闭；开启后仅允许 Paper/Shadow 通知与暂停/恢复新入场
 - Live、钱包、私钥读取、签名、广播、链上写入：不实现
 - BSC：本阶段不实现，只保留最小 Protocol 接口
 - 当前工作区按全新项目重建
 - 不恢复历史 V2、V2.1、V2.2、V4 为可运行策略
 - 只建立一个新的基线策略
-- 当前实现阶段为阶段 3：Binance Web3 官方只读适配；本阶段不进入 Dashboard 实现
+- 当前实现阶段为阶段 4 Gate A：实时只读数据源、Paper/Shadow、Dashboard 与运行运维
+- Gate A 完成后必须停止，等待单独的 Gate B Live 授权
 
 ## 基线策略身份
 
@@ -93,12 +94,13 @@ large_loss_threshold_pct: -40
 ## 数据源与报价
 
 - Fixture/Replay 仍是默认数据源和确定性测试事实来源；`DATA_SOURCE=fixture` 为默认值。
-- 阶段 3 允许 Binance Web3 官方只读接口：Solana `CT_501` 的 Meme Rush、Smart Money、Token Dynamic 和 Kline。
+- 阶段 4 Gate A 允许 Binance Web3 官方只读接口：Solana `CT_501` 的 Meme Rush、Smart Money、Token Dynamic 和 Kline；允许 Solana 主网 RPC/WSS 只读订阅、Pump/PumpSwap 状态读取，以及 Jupiter 当前官方 Quote GET。
 - Binance Web3 当前冻结为公开 `auth_mode=none`；适配器不读取或发送钱包、Jupiter、API Key、Cookie、Session 或签名材料。
 - Binance Smart Money 只作为 Shadow 观察信号，`trigger_entry=false`，不得触发 Paper 入场或退出。
 - Meme Rush 的 `createTime`/`migrateTime` 单位未被官方参考明确为毫秒，因此在可证实前保持 unavailable。
 - Binance 不能提供的 15 秒独立买家、15 秒买卖比、15 秒净买、可执行买卖路由、price impact 和可靠创建者卖出确认，不得用其它字段填补，也不得触发 Paper。
-- 本阶段不接入真实 Solana RPC/WSS、Jupiter QuoteProvider 或 Pump/PumpSwap；无有效可执行报价不得模拟成交。
+- Jupiter 只允许 Quote endpoint；没有 `/swap`、`/swap-instructions`、构建交易、签名或发送交易。`priceImpactPct` 的单位未在当前官方接口契约中冻结，默认保持 unavailable，不得自行换算。
+- 无有效可执行报价不得模拟成交；Token Dynamic、Kline、Pump 曲线指示价不得冒充 Jupiter 可执行报价。
 
 ## 报价、成交和成本
 
@@ -128,7 +130,7 @@ large_loss_threshold_pct: -40
 ## Dashboard 与持久化
 
 - 默认绑定 127.0.0.1:8788。
-- MVP 只读、无认证，不提供 Live、钱包、签名或广播入口。
+- Dashboard 默认本地只读；允许的写操作仅是 Paper/Shadow 新入场暂停/恢复，不提供 Live、钱包、签名或广播入口。
 - Paper 和 Shadow 必须明显分区，列表默认最新在上。
 - SQLite WAL 是运行事实来源。
 - JSONL 是不可变审计日志；CSV 仅导出；Parquet 延后。
@@ -167,13 +169,19 @@ SIGNING_ENABLED=false
 BROADCAST_ENABLED=false
 TELEGRAM_ENABLED=false
 
+Gate A 默认保持 `TELEGRAM_ENABLED=false`；如需开启，只能在以上 Paper/Shadow 执行安全开关不变时用于通知和暂停/恢复新入场。
+
 MVP 代码中不得存在可到达的签名和广播实现；不得创建 PrivateKey、Keypair 或 Wallet 类实例；不得安装非必要的钱包执行依赖。
 
-## 阶段三当前授权范围
+## 阶段四 Gate A 当前授权范围
 
-允许：审计官方 Binance Web3 文档和官方开源实现；实现只读 HTTP client、字段归一化、错误分类、有限重试、Fixture/Replay fixture、历史 bootstrap、Smart Money Shadow-only 适配；执行单次或明确时限内的有限探测；更新审计和验收文档。
+允许：实现已审计的 Binance Web3、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 只读适配；实现实时 Paper/Shadow 协调器、持仓生命周期、重启恢复、Dashboard、Telegram Paper/Shadow 控制、健康、锁、导出和文档；执行有限、可终止的只读探测。
 
-禁止：任何写链、执行、钱包、私钥、签名、广播、Live、BSC、RPC/WSS、Jupiter、Dashboard HTTP 服务、长期轮询 runner、Telegram 发送和任何未在官方资料确认的字段或 endpoint。
+禁止：任何写链、Jupiter 执行接口、交易构建、钱包、私钥、签名、广播、Live、BSC、未确认字段或 endpoint、自动进入 Gate B。
+
+## Gate B 单独授权边界
+
+Gate B Live 只有在用户单独明确授权后才可审计和设计；在此之前不得创建 Live Engine、钱包适配、签名器、交易构建器或广播路径。
 
 ## 阶段 0 授权范围
 
