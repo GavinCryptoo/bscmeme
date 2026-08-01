@@ -1,0 +1,2 @@
+"""Versioned deterministic strategy definitions."""
+

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meme0801"
+version = "0.1.0"
+description = "Solana Paper and Shadow strategy system skeleton"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+meme_system = ["storage/migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
