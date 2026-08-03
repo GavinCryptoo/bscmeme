@@ -1096,6 +1096,7 @@ class DeterministicSimulation:
         source = {
             "binance_indicative": "binance_indicative",
             "pool_wss_indicative": "pool_wss",
+            "pump_bonding_curve_quote": "pump_bonding_curve_quote",
             "indicative_timeout_fallback": "timeout_fallback",
             "bsc_executable_quote": quote.quote_source or quote.provider,
         }.get(pricing_mode, "jupiter_quote" if executable_quote else pricing_mode)

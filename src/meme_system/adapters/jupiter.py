@@ -277,7 +277,14 @@ class JupiterReadOnlyQuoteProvider:
                 request_times.append(datetime.now(timezone.utc))
                 status, body, _headers = self.transport(
                     self.url + "?" + urlencode(params),
-                    {"x-api-key": self.api_key, "Accept": "application/json"},
+                    {
+                        "x-api-key": self.api_key,
+                        "Accept": "application/json",
+                        # Jupiter's gateway rejects Python's implicit transport
+                        # signature. This identifies the bounded read-only client;
+                        # it does not alter the V2 endpoint or request semantics.
+                        "User-Agent": "meme0801-readonly/1.0",
+                    },
                     self.timeout_sec,
                 )
                 request_statuses.append(status)
@@ -326,6 +333,7 @@ class JupiterReadOnlyQuoteProvider:
                 latency_ms=int((time.monotonic() - started) * 1000),
                 executable_style=route_available,
                 confidence="verified" if route_available else "unavailable",
+                quote_source="jupiter_quote" if route_available else None,
                 error_class=None if route_available else "jupiter_no_route",
                 raw_response_hash=_payload_hash(parsed),
                 request_times=tuple(request_times),

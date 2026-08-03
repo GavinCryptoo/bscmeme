@@ -805,8 +805,10 @@ class Phase4Tests(unittest.TestCase):
         )
         quote = provider.quote_buy("MintA", __import__("decimal").Decimal("0.001"))
         self.assertEqual(quote.provider, "jupiter")
+        self.assertEqual(quote.quote_source, "jupiter_quote")
         self.assertIsNone(quote.price_impact_pct)
         self.assertEqual(quote.route, ("Test AMM",))
+        self.assertEqual(calls[0][1]["User-Agent"], "meme0801-readonly/1.0")
         self.assertTrue(provider.safe_status()["credentials_configured"])
         self.assertNotIn("redacted-test-key", json.dumps(provider.safe_status()))
 

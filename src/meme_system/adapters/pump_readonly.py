@@ -13,7 +13,7 @@ import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Mapping
+from typing import Callable, Mapping
 
 from meme_system.adapters.protocols import ExecutableQuote
 from meme_system.adapters.solana_readonly import SolanaReadOnlyError, SolanaRpcClient
@@ -149,19 +149,42 @@ class PumpProtocolReadOnlyQuoteProvider:
     executable-style provider after migration.
     """
 
-    def __init__(self, state_adapter: PumpReadOnlyAdapter, *, token_decimals: Mapping[str, int] | None = None, fee_bps: int = 100) -> None:
+    def __init__(
+        self,
+        state_adapter: PumpReadOnlyAdapter,
+        *,
+        token_decimals: Mapping[str, int] | None = None,
+        decimals_resolver: Callable[[str], int | None] | None = None,
+        fee_bps: int = 100,
+    ) -> None:
         self.state_adapter = state_adapter
         self.token_decimals = dict(token_decimals or {})
+        self.decimals_resolver = decimals_resolver
         self.fee_bps = max(0, min(10_000, fee_bps))
 
     def quote(self, mint: str, side: str, input_quantity: Decimal) -> ExecutableQuote:
         state = self.state_adapter.inspect(mint)
+        return self.quote_state(state, side, input_quantity)
+
+    def quote_state(
+        self,
+        state: PumpMarketState,
+        side: str,
+        input_quantity: Decimal,
+    ) -> ExecutableQuote:
+        """Quote the exact state already inspected by the routing decision."""
+        mint = state.mint
         if state.state != "PUMP_BONDING_CURVE" or state.bonding_curve is None:
             return _unavailable_quote(mint, side, input_quantity, "pump_route_unavailable")
         curve = state.bonding_curve
         if curve.virtual_token_reserves is None or curve.virtual_sol_reserves is None:
             return _unavailable_quote(mint, side, input_quantity, "pump_curve_reserves_unavailable")
         decimals = self.token_decimals.get(mint)
+        if decimals is None and self.decimals_resolver is not None:
+            try:
+                decimals = self.decimals_resolver(mint)
+            except Exception:
+                decimals = None
         if decimals is None:
             return _unavailable_quote(mint, side, input_quantity, "pump_token_decimals_missing")
         fee_factor = Decimal(10_000 - self.fee_bps) / Decimal(10_000)
@@ -190,14 +213,15 @@ class PumpProtocolReadOnlyQuoteProvider:
             price_impact_pct=None,
             quoted_at=now,
             age_ms=0,
-            provider="pump_protocol",
+            provider="pump_bonding_curve_quote",
             route=("pump_bonding_curve",),
             quote_context_slot=state.observed_slot,
             requested_at=now,
             received_at=now,
-            latency_ms=self.state_adapter.rpc.last_latency_ms,
+            latency_ms=getattr(getattr(self.state_adapter, "rpc", None), "last_latency_ms", None),
             executable_style=True,
             confidence="verified",
+            quote_source="pump_bonding_curve_quote",
         )
 
 

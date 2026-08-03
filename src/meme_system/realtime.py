@@ -28,6 +28,7 @@ from meme_system.adapters.bsc_wss import (
     normalize_bsc_address,
 )
 from meme_system.adapters.bsc_quote import BscReadOnlyQuoteProvider
+from meme_system.adapters.pump_readonly import PumpMarketState, PumpProtocolReadOnlyQuoteProvider
 from meme_system.adapters.binance_web3.errors import BinanceWeb3Error
 from meme_system.adapters.binance_web3.market_data import BinanceWeb3MarketDataAdapter
 from meme_system.adapters.binance_web3.models import BinanceMarketSnapshot, BinanceNormalizedSignal
@@ -313,6 +314,7 @@ class BinanceRealtimeFeatureProvider:
         bsc_executable_quote_enabled: bool = False,
         bsc_pool_resolver: BscPoolResolver | None = None,
         solana_price_monitor: SolanaPriceMonitor | None = None,
+        pump_quote_provider: PumpProtocolReadOnlyQuoteProvider | None = None,
     ) -> None:
         self.market_data = market_data
         self.quote_provider = quote_provider
@@ -324,6 +326,7 @@ class BinanceRealtimeFeatureProvider:
         self.bsc_executable_quote_enabled = bool(bsc_executable_quote_enabled)
         self.bsc_pool_resolver = bsc_pool_resolver
         self.solana_price_monitor = solana_price_monitor
+        self.pump_quote_provider = pump_quote_provider
         self._position_snapshots: dict[str, BinanceMarketSnapshot] = {}
         self._latest_market_snapshots: dict[str, BinanceMarketSnapshot] = {}
 
@@ -482,10 +485,31 @@ class BinanceRealtimeFeatureProvider:
             )
             if pricing_error is not None:
                 soft["pricing_error"] = pricing_error
-        elif self.quote_provider is not None:
-            buy_quote = self._quote(normalized.signal.mint, "buy", self.position_size_sol, quote_errors)
-            if buy_quote is not None and buy_quote.output_quantity > 0:
-                sell_quote = self._quote(normalized.signal.mint, "sell", buy_quote.output_quantity, quote_errors)
+        else:
+            pump_state = self._solana_market_state(normalized.signal.mint)
+            if pump_state is not None:
+                soft["trading_stage"] = pump_state.state
+            if (
+                pump_state is not None
+                and pump_state.state == "PUMP_BONDING_CURVE"
+                and self.pump_quote_provider is not None
+            ):
+                pricing_mode = "pump_bonding_curve_quote"
+                buy_quote = self.pump_quote_provider.quote_state(
+                    pump_state, "buy", self.position_size_sol
+                )
+                if buy_quote.output_quantity > 0:
+                    sell_quote = self.pump_quote_provider.quote_state(
+                        pump_state, "sell", buy_quote.output_quantity
+                    )
+                for quote in (buy_quote, sell_quote):
+                    if quote is not None and quote.error_class:
+                        quote_errors.append(quote.error_class)
+            elif self.quote_provider is not None:
+                pricing_mode = "jupiter_quote"
+                buy_quote = self._quote(normalized.signal.mint, "buy", self.position_size_sol, quote_errors)
+                if buy_quote is not None and buy_quote.output_quantity > 0:
+                    sell_quote = self._quote(normalized.signal.mint, "sell", buy_quote.output_quantity, quote_errors)
         if quote_errors:
             soft["quote_error_classes"] = tuple(sorted(set(quote_errors)))
 
@@ -565,7 +589,18 @@ class BinanceRealtimeFeatureProvider:
                 snapshot.observed_at,
                 snapshot.raw_response_hash,
             )
-        if self.quote_provider is None or position.active_quantity_token <= 0:
+        if position.active_quantity_token <= 0:
+            return None
+        pump_state = self._solana_market_state(position.mint)
+        if (
+            pump_state is not None
+            and pump_state.state == "PUMP_BONDING_CURVE"
+            and self.pump_quote_provider is not None
+        ):
+            return self.pump_quote_provider.quote_state(
+                pump_state, "sell", position.active_quantity_token
+            )
+        if self.quote_provider is None:
             return None
         try:
             priority_quote = getattr(self.quote_provider, "quote_position", None)
@@ -1002,6 +1037,14 @@ class BinanceRealtimeFeatureProvider:
             return quote
         except Exception as exc:
             errors.append(getattr(exc, "error_class", f"{side}_quote_error"))
+            return None
+
+    def _solana_market_state(self, mint: str) -> PumpMarketState | None:
+        if self.is_bsc or self.pump_quote_provider is None:
+            return None
+        try:
+            return self.pump_quote_provider.state_adapter.inspect(mint)
+        except Exception:
             return None
 
 

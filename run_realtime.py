@@ -28,7 +28,7 @@ from meme_system.adapters.binance_web3.client import BinanceWeb3Client
 from meme_system.adapters.binance_web3.market_data import BinanceWeb3MarketDataAdapter
 from meme_system.adapters.binance_web3.signal_source import BinanceWeb3SignalSource
 from meme_system.adapters.jupiter import JupiterReadOnlyQuoteProvider, TokenDecimalsCache
-from meme_system.adapters.pump_readonly import PumpReadOnlyAdapter
+from meme_system.adapters.pump_readonly import PumpProtocolReadOnlyQuoteProvider, PumpReadOnlyAdapter
 from meme_system.adapters.solana_readonly import SolanaRpcClient, SolanaWssMonitor
 from meme_system.adapters.solana_price import SolanaPriceMonitor
 from meme_system.config.data_source import DataSourceConfig
@@ -216,6 +216,14 @@ def main(argv: list[str] | None = None) -> int:
             if solana_rpc is not None and decimals_cache is not None
             else None
         )
+        pump_quote_provider = (
+            PumpProtocolReadOnlyQuoteProvider(
+                solana_price_monitor.pump_adapter,
+                decimals_resolver=decimals_cache.resolve,
+            )
+            if solana_price_monitor is not None and decimals_cache is not None
+            else None
+        )
         source = BinanceWeb3SignalSource(
             client,
             chain_id=chain_id,
@@ -237,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             bsc_executable_quote_enabled=bsc_executable_quote_enabled,
             bsc_pool_resolver=(BscPoolResolver.from_env() if args.chain == "bsc" else None),
             solana_price_monitor=solana_price_monitor,
+            pump_quote_provider=pump_quote_provider,
         )
         control = RuntimeControl(paths.live_control_file if args.mode == "live" else paths.control_file)
         telegram_config = TelegramConfig.from_env()
