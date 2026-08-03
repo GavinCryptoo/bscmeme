@@ -113,6 +113,8 @@ class VirtualPosition:
     symbol: str | None = None
     entry_price_snapshot: PriceSnapshot | None = None
     exit_price_snapshot: PriceSnapshot | None = None
+    # 0 = historical lifecycle; 1 = Solana atomic price snapshots.
+    price_snapshot_version: int = 0
     entry_holders: int | None = None
     entry_liquidity_usd: Decimal | None = None
     exit_holders: int | None = None

@@ -7,6 +7,8 @@ import sqlite3
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from meme_system.domain.naming import clean_token_name
+
 
 def _decode_json(value: str | None) -> Any:
     if value is None:
@@ -157,6 +159,13 @@ class LedgerQueries:
             (*params, limit),
         ))
         for row in rows:
+            row["entry_price_snapshot"] = _decode_json(row.pop("entry_price_snapshot_json", None))
+            row["exit_price_snapshot"] = _decode_json(row.pop("exit_price_snapshot_json", None))
+            row["price_snapshot_version"] = int(row.get("price_snapshot_version") or 0)
+            row["display_name"] = row.get("display_name") or clean_token_name(row.get("token_name"))
+            row["price_snapshot_status"] = (
+                "atomic" if row["price_snapshot_version"] >= 1 else "legacy_incomplete"
+            )
             soft_features = _decode_json(row.pop("position_soft_features_json", None))
             if isinstance(soft_features, dict):
                 for name in ("price_usd", "holders", "market_cap_usd", "liquidity_usd"):
@@ -178,18 +187,26 @@ class LedgerQueries:
         """Attach read-only trade details and time-bounded market snapshots."""
         for row in rows:
             entry = self.connection.execute(
-                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at "
+                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at, price_snapshot_json "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'entry' "
                 "ORDER BY recorded_at ASC, rowid ASC LIMIT 1",
                 (self.mode, row["position_id"]),
             ).fetchone()
             exit_row = self.connection.execute(
                 "SELECT quote_input_quantity, quote_output_quantity, "
-                "net_pnl_estimated_sol, quote_quoted_at, recorded_at "
+                "net_pnl_estimated_sol, quote_quoted_at, recorded_at, price_snapshot_json "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'exit' "
                 "ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
                 (self.mode, row["position_id"]),
             ).fetchone()
+            entry_price_snapshot = row.get("entry_price_snapshot")
+            if not isinstance(entry_price_snapshot, dict) and entry is not None:
+                entry_price_snapshot = _decode_json(entry["price_snapshot_json"])
+            exit_price_snapshot = row.get("exit_price_snapshot")
+            if not isinstance(exit_price_snapshot, dict) and exit_row is not None:
+                exit_price_snapshot = _decode_json(exit_row["price_snapshot_json"])
+            row["entry_price_snapshot"] = entry_price_snapshot if isinstance(entry_price_snapshot, dict) else None
+            row["exit_price_snapshot"] = exit_price_snapshot if isinstance(exit_price_snapshot, dict) else None
             row["buy_price_sol"] = _unit_price(
                 entry["quote_input_quantity"], entry["quote_output_quantity"]
                 if entry is not None
@@ -201,19 +218,21 @@ class LedgerQueries:
                 else None,
             ) if exit_row is not None else None
             entry_quote_at = (
-                row.get("entry_quote_at")
-                or (entry["quote_quoted_at"] if entry is not None else None)
-            )
+                (entry_price_snapshot or {}).get("quoted_at")
+                if isinstance(entry_price_snapshot, dict)
+                else row.get("entry_quote_at")
+            ) or (entry["quote_quoted_at"] if entry is not None else None)
             exit_quote_at = (
-                row.get("exit_quote_at")
-                or (exit_row["quote_quoted_at"] if exit_row is not None else None)
-            )
+                (exit_price_snapshot or {}).get("quoted_at")
+                if isinstance(exit_price_snapshot, dict)
+                else row.get("exit_quote_at")
+            ) or (exit_row["quote_quoted_at"] if exit_row is not None else None)
             row["entry_quote_at"] = entry_quote_at
             row["exit_quote_at"] = exit_quote_at
             row["buy_time"] = entry_quote_at
             row["sell_time"] = exit_quote_at
-            row["entry_time_status"] = "quote_quoted_at" if entry_quote_at else "unknown"
-            row["exit_time_status"] = "quote_quoted_at" if exit_quote_at else "unknown"
+            row["entry_time_status"] = "atomic_snapshot" if isinstance(entry_price_snapshot, dict) else ("quote_quoted_at" if entry_quote_at else "unknown")
+            row["exit_time_status"] = "atomic_snapshot" if isinstance(exit_price_snapshot, dict) else ("quote_quoted_at" if exit_quote_at else "unknown")
             if not row.get("signal_observed_at"):
                 signal_row = self.connection.execute(
                     "SELECT s.observed_at FROM candidates c "
@@ -231,6 +250,12 @@ class LedgerQueries:
             pnl_sol = exit_row["net_pnl_estimated_sol"] if exit_row is not None else None
             row["pnl_sol"] = pnl_sol
             row["pnl_rate_pct"] = _percentage(pnl_sol, row.get("quantity_sol"))
+            if row.get("price_snapshot_version", 0) < 1:
+                row["price_snapshot_status"] = "legacy_incomplete"
+            elif not isinstance(entry_price_snapshot, dict) or not isinstance(exit_price_snapshot, dict):
+                row["price_snapshot_status"] = "incomplete"
+            else:
+                row["price_snapshot_status"] = "atomic"
             self._attach_market_snapshots(row, entry, exit_row)
 
     def _attach_market_snapshots(

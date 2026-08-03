@@ -268,6 +268,9 @@ class DeterministicSimulation:
             display_name=features.display_name or features.token_name,
             symbol=features.symbol,
             entry_price_snapshot=entry_price_snapshot,
+            price_snapshot_version=(
+                1 if self._native_symbol() == "SOL" and entry_price_snapshot is not None else 0
+            ),
             entry_holders=features.holders,
             entry_liquidity_usd=features.liquidity_usd,
             status="ENTRY_PENDING",
@@ -349,10 +352,11 @@ class DeterministicSimulation:
                     quote=None,
                     cost=None,
                 )
-        self._record_exit_attempt(position, decision, now)
         if not decision.triggered:
+            self._record_exit_attempt(position, decision, now)
             return ExitResult(position, decision, None)
         if decision.cost is None:
+            self._record_exit_attempt(position, decision, now)
             if self._is_bsc_executable_mode():
                 return self.process_bsc_unavailable_exit(
                     position_id,
@@ -372,6 +376,19 @@ class DeterministicSimulation:
             position = self.ledger.positions[position_id]
         exit_quote_at = self._quote_lifecycle_timestamp(decision.quote)
         close_time = exit_quote_at or now
+        snapshot = price_snapshot or self.build_price_snapshot(
+            decision.quote,
+            native_symbol=self._native_symbol(),
+            pricing_mode=self.pricing_mode,
+            executable_quote=self.executable_quote,
+            now=close_time,
+        )
+        self._record_exit_attempt(
+            position,
+            decision,
+            now,
+            price_snapshot=snapshot if self._native_symbol() == "SOL" else None,
+        )
         self.ledger.transition_position(
             position_id,
             "EXIT_TRIGGERED",
@@ -383,13 +400,7 @@ class DeterministicSimulation:
             close_time,
             decision.reason,
             exit_quote_at=exit_quote_at,
-            exit_price_snapshot=price_snapshot or self.build_price_snapshot(
-                decision.quote,
-                native_symbol=self._native_symbol(),
-                pricing_mode=self.pricing_mode,
-                executable_quote=self.executable_quote,
-                now=close_time,
-            ),
+            exit_price_snapshot=snapshot,
         )
         self._record_loss_counters(position, decision, now)
         return ExitResult(position, decision, closed)
@@ -569,6 +580,7 @@ class DeterministicSimulation:
         *,
         exit_holders: int | None = None,
         price_snapshot: PriceSnapshot | None = None,
+        fallback_price_snapshot: PriceSnapshot | None = None,
     ) -> ExitResult:
         """Close a Solana Paper/Shadow position on the hard max-hold deadline.
 
@@ -667,7 +679,8 @@ class DeterministicSimulation:
         )
         exit_quote_at = self._quote_lifecycle_timestamp(quote)
         close_time = exit_quote_at or now
-        snapshot = price_snapshot or self.build_price_snapshot(
+        selected_snapshot = price_snapshot if quote is jupiter_quote else fallback_price_snapshot
+        snapshot = selected_snapshot or self.build_price_snapshot(
             quote,
             native_symbol=self._native_symbol(),
             pricing_mode=pricing_mode,
@@ -738,6 +751,19 @@ class DeterministicSimulation:
             or quote.unusable_reason(now) is not None
         ):
             return None
+        # A local pool observation is useful for prompt trigger detection but
+        # cannot value a timeout after five seconds. Binance is only a bounded
+        # fallback and expires after ten seconds. Jupiter retains its own
+        # quote-expiry validation above.
+        if quote.quoted_at is not None:
+            try:
+                age_sec = max(0, (now - quote.quoted_at).total_seconds())
+            except (TypeError, ValueError):
+                return None
+            if quote.provider == "pool_wss_indicative" and age_sec > 5:
+                return None
+            if quote.provider == "binance_web3" and age_sec > 10:
+                return None
         return quote
 
     def process_live_exit(
@@ -889,10 +915,11 @@ class DeterministicSimulation:
                 quote=None,
                 cost=None,
             )
-        self._record_exit_attempt(position, decision, now)
         if not decision.triggered:
+            self._record_exit_attempt(position, decision, now)
             return ExitResult(position, decision, None)
         if decision.cost is None:
+            self._record_exit_attempt(position, decision, now)
             if self._is_bsc_executable_mode() and decision.reason not in {
                 "sell_quote_unavailable",
                 "quote_expired",
@@ -924,18 +951,25 @@ class DeterministicSimulation:
         )
         exit_quote_at = self._quote_lifecycle_timestamp(decision.quote)
         close_time = exit_quote_at or now
+        snapshot = price_snapshot or self.build_price_snapshot(
+            decision.quote,
+            native_symbol=self._native_symbol(),
+            pricing_mode=self.pricing_mode,
+            executable_quote=self.executable_quote,
+            now=close_time,
+        )
+        self._record_exit_attempt(
+            position,
+            decision,
+            now,
+            price_snapshot=snapshot if self._native_symbol() == "SOL" else None,
+        )
         closed = self.ledger.close_position(
             position_id,
             close_time,
             decision.reason,
             exit_quote_at=exit_quote_at,
-            exit_price_snapshot=price_snapshot or self.build_price_snapshot(
-                decision.quote,
-                native_symbol=self._native_symbol(),
-                pricing_mode=self.pricing_mode,
-                executable_quote=self.executable_quote,
-                now=close_time,
-            ),
+            exit_price_snapshot=snapshot,
         )
         snapshot = self.ledger.closed_positions[position_id].exit_price_snapshot
         returns = {
@@ -1065,6 +1099,10 @@ class DeterministicSimulation:
             "indicative_timeout_fallback": "timeout_fallback",
             "bsc_executable_quote": quote.quote_source or quote.provider,
         }.get(pricing_mode, "jupiter_quote" if executable_quote else pricing_mode)
+        if quote.provider == "pool_wss_indicative":
+            source = "pool_wss"
+        elif quote.provider == "binance_web3":
+            source = "binance_indicative"
         parsed_native_usd = native_usd if native_usd is not None and native_usd > 0 else None
         price_usd = price_native * parsed_native_usd if parsed_native_usd is not None else None
         age_ms: int | None = None
@@ -1105,6 +1143,7 @@ class DeterministicSimulation:
         position: VirtualPosition,
         decision: ExitDecision,
         recorded_at: datetime,
+        price_snapshot: PriceSnapshot | None = None,
     ) -> None:
         if decision.reason is None:
             return
@@ -1132,6 +1171,7 @@ class DeterministicSimulation:
                 recorded_at=recorded_at,
                 pricing_mode=self.pricing_mode,
                 executable_quote=self.executable_quote,
+                price_snapshot=price_snapshot,
             )
         )
 

@@ -464,6 +464,7 @@ class SimulationTests(unittest.TestCase):
             route=("binance_indicative",),
             executable_style=False,
             confidence="indicative",
+            quoted_at=NOW + timedelta(seconds=610),
         )
         result = engine.process_timeout_exit(
             "timeout-fallback-position",
@@ -1198,3 +1199,58 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(len(result.exits), 1)
         self.assertEqual(result.exits[0].decision.reason, "take_profit")
         self.assertEqual(result.exits[0].closed_position.status, "CLOSED")
+
+    def test_solana_atomic_price_snapshots_bind_position_times_and_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = initialize_database(Path(directory) / "paper.db")
+            engine = DeterministicSimulation("paper", ledger=SimulationLedger("paper", connection))
+            buy = make_buy_quote()
+            sell = replace(make_sell_quote("0.0013"), quoted_at=NOW + timedelta(seconds=12))
+            features = replace(
+                make_entry_features(buy_quote=buy, sell_quote=sell),
+                evaluated_at=NOW + timedelta(seconds=1),
+                native_usd=Decimal("150"),
+            )
+            engine.process_entry(
+                replace(make_signal("atomic", "MintA"), observed_at=NOW),
+                features,
+                "atomic-candidate",
+                "atomic-position",
+            )
+            result = engine.process_paper_exit("atomic-position", NOW + timedelta(seconds=12), sell)
+            self.assertIsNotNone(result.closed_position)
+            closed = result.closed_position
+            self.assertEqual(closed.opened_at, buy.quoted_at)
+            self.assertEqual(closed.closed_at, sell.quoted_at)
+            self.assertEqual(closed.signal_observed_at, NOW)
+            self.assertEqual(closed.evaluated_at, NOW + timedelta(seconds=1))
+            self.assertEqual(closed.price_snapshot_version, 1)
+            self.assertEqual(closed.entry_price_snapshot.price_usd, Decimal("0.00015"))
+            self.assertEqual(closed.exit_price_snapshot.quoted_at, sell.quoted_at)
+            snapshots = list(connection.execute("SELECT price_snapshot_json FROM executions ORDER BY rowid"))
+            self.assertEqual(len(snapshots), 2)
+            self.assertTrue(all(row["price_snapshot_json"] for row in snapshots))
+            connection.close()
+
+    def test_solana_timeout_rejects_stale_binance_fallback_and_marks_unknown(self) -> None:
+        engine = DeterministicSimulation("paper")
+        engine.process_entry(
+            make_signal("stale-timeout"), make_entry_features(), "stale-candidate", "stale-position"
+        )
+        engine.process_timeout_exit("stale-position", NOW + timedelta(seconds=600), None)
+        stale = replace(
+            make_sell_quote("0.0008", quote_id="stale-binance"),
+            provider="binance_web3",
+            route=("binance_indicative",),
+            executable_style=False,
+            confidence="indicative",
+        )
+        result = engine.process_timeout_exit(
+            "stale-position", NOW + timedelta(seconds=610), None, stale
+        )
+        self.assertIsNotNone(result.closed_position)
+        self.assertIsNone(result.closed_position.exit_price_snapshot)
+        execution = engine.ledger.executions[-1]
+        self.assertEqual(execution.exit_status, "valuation_unavailable")
+        self.assertEqual(execution.pnl_status, "unknown")
+        self.assertIsNone(execution.cost)

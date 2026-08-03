@@ -1,7 +1,7 @@
 (() => {
   const directFilePreview = window.location.protocol === 'file:';
   const initialChain = new URLSearchParams(window.location.search).get('chain') === 'bsc' ? 'bsc' : 'solana';
-  const state = { chain: initialChain, mode: 'paper', limit: 1000, status: null, health: null, config: null, analytics: null, trendWindow: '24h', filters: { token: '', strategy: 'all', outcome: 'all', status: 'all', window: '24h' }, positionsPage: 1, positionPageSize: 10, positionItems: [], closedPage: 1, closedPageSize: 10, closedItems: [] };
+  const state = { chain: initialChain, mode: 'paper', limit: 1000, status: null, health: null, config: null, analytics: null, trendWindow: '24h', filters: { token: '', strategy: 'all', outcome: 'all', status: 'all', window: '24h' }, positionsPage: 1, positionPageSize: 10, positionItems: [], closedPage: 1, closedPageSize: 10, closedItems: [], priceUnit: 'usd' };
   const $ = (selector) => document.querySelector(selector);
   const observationWindowText = () => {
     const fallback = 60;
@@ -57,12 +57,21 @@
   };
   const nativeSymbol = () => state.chain === 'bsc' ? 'BNB' : 'SOL';
   const nativeField = (item, nativeName, legacySolName) => item[nativeName] ?? item[legacySolName];
+  const displayTokenName = (item) => [item.symbol, item.display_name, shortMint(item.mint)].filter(Boolean).join(' · ') || '未命名代币';
+  const priceSourceText = (snapshot) => ({ jupiter_quote: 'Jupiter 可执行报价', pool_wss: '池内实时价格', binance_indicative: 'Binance 兜底价', timeout_fallback: 'Binance 兜底价' }[snapshot?.price_source] || '历史口径不完整');
+  const snapshotPrice = (snapshot, legacyValue) => {
+    if (state.chain === 'solana' && state.priceUnit === 'usd') return snapshot?.price_usd ?? null;
+    return snapshot?.price_native ?? legacyValue ?? null;
+  };
+  const snapshotStatusText = (item, snapshot) => snapshot ? priceSourceText(snapshot) : (item.price_snapshot_status === 'legacy_incomplete' ? '历史口径不完整' : '价格不可用');
   const renderChainLabels = () => {
     const isBsc = state.chain === 'bsc';
     const symbol = nativeSymbol();
     $('#metric-pnl-caption').textContent = `已实现 · ${symbol}`;
-    $('#closed-buy-price-label').textContent = `买入价格（${symbol}/代币）`;
-    $('#closed-sell-price-label').textContent = `卖出价格（${symbol}/代币）`;
+    const priceUnit = !isBsc && state.priceUnit === 'usd' ? 'USD' : symbol;
+    $('#closed-buy-price-label').textContent = `买入价格（${priceUnit}/代币）`;
+    $('#closed-sell-price-label').textContent = `卖出价格（${priceUnit}/代币）`;
+    $('#price-unit-control').hidden = isBsc;
     $('#closed-pnl-label').textContent = `盈亏额（${symbol}）`;
     $('#chain-eyebrow').textContent = `${isBsc ? 'BSC' : 'Solana'} 主网 · Paper / Shadow`;
     $('#status-quote').textContent = isBsc ? 'Binance 指示价' : 'Jupiter Quote GET';
@@ -453,7 +462,7 @@
     $('#position-page').textContent = positions.length ? `第 ${state.positionsPage} / ${totalPages} 页` : '暂无持仓';
     $('#position-prev').disabled = state.positionsPage <= 1;
     $('#position-next').disabled = state.positionsPage >= totalPages;
-    $('#position-body').innerHTML = visible.length ? visible.map((item) => `<tr><td><span class="mint">${escapeHtml(item.token_name || '未命名代币')}</span>${copyControl(item.mint)}</td><td><strong>${escapeHtml(tokenPriceText(item.local_price_sol_per_token))}</strong><small class="table-subtext">pool_wss_indicative</small></td><td><strong>${escapeHtml(tokenPriceText(item.jupiter_price_sol_per_token))}</strong><small class="table-subtext">jupiter_quote</small></td><td>${escapeHtml(signedDecimalText(item.price_delta_pct, 2))}%</td><td>${escapeHtml(dateText(item.local_price_observed_at))}</td><td>${escapeHtml(dateText(item.jupiter_price_observed_at))}</td><td>${escapeHtml(countText(item.holders))}</td><td>${escapeHtml(marketText(item.market_cap_usd))}</td><td>${escapeHtml(marketText(item.liquidity_usd))}</td></tr>`).join('') : '<tr><td colspan="9" class="empty-state">暂无虚拟持仓</td></tr>';
+    $('#position-body').innerHTML = visible.length ? visible.map((item) => `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td><strong>${escapeHtml(tokenPriceText(item.local_price_sol_per_token))}</strong><small class="table-subtext">pool_wss_indicative</small></td><td><strong>${escapeHtml(tokenPriceText(item.jupiter_price_sol_per_token))}</strong><small class="table-subtext">jupiter_quote</small></td><td>${escapeHtml(signedDecimalText(item.price_delta_pct, 2))}%</td><td>${escapeHtml(dateText(item.local_price_observed_at))}</td><td>${escapeHtml(dateText(item.jupiter_price_observed_at))}</td><td>${escapeHtml(countText(item.holders))}</td><td>${escapeHtml(marketText(item.market_cap_usd))}</td><td>${escapeHtml(marketText(item.liquidity_usd))}</td></tr>`).join('') : '<tr><td colspan="9" class="empty-state">暂无虚拟持仓</td></tr>';
   }
 
   function renderClosedPositions(positions) {
@@ -468,7 +477,7 @@
     $('#closed-page').textContent = positions.length ? `第 ${state.closedPage} / ${totalPages} 页` : '暂无记录';
     $('#closed-prev').disabled = state.closedPage <= 1;
     $('#closed-next').disabled = state.closedPage >= totalPages;
-    $('#closed-body').innerHTML = visible.length ? visible.map((item) => { const buyPrice = nativeField(item, 'buy_price_bnb', 'buy_price_sol'); const sellPrice = nativeField(item, 'sell_price_bnb', 'sell_price_sol'); const pnl = nativeField(item, 'pnl_bnb', 'pnl_sol'); return `<tr><td><span class="mint">${escapeHtml(item.token_name || '未命名代币')}</span>${copyControl(item.mint)}</td><td>${escapeHtml(tradeTimeText(item.signal_observed_at, item.signal_observed_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.evaluated_at, item.evaluated_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.entry_quote_at, item.entry_time_status))}</td><td>${escapeHtml(tradeTimeText(item.opened_at, item.opened_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.exit_quote_at, item.exit_time_status))}</td><td>${escapeHtml(tradeTimeText(item.closed_at, item.closed_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tokenPriceText(buyPrice))}</td><td>${escapeHtml(tokenPriceText(sellPrice))}</td><td><span class="${pnlClass(pnl)}">${escapeHtml(pnlAmountText(pnl))}</span></td><td><span class="${pnlClass(item.pnl_rate_pct)}">${escapeHtml(pnlRateText(item.pnl_rate_pct))}</span></td><td>${escapeHtml(countText(item.entry_holders ?? item.holders))}</td><td>${escapeHtml(exitHoldersText(item))}</td><td>${escapeHtml(marketText(item.entry_market_cap_usd))}</td><td>${escapeHtml(marketText(item.exit_market_cap_usd))}</td><td>${escapeHtml(marketText(item.entry_liquidity_usd))}</td><td>${escapeHtml(marketText(item.exit_liquidity_usd))}</td></tr>`; }).join('') : '<tr><td colspan="17" class="empty-state">暂无已平仓记录</td></tr>';
+    $('#closed-body').innerHTML = visible.length ? visible.map((item) => { const legacyBuy = nativeField(item, 'buy_price_bnb', 'buy_price_sol'); const legacySell = nativeField(item, 'sell_price_bnb', 'sell_price_sol'); const buyPrice = snapshotPrice(item.entry_price_snapshot, legacyBuy); const sellPrice = snapshotPrice(item.exit_price_snapshot, legacySell); const pnl = nativeField(item, 'pnl_bnb', 'pnl_sol'); return `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td>${escapeHtml(tradeTimeText(item.signal_observed_at, item.signal_observed_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.evaluated_at, item.evaluated_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.entry_quote_at, item.entry_time_status))}</td><td>${escapeHtml(tradeTimeText(item.opened_at, item.opened_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.exit_quote_at, item.exit_time_status))}</td><td>${escapeHtml(tradeTimeText(item.closed_at, item.closed_at ? 'known' : 'unknown'))}</td><td><strong>${escapeHtml(tokenPriceText(buyPrice))}</strong><small class="table-subtext">${escapeHtml(snapshotStatusText(item, item.entry_price_snapshot))}</small></td><td><strong>${escapeHtml(tokenPriceText(sellPrice))}</strong><small class="table-subtext">${escapeHtml(snapshotStatusText(item, item.exit_price_snapshot))}</small></td><td><span class="${pnlClass(pnl)}">${escapeHtml(pnlAmountText(pnl))}</span></td><td><span class="${pnlClass(item.pnl_rate_pct)}">${escapeHtml(pnlRateText(item.pnl_rate_pct))}</span></td><td>${escapeHtml(countText(item.entry_holders ?? item.holders))}</td><td>${escapeHtml(exitHoldersText(item))}</td><td>${escapeHtml(marketText(item.entry_market_cap_usd))}</td><td>${escapeHtml(marketText(item.exit_market_cap_usd))}</td><td>${escapeHtml(marketText(item.entry_liquidity_usd))}</td><td>${escapeHtml(marketText(item.exit_liquidity_usd))}</td></tr>`; }).join('') : '<tr><td colspan="17" class="empty-state">暂无已平仓记录</td></tr>';
   }
 
   function exitHoldersText(item) {
@@ -586,6 +595,11 @@
     if (![10, 20, 50, 100].includes(pageSize)) return;
     state.closedPageSize = pageSize;
     state.closedPage = 1;
+    renderClosedPositions(state.closedItems);
+  });
+  $('#price-display-unit').addEventListener('change', (event) => {
+    state.priceUnit = event.target.value === 'native' ? 'native' : 'usd';
+    renderChainLabels();
     renderClosedPositions(state.closedItems);
   });
   const filterControls = ['filter-strategy', 'filter-outcome', 'filter-status', 'filter-window'];

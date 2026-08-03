@@ -117,7 +117,7 @@ class SimulationLedger:
             "jupiter_price_sol_per_token, jupiter_price_observed_at, jupiter_return_pct, "
             "closed_at, closed_reason, signal_observed_at, evaluated_at, "
             "entry_quote_at, exit_quote_at, raw_name, display_name, symbol, "
-            "entry_price_snapshot_json, exit_price_snapshot_json "
+            "entry_price_snapshot_json, exit_price_snapshot_json, price_snapshot_version "
             "FROM virtual_positions WHERE mode = ? ORDER BY opened_at ASC",
             (mode,),
         )
@@ -242,6 +242,7 @@ class SimulationLedger:
                 symbol=row["symbol"],
                 entry_price_snapshot=_parse_snapshot(row["entry_price_snapshot_json"]),
                 exit_price_snapshot=_parse_snapshot(row["exit_price_snapshot_json"]),
+                price_snapshot_version=int(row["price_snapshot_version"] or 0),
             )
             if position.status == "CLOSED":
                 ledger.closed_positions[position.position_id] = position
@@ -360,8 +361,8 @@ class SimulationLedger:
                 "last_observed_at, last_quote_id, "
                 "closed_at, closed_reason, signal_observed_at, evaluated_at, "
                 "entry_quote_at, exit_quote_at, raw_name, display_name, symbol, "
-                "entry_price_snapshot_json, exit_price_snapshot_json) "
-                "VALUES (" + ", ".join("?" for _ in range(41)) + ")",
+                "entry_price_snapshot_json, exit_price_snapshot_json, price_snapshot_version) "
+                "VALUES (" + ", ".join("?" for _ in range(42)) + ")",
                 (
                     position.position_id,
                     position.mint,
@@ -428,6 +429,7 @@ class SimulationLedger:
                     position.symbol,
                     _snapshot_json(position.entry_price_snapshot),
                     _snapshot_json(position.exit_price_snapshot),
+                    position.price_snapshot_version,
                 ),
             )
             self.connection.commit()
@@ -732,6 +734,9 @@ class SimulationLedger:
         exit_price_snapshot: PriceSnapshot | None = None,
     ) -> VirtualPosition:
         position = self.positions.pop(position_id)
+        if exit_price_snapshot is not None and exit_price_snapshot.quoted_at is not None:
+            closed_at = exit_price_snapshot.quoted_at
+            exit_quote_at = exit_price_snapshot.quoted_at
         closed_at = closed_at or position.last_observed_at or position.opened_at
         if exit_quote_at is None:
             exit_quote_at = position.exit_quote_at
@@ -780,8 +785,8 @@ class SimulationLedger:
             "quote_input_quantity, quote_output_quantity, price_impact_pct, quote_quoted_at, "
             "route_fee, estimated_network_fee, estimated_priority_fee, gross_pnl_sol, "
             "gross_pnl_pct, net_pnl_estimated_sol, net_pnl_is_estimated, recorded_at, "
-            "pricing_mode, executable_quote, exit_status, pnl_status) "
-            "VALUES (" + ", ".join("?" for _ in range(23)) + ") ",
+            "pricing_mode, executable_quote, exit_status, pnl_status, price_snapshot_json) "
+            "VALUES (" + ", ".join("?" for _ in range(24)) + ") ",
             (
                 execution.execution_id,
                 execution.position_id,
@@ -820,6 +825,7 @@ class SimulationLedger:
                 int(execution.executable_quote),
                 execution.exit_status,
                 execution.pnl_status,
+                _snapshot_json(execution.price_snapshot),
             ),
         )
         self.connection.commit()

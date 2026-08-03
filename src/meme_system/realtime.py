@@ -34,7 +34,8 @@ from meme_system.adapters.binance_web3.models import BinanceMarketSnapshot, Bina
 from meme_system.adapters.binance_web3.signal_source import BinanceWeb3SignalSource
 from meme_system.adapters.protocols import ExecutableQuote, QuoteProvider
 from meme_system.adapters.solana_price import SolanaObservedPrice, SolanaPriceMonitor
-from meme_system.domain.models import EntryFeatures, ShadowExitFeatures, ShadowOutcome, Signal, VirtualPosition
+from meme_system.domain.models import EntryFeatures, PriceSnapshot, ShadowExitFeatures, ShadowOutcome, Signal, VirtualPosition
+from meme_system.domain.naming import clean_token_name
 from meme_system.engines.simulation import DeterministicSimulation, EntryResult, ExitResult
 from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, LatencyRecorder, RuntimeControl, utc_now
 from meme_system.storage.exit_holders import (
@@ -356,10 +357,13 @@ class BinanceRealtimeFeatureProvider:
             except Exception:
                 dynamic_error = "binance_dynamic_unavailable"
 
+        raw_name = _first_string(_field_value(fields, "name"))
+        symbol = _first_string(_field_value(fields, "symbol"))
+        display_name = clean_token_name(raw_name) if not self.is_bsc else raw_name
         token_name = (
-            _first_string(_field_value(fields, "symbol"), _field_value(fields, "name"))
+            _first_string(symbol, raw_name)
             if self.is_bsc
-            else _first_string(_field_value(fields, "name"), _field_value(fields, "symbol"))
+            else _first_string(display_name, symbol)
         )
         soft = {
             "source": normalized.endpoint_type,
@@ -389,6 +393,12 @@ class BinanceRealtimeFeatureProvider:
             soft["dynamic_error_class"] = dynamic_error
         if dynamic_available:
             soft["observation_snapshot_available"] = True
+        if not self.is_bsc:
+            soft.update({
+                "raw_name": raw_name,
+                "display_name": display_name,
+                "symbol": symbol,
+            })
 
         buy_quote: ExecutableQuote | None = None
         sell_quote: ExecutableQuote | None = None
@@ -482,6 +492,12 @@ class BinanceRealtimeFeatureProvider:
         # 5..120s age, 15s buyer ratio/net-buy windows, or a confident creator
         # sell boolean. They remain unavailable instead of being synthesized
         # from 5m/24h fields or timestamp units that are not frozen.
+        native_usd: Decimal | None = None
+        if not self.is_bsc:
+            token_usd = _positive_decimal(_field_value(fields, "price_usd"))
+            token_native = _positive_decimal(_field_value(fields, "native_token_price"))
+            if token_usd is not None and token_native is not None:
+                native_usd = token_usd / token_native
         return EntryFeatures(
             token_age_sec=None,
             unique_buyers_15s=None,
@@ -500,6 +516,10 @@ class BinanceRealtimeFeatureProvider:
             pricing_mode=pricing_mode,
             executable_quote=executable_quote,
             pricing_error=pricing_error,
+            raw_name=raw_name if not self.is_bsc else None,
+            display_name=display_name if not self.is_bsc else None,
+            symbol=symbol if not self.is_bsc else None,
+            native_usd=native_usd,
         )
 
     def quote_for_position(self, position: VirtualPosition) -> ExecutableQuote | None:
@@ -598,7 +618,7 @@ class BinanceRealtimeFeatureProvider:
             return None
         if self.solana_price_monitor is not None:
             observed = self.solana_price_monitor.latest(position.mint)
-            if observed is not None:
+            if observed is not None and (utc_now() - observed.observed_at).total_seconds() <= 5:
                 local_quote = self.local_quote_for_position(position, observed)
                 if local_quote is not None:
                     return local_quote
@@ -609,6 +629,8 @@ class BinanceRealtimeFeatureProvider:
             snapshot = self._latest_market_snapshots.get(position.mint)
         if snapshot is None:
             return None
+        if (utc_now() - snapshot.observed_at).total_seconds() > 10:
+            return None
         return self._indicative_quote(
             position.mint,
             "sell",
@@ -616,6 +638,41 @@ class BinanceRealtimeFeatureProvider:
             snapshot.fields,
             snapshot.observed_at,
             snapshot.raw_response_hash,
+        )
+
+    def price_snapshot_for_position(
+        self,
+        position: VirtualPosition,
+        quote: ExecutableQuote | None,
+        *,
+        pricing_mode: str,
+        executable_quote: bool,
+        now: datetime,
+    ) -> PriceSnapshot | None:
+        """Build a Solana boundary snapshot without mixing stale USD data."""
+        if self.is_bsc:
+            return None
+        native_usd: Decimal | None = None
+        market = self._position_snapshots.get(position.position_id)
+        if market is None:
+            market = self._latest_market_snapshots.get(position.mint)
+        if market is not None and quote is not None and quote.quoted_at is not None:
+            try:
+                age_sec = abs((quote.quoted_at - market.observed_at).total_seconds())
+            except (TypeError, ValueError):
+                age_sec = float("inf")
+            if age_sec <= 10:
+                token_usd = _positive_decimal(_field_value(market.fields, "price_usd"))
+                token_native = _positive_decimal(_field_value(market.fields, "native_token_price"))
+                if token_usd is not None and token_native is not None:
+                    native_usd = token_usd / token_native
+        return DeterministicSimulation.build_price_snapshot(
+            quote,
+            native_symbol="SOL",
+            native_usd=native_usd,
+            pricing_mode=pricing_mode,
+            executable_quote=executable_quote,
+            now=now,
         )
 
     def resolve_bsc_pool(
@@ -1232,6 +1289,13 @@ class RealtimeCoordinator:
                             pricing_mode=pricing_mode,
                             executable_quote=bool(usable_jupiter),
                             local_observation=not usable_jupiter,
+                            price_snapshot=self.features.price_snapshot_for_position(
+                                current,
+                                settlement,
+                                pricing_mode=pricing_mode,
+                                executable_quote=bool(usable_jupiter),
+                                now=observed.observed_at,
+                            ),
                         )
         return processed
 
@@ -1996,6 +2060,20 @@ class RealtimeCoordinator:
                     else None
                 )
                 exit_holders_snapshot = self.features.latest_holders_snapshot(position, now)
+                jupiter_snapshot = self.features.price_snapshot_for_position(
+                    position,
+                    quote,
+                    pricing_mode="jupiter_quote",
+                    executable_quote=True,
+                    now=now,
+                )
+                fallback_snapshot = self.features.price_snapshot_for_position(
+                    position,
+                    fallback_quote,
+                    pricing_mode="indicative_timeout_fallback",
+                    executable_quote=False,
+                    now=now,
+                )
                 result = engine.process_timeout_exit(
                     position.position_id,
                     now,
@@ -2006,6 +2084,8 @@ class RealtimeCoordinator:
                         if exit_holders_snapshot is not None
                         else None
                     ),
+                    price_snapshot=jupiter_snapshot,
+                    fallback_price_snapshot=fallback_snapshot,
                 )
             else:
                 if not quote_already_fetched:
@@ -2021,6 +2101,15 @@ class RealtimeCoordinator:
                             if exit_holders_snapshot is not None
                             else None
                         ),
+                        price_snapshot=(
+                            self.features.price_snapshot_for_position(
+                                position,
+                                quote,
+                                pricing_mode="jupiter_quote",
+                                executable_quote=True,
+                                now=now,
+                            ) if not self.features.is_bsc else None
+                        ),
                     )
                 elif mode == "shadow":
                     shadow_features = self.features.shadow_exit_features(position, quote, now)
@@ -2034,6 +2123,15 @@ class RealtimeCoordinator:
                             exit_holders_snapshot.holders
                             if exit_holders_snapshot is not None
                             else None
+                        ),
+                        price_snapshot=(
+                            self.features.price_snapshot_for_position(
+                                position,
+                                quote,
+                                pricing_mode="jupiter_quote",
+                                executable_quote=True,
+                                now=now,
+                            ) if not self.features.is_bsc else None
                         ),
                     )
                 else:

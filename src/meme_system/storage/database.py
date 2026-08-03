@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 MIGRATIONS = (
     (1, "001_initial.sql"),
@@ -22,6 +22,8 @@ MIGRATIONS = (
     (11, "011_quote_lifecycle_timestamps.sql"),
     (12, "012_solana_price_observation.sql"),
     (13, "013_price_snapshots_and_token_names.sql"),
+    # 014 is an isolated BSC migration. Keep it outside the Solana lineage.
+    (15, "015_solana_price_snapshot_semantics.sql"),
 )
 
 

@@ -34,7 +34,7 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15])
             columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(virtual_positions)")
@@ -52,6 +52,7 @@ class StorageTests(unittest.TestCase):
             self.assertIn("evaluated_at", columns)
             self.assertIn("entry_quote_at", columns)
             self.assertIn("exit_quote_at", columns)
+            self.assertIn("price_snapshot_version", columns)
             execution_columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(executions)")

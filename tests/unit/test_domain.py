@@ -4,6 +4,7 @@ import unittest
 from decimal import Decimal
 
 from meme_system.domain.models import BASELINE_IDENTITY, BSC_BASELINE_IDENTITY
+from meme_system.domain.naming import clean_token_name
 from meme_system.strategies.baseline import bsc_baseline_config
 
 
@@ -32,3 +33,8 @@ class DomainIdentityTests(unittest.TestCase):
         self.assertEqual(config.shadow_liquidity_drop_pct, Decimal("0.15"))
         self.assertEqual(config.stop_loss_trigger_pct, Decimal("-0.10"))
         self.assertEqual(BASELINE_IDENTITY.ruleset_version, "0.1.1")
+
+    def test_display_name_strips_unicode_direction_controls_without_changing_raw_value(self) -> None:
+        raw_name = "Alpha\u202eSOL\u2066Token\u2069"
+        self.assertEqual(clean_token_name(raw_name), "AlphaSOLToken")
+        self.assertEqual(raw_name, "Alpha\u202eSOL\u2066Token\u2069")
