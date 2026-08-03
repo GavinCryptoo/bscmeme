@@ -1,27 +1,60 @@
 #!/usr/bin/env node
 
 // Official PancakeSwap Smart Router SDK boundary. The process receives only
-// public swap parameters; the Python parent never passes BSC_PRIVATE_KEY here.
+// public read-only swap parameters; the Python parent never passes a wallet,
+// key, signature, or transaction request here.
 
 const fs = require('node:fs');
-const { createPublicClient, http, hexToBigInt } = require('viem');
+const readline = require('node:readline');
+const { createPublicClient, http } = require('viem');
 const { bsc } = require('viem/chains');
 const { Native, Token, CurrencyAmount, TradeType, Percent } = require('@pancakeswap/sdk');
 const { ChainId } = require('@pancakeswap/chains');
 const { SmartRouter, SwapRouter, SMART_ROUTER_ADDRESSES } = require('@pancakeswap/smart-router/evm');
 
-function fail(error) {
-  const errorClass = error && error.name ? error.name : 'smart_router_error';
-  const message = error && error.message ? String(error.message).slice(0, 160) : null;
-  process.stdout.write(JSON.stringify({ status: 'error', error_class: errorClass, error_message: message }));
-  process.exitCode = 1;
+function errorResponse(error) {
+  return {
+    status: 'error',
+    error_class: error && error.name ? error.name : 'smart_router_error',
+    error_message: error && error.message ? String(error.message).slice(0, 160) : null,
+  };
 }
 
-async function main() {
-  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-  if (!input || input.operation !== 'quote' && input.operation !== 'build') throw new Error('invalid_operation');
+function currencyFrom(input, prefix, native) {
+  const isNative = input[`${prefix}Native`];
+  if (isNative === true) return native;
+  const token = input[`${prefix}Token`];
+  const decimals = Number(input[`${prefix}Decimals`]);
+  if (!token || !Number.isInteger(decimals) || decimals < 0 || decimals > 255) {
+    throw new Error(`invalid_${prefix.toLowerCase()}_currency`);
+  }
+  return new Token(ChainId.BSC, token, decimals, prefix.toUpperCase());
+}
+
+function normalizeCurrencies(input, native) {
+  // Keep the pre-existing live build payload compatible. New quote callers
+  // specify input/output explicitly so a stablecoin fundraising asset is not
+  // silently treated as native BNB.
+  if (Object.prototype.hasOwnProperty.call(input, 'inputNative')) {
+    return {
+      inputCurrency: currencyFrom(input, 'input', native),
+      outputCurrency: currencyFrom(input, 'output', native),
+    };
+  }
   if (input.side !== 'buy' && input.side !== 'sell') throw new Error('invalid_side');
-  if (!input.rpcUrl || !input.token || (input.operation === 'build' && !input.recipient)) throw new Error('missing_public_swap_input');
+  if (!input.token) throw new Error('missing_public_swap_input');
+  const token = new Token(ChainId.BSC, input.token, Number(input.tokenDecimals), 'TOKEN');
+  return {
+    inputCurrency: input.side === 'buy' ? native : token,
+    outputCurrency: input.side === 'buy' ? token : native,
+  };
+}
+
+async function handle(input) {
+  if (!input || typeof input !== 'object') throw new Error('invalid_input');
+  if (input.operation === 'health') return { status: 'ok', ready: true };
+  if (input.operation !== 'quote' && input.operation !== 'build') throw new Error('invalid_operation');
+  if (!input.rpcUrl || (input.operation === 'build' && !input.recipient)) throw new Error('missing_public_swap_input');
 
   const chainId = ChainId.BSC;
   const publicClient = createPublicClient({
@@ -29,10 +62,8 @@ async function main() {
     transport: http(input.rpcUrl, { timeout: 15000 }),
     batch: { multicall: { batchSize: 1024 * 200 } },
   });
-  const token = new Token(chainId, input.token, Number(input.tokenDecimals), 'TOKEN');
   const native = Native.onChain(chainId);
-  const inputCurrency = input.side === 'buy' ? native : token;
-  const outputCurrency = input.side === 'buy' ? token : native;
+  const { inputCurrency, outputCurrency } = normalizeCurrencies(input, native);
   const amount = CurrencyAmount.fromRawAmount(inputCurrency, BigInt(input.amountRaw));
 
   const [v2Pools, v3Pools] = await Promise.all([
@@ -43,8 +74,6 @@ async function main() {
     }),
     SmartRouter.getV3CandidatePools({
       onChainProvider: () => publicClient,
-      // Keep this bounded to on-chain discovery plus the SDK's static fallback.
-      // No guessed or stale third-party subgraph endpoint is used.
       subgraphFallback: false,
       currencyA: inputCurrency,
       currencyB: outputCurrency,
@@ -103,7 +132,35 @@ async function main() {
     response.data = parameters.calldata;
     response.value = parameters.value;
   }
-  process.stdout.write(JSON.stringify(response));
+  return response;
 }
 
-main().catch(fail);
+async function emit(input) {
+  try {
+    process.stdout.write(`${JSON.stringify(await handle(input))}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify(errorResponse(error))}\n`);
+  }
+}
+
+async function main() {
+  if (!process.argv.includes('--server')) {
+    const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+    await emit(input);
+    return;
+  }
+  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      await emit(JSON.parse(line));
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify(errorResponse(error))}\n`);
+    }
+  }
+}
+
+main().catch((error) => {
+  process.stdout.write(`${JSON.stringify(errorResponse(error))}\n`);
+  process.exitCode = 1;
+});

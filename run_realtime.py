@@ -143,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     bsc_wss_monitor: BscPairWssMonitor | None = None
     telegram: TelegramControl | None = None
     coordinator: RealtimeCoordinator | None = None
+    bsc_quote_provider: BscReadOnlyQuoteProvider | None = None
     live_telegram_started = False
     try:
         if args.mode == "live":
@@ -205,6 +206,15 @@ def main(argv: list[str] | None = None) -> int:
             if bsc_executable_quote_enabled
             else None
         )
+        if bsc_quote_provider is not None:
+            router_healthy = bsc_quote_provider.router_health_check()
+            for mode in modes:
+                health[mode].set(
+                    "pancakeswap_router",
+                    "HEALTHY" if router_healthy else "DEGRADED",
+                    error_class=None if router_healthy else "pancakeswap_quote_unavailable",
+                    details={"persistent_client": True, "startup_health_check": True},
+                )
         solana_rpc = SolanaRpcClient.from_env() if args.chain == "solana" else None
         decimals_cache = (
             TokenDecimalsCache.from_env(rpc=solana_rpc, overrides=_token_decimals())
@@ -434,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
             wss_loop.call_soon_threadsafe(wss_async_stop.set)
         if coordinator is not None:
             coordinator.shutdown()
+        if bsc_quote_provider is not None:
+            bsc_quote_provider.close()
         if wss_thread is not None:
             wss_thread.join(timeout=5.0)
         if position_thread is not None:

@@ -58,7 +58,7 @@
   const nativeSymbol = () => state.chain === 'bsc' ? 'BNB' : 'SOL';
   const nativeField = (item, nativeName, legacySolName) => item[nativeName] ?? item[legacySolName];
   const displayTokenName = (item) => [item.symbol, item.display_name, shortMint(item.mint)].filter(Boolean).join(' · ') || '未命名代币';
-  const priceSourceText = (snapshot) => ({ jupiter_quote: 'Jupiter 可执行报价', pump_bonding_curve_quote: 'Pump Bonding Curve 报价', pool_wss: '池内实时价格', binance_indicative: 'Binance 兜底价', timeout_fallback: 'Binance 兜底价' }[snapshot?.price_source] || '历史口径不完整');
+  const priceSourceText = (snapshot) => ({ jupiter_quote: 'Jupiter 可执行报价', pump_bonding_curve_quote: 'Pump Bonding Curve 报价', bonding_curve_quote: 'bonding_curve_quote', pancakeswap_quote: 'pancakeswap_quote', binance_indicative_reference: 'binance_indicative_reference', pool_wss: '池内实时价格', binance_indicative: 'Binance 兜底价', timeout_fallback: 'Binance 兜底价' }[snapshot?.price_source] || '历史口径不完整');
   const snapshotPrice = (snapshot, legacyValue) => {
     if (state.chain === 'solana' && state.priceUnit === 'usd') return snapshot?.price_usd ?? null;
     return snapshot?.price_native ?? legacyValue ?? null;
@@ -74,7 +74,7 @@
     $('#price-unit-control').hidden = isBsc;
     $('#closed-pnl-label').textContent = `盈亏额（${symbol}）`;
     $('#chain-eyebrow').textContent = `${isBsc ? 'BSC' : 'Solana'} 主网 · Paper / Shadow`;
-    $('#status-quote').textContent = isBsc ? 'Binance 指示价' : 'Jupiter Quote GET';
+    $('#status-quote').textContent = isBsc ? 'BSC 链上只读 Quote' : 'Jupiter Quote GET';
     $('#status-rpc').textContent = isBsc ? 'BSC Pair WSS（可选）' : 'Helius · Alchemy 备用';
   };
   const pnlAmountText = (value) => {

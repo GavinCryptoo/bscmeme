@@ -92,7 +92,7 @@ class BaselineStrategy:
     def __init__(self, config: BaselineConfig | None = None) -> None:
         self.config = config or BaselineConfig()
 
-    def evaluate_entry(self, features: EntryFeatures) -> EntryDecision:
+    def _local_entry_checks(self, features: EntryFeatures) -> list[RuleCheck]:
         checks: list[RuleCheck] = []
         checks.append(
             self._optional_numeric_check(
@@ -151,6 +151,15 @@ class BaselineStrategy:
         checks.append(self._holders_check(features.holders))
         checks.append(self._market_cap_check(features.market_cap_usd))
         checks.append(self._liquidity_check(features.liquidity_usd))
+        return checks
+
+    def local_entry_eligible(self, features: EntryFeatures) -> bool:
+        """Check all non-quote gates before an expensive BSC quote request."""
+
+        return all(check.passed for check in self._local_entry_checks(features))
+
+    def evaluate_entry(self, features: EntryFeatures) -> EntryDecision:
+        checks = self._local_entry_checks(features)
         if features.pricing_mode == "binance_indicative":
             checks.append(
                 self._check(
@@ -162,6 +171,23 @@ class BaselineStrategy:
                     "valid Binance current price",
                     "bsc_price_unavailable",
                     "Binance 当前价格缺失或无效，拒绝开仓",
+                )
+            )
+        elif features.pricing_error in {
+            "fourmeme_context_unavailable",
+            "unsupported_fundraising_asset",
+            "bonding_curve_buy_quote_unavailable",
+            "bonding_curve_sell_quote_unavailable",
+            "pancakeswap_quote_unavailable",
+        }:
+            checks.append(
+                self._check(
+                    "bsc_quote_context",
+                    False,
+                    features.pricing_error,
+                    "verified executable quote",
+                    features.pricing_error,
+                    "BSC 链上报价不可用：" + features.pricing_error,
                 )
             )
         else:

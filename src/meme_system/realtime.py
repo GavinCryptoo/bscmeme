@@ -334,6 +334,8 @@ class BinanceRealtimeFeatureProvider:
         self,
         normalized: BinanceNormalizedSignal,
         evaluated_at: datetime | None = None,
+        *,
+        include_bsc_quote: bool = True,
     ) -> EntryFeatures:
         evaluated_at = evaluated_at or utc_now()
         fields = dict(normalized.fields)
@@ -439,25 +441,6 @@ class BinanceRealtimeFeatureProvider:
             if pricing_error is not None:
                 soft["pricing_error"] = pricing_error
         elif self.is_bsc and self.bsc_executable_quote_enabled:
-            if self.bsc_quote_provider is not None:
-                quote_fields = {
-                    name: _field_value(fields, name)
-                    for name in (
-                        "pair_address",
-                        "bonding_curve_address",
-                        "protocol",
-                        "token_version",
-                        "migrate_status",
-                        "token_decimals",
-                    )
-                }
-                buy_quote, sell_quote, pricing_error = self.bsc_quote_provider.quote_candidate(
-                    normalized.signal.mint,
-                    self.position_size_sol,
-                    quote_fields,
-                )
-            else:
-                pricing_error = "bsc_executable_quote_provider_unavailable"
             soft.update(
                 {
                     "pricing_mode": pricing_mode,
@@ -467,8 +450,17 @@ class BinanceRealtimeFeatureProvider:
                     "pricing_reference_executable_quote": False,
                 }
             )
-            if pricing_error is not None:
-                soft["pricing_error"] = pricing_error
+            if include_bsc_quote:
+                buy_quote, sell_quote, pricing_error = self._bsc_entry_quote_pair(
+                    normalized.signal.mint,
+                )
+                soft["quote_requested"] = True
+                if pricing_error is not None:
+                    soft["pricing_error"] = pricing_error
+            else:
+                # The candidate must first survive purely local gates. This
+                # avoids one RPC/router request for every raw Meme Rush row.
+                soft["quote_requested"] = False
         elif self.is_bsc:
             buy_quote, sell_quote, pricing_error = self._indicative_entry_quotes(
                 normalized.signal.mint,
@@ -546,6 +538,38 @@ class BinanceRealtimeFeatureProvider:
             symbol=symbol if not self.is_bsc else None,
             native_usd=native_usd,
         )
+
+    def bsc_entry_features_with_quote(
+        self,
+        normalized: BinanceNormalizedSignal,
+        features: EntryFeatures,
+    ) -> EntryFeatures:
+        """Attach one real BSC entry/instant-exit quote after local gates."""
+
+        if not (self.is_bsc and self.bsc_executable_quote_enabled):
+            return features
+        buy_quote, sell_quote, pricing_error = self._bsc_entry_quote_pair(normalized.signal.mint)
+        soft = dict(features.soft_features or {})
+        soft["quote_requested"] = True
+        if pricing_error is None:
+            soft.pop("pricing_error", None)
+        else:
+            soft["pricing_error"] = pricing_error
+        return replace(
+            features,
+            buy_quote=buy_quote,
+            sell_quote=sell_quote,
+            pricing_error=pricing_error,
+            soft_features=soft,
+        )
+
+    def _bsc_entry_quote_pair(
+        self,
+        mint: str,
+    ) -> tuple[ExecutableQuote | None, ExecutableQuote | None, str | None]:
+        if self.bsc_quote_provider is None:
+            return None, None, "bsc_executable_quote_provider_unavailable"
+        return self.bsc_quote_provider.quote_candidate(mint, self.position_size_sol)
 
     def quote_for_position(self, position: VirtualPosition) -> ExecutableQuote | None:
         if self.is_bsc:
@@ -722,6 +746,24 @@ class BinanceRealtimeFeatureProvider:
     ) -> BscPoolDescriptor | None:
         if not self.is_bsc or self.bsc_pool_resolver is None:
             return None
+        # A resolved Four context is authoritative over Binance discovery
+        # fields.  This accessor is cache-only, so it cannot introduce quote
+        # RPC traffic for every raw signal.
+        cached_context = None
+        cached_context_for = getattr(self.bsc_quote_provider, "cached_context", None)
+        if callable(cached_context_for):
+            cached_context = cached_context_for(mint)
+        if cached_context is not None:
+            if cached_context.migrated and cached_context.pancake_pair is not None:
+                pair_address = cached_context.pancake_pair
+                bonding_curve_address = None
+                protocol = None
+                migrate_status = None
+            elif not cached_context.migrated:
+                pair_address = None
+                bonding_curve_address = cached_context.launchpad
+                protocol = 2002
+                migrate_status = 0
         return self.bsc_pool_resolver.resolve(
             mint,
             pair_address,
@@ -1133,6 +1175,8 @@ class RealtimeCoordinator:
         self._bsc_wss_healthy = False
         self._bsc_last_pool_quotes: dict[str, ExecutableQuote] = {}
         self._bsc_wss_status_key: tuple[object, ...] | None = None
+        self._bsc_quote_local_conditions_passed = 0
+        self._bsc_quote_final_entries = 0
         self._db_lock = RLock()
         self._position_quote_lock = Lock()
         self._position_quotes: dict[tuple[str, str], ExecutableQuote | None] = {}
@@ -1904,7 +1948,12 @@ class RealtimeCoordinator:
         record = pending.record
         signal = record.signal
         feature_started = time.monotonic()
-        entry_features = self.features.entry_features(record, evaluated_at)
+        defer_bsc_quote = self.features.is_bsc and self.features.bsc_executable_quote_enabled
+        entry_features = self.features.entry_features(
+            record,
+            evaluated_at,
+            include_bsc_quote=not defer_bsc_quote,
+        )
         entry_features = replace(
             entry_features,
             soft_features={
@@ -1915,9 +1964,37 @@ class RealtimeCoordinator:
                 "observation_liquidity_usd": entry_features.liquidity_usd,
             },
         )
+        strategy_config = next(iter(self.engines.values())).strategy.config
+        if defer_bsc_quote:
+            quote_needed = False
+            for mode, engine in self.engines.items():
+                candidate_id = f"{mode}:{signal.signal_id}:{engine.strategy.config.identity.ruleset_version}"
+                if engine.ledger.candidate_exists(candidate_id):
+                    continue
+                block_reason = self._observation_gate(
+                    pending,
+                    entry_features,
+                    strategy_config.min_liquidity_usd,
+                    price_must_rise=True,
+                    holders_must_not_decrease=strategy_config.require_holders_non_decreasing_after_observation,
+                    liquidity_must_not_decrease=mode == "shadow",
+                )
+                if (
+                    block_reason is None
+                    and not self.controls.paused(mode)
+                    and engine.strategy.local_entry_eligible(entry_features)
+                ):
+                    quote_needed = True
+                    break
+            if quote_needed:
+                self._bsc_quote_local_conditions_passed += 1
+                entry_features = self.features.bsc_entry_features_with_quote(record, entry_features)
+                # A successful quote may have discovered the real Pancake
+                # pair. Refresh only this candidate's WSS binding from the
+                # cache; never from a Meme Rush venue guess.
+                self._remember_bsc_pool(record)
         feature_elapsed = (time.monotonic() - feature_started) * 1000
         self.latency.record("feature_and_quote_build", feature_elapsed)
-        strategy_config = next(iter(self.engines.values())).strategy.config
         accepted = {mode: 0 for mode in self.engines}
         duplicate_skipped = 0
         candidates = 0
@@ -1953,7 +2030,20 @@ class RealtimeCoordinator:
             self._notify_live_events(mode, engine, event_start)
             if result.position is not None:
                 accepted[mode] += 1
+                if defer_bsc_quote:
+                    self._bsc_quote_final_entries += 1
             self._audit_candidate(mode, signal, result, entry_features)
+        if defer_bsc_quote:
+            provider = self.features.bsc_quote_provider
+            quote_metrics = provider.metrics() if provider is not None else {}
+            metrics = {
+                "local_conditions_passed": self._bsc_quote_local_conditions_passed,
+                **quote_metrics,
+                "final_entries": self._bsc_quote_final_entries,
+            }
+            for mode in self.engines:
+                with self._db_lock:
+                    self.stores[mode].set_state("bsc_quote_metrics", metrics)
         return candidates, accepted, duplicate_skipped
 
     @staticmethod

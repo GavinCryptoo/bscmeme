@@ -1,78 +1,180 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from eth_abi import encode as abi_encode
+
 from meme_system.adapters.bsc_quote import (
     BscReadOnlyQuoteProvider,
-    _CALC_TRADING_FEE_SELECTOR,
-    FOUR_MEME_TOKEN_MANAGER,
+    FOUR_MEME_HELPER3,
+    _FOUR_INFO_TYPES,
+    _GET_PANCAKE_PAIR_SELECTOR,
+    _GET_TOKEN_INFO_SELECTOR,
+    _TRY_BUY_SELECTOR,
+    _TRY_SELL_SELECTOR,
 )
+from meme_system.domain.models import EntryFeatures
+from meme_system.strategies.baseline import BaselineStrategy, bsc_baseline_config
 
 
 TOKEN = "0x1111111111111111111111111111111111111111"
 PAIR = "0x2222222222222222222222222222222222222222"
+MANAGER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+STABLE = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 ROUTER = "0x13f4ea83d0bd40e75c8222255bc855a974568dd4"
-NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+ZERO = "0x0000000000000000000000000000000000000000"
 
 
 class _Rpc:
     urls = ("https://rpc.example",)
     configured = True
 
-    def call_uint(self, _to, _data):
-        return 18
+    def __init__(self, *, quote: str = ZERO, migrated: bool = False) -> None:
+        self.quote = quote
+        self.migrated = migrated
+
+    def call_uint(self, to, _data):
+        return 6 if to == STABLE else 18
+
+    def call_address(self, _to, data):
+        return PAIR if data.startswith(_GET_PANCAKE_PAIR_SELECTOR) and self.migrated else None
+
+    def call(self, method, _params):
+        self.assertEqual(method, "eth_getCode")
+        return "0x363d3d373d3d3d363d73" + "12" * 20 + "5af43d82803e903d91602b57fd5bf3"
+
+    def call_hex(self, _to, data):
+        if data.startswith(_GET_TOKEN_INFO_SELECTOR):
+            return "0x" + abi_encode(
+                list(_FOUR_INFO_TYPES),
+                (2, MANAGER, self.quote, 1, 0, 0, 0, 0, 0, 0, 0, self.migrated),
+            ).hex()
+        if data.startswith(_TRY_BUY_SELECTOR):
+            return "0x" + abi_encode(
+                ["address", "address", "uint256", "uint256", "uint256", "uint256", "uint256", "uint256"],
+                (MANAGER, self.quote, 100 * 10**18, 0, 0, 0, 0, 0),
+            ).hex()
+        if data.startswith(_TRY_SELL_SELECTOR):
+            return "0x" + abi_encode(
+                ["address", "address", "uint256", "uint256"],
+                (MANAGER, self.quote, 10**16, 10**12),
+            ).hex()
+        return None
+
+    def assertEqual(self, first, second):
+        if first != second:
+            raise AssertionError(f"{first!r} != {second!r}")
+
+
+class _Router:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, payload):
+        self.calls.append(dict(payload))
+        if payload["operation"] == "health":
+            return {"status": "ok", "ready": True}
+        output_raw = "100000000" if payload["outputNative"] is False else "9000000000000000"
+        return {
+            "status": "ok",
+            "outputRaw": output_raw,
+            "routerAddress": ROUTER,
+            "route": [{"type": "V2", "pools": [PAIR]}],
+        }
+
+    def close(self):
+        return None
 
 
 class BscReadOnlyQuoteTests(unittest.TestCase):
-    def test_pancakeswap_candidate_requires_and_persists_two_real_quotes(self) -> None:
-        provider = BscReadOnlyQuoteProvider(rpc=_Rpc(), helper_path=Path(__file__))
-
-        def router(_mint, side, _amount_raw, _decimals):
-            return {
-                "outputRaw": "250000000000000000000" if side == "buy" else "9000000000000000",
-                "priceImpactPct": "1.25",
-                "routerAddress": ROUTER,
-                "route": [{"type": "V2", "pools": [PAIR]}],
-            }
-
-        provider._router_request = router  # type: ignore[method-assign]
-        buy, sell, error = provider.quote_candidate(
-            TOKEN,
-            Decimal("0.01"),
-            {"pair_address": PAIR, "migrate_status": 1, "token_decimals": 18},
+    def test_native_bonding_curve_uses_onchain_context_and_two_quotes(self) -> None:
+        provider = BscReadOnlyQuoteProvider(
+            rpc=_Rpc(), helper_path=Path(__file__), router_client=_Router()
         )
+
+        buy, sell, error = provider.quote_candidate(TOKEN, Decimal("0.01"))
 
         self.assertIsNone(error)
         self.assertIsNotNone(buy)
         self.assertIsNotNone(sell)
         assert buy is not None and sell is not None
-        self.assertEqual(buy.quote_source, "pancakeswap_router")
-        self.assertEqual(sell.quote_source, "pancakeswap_router")
-        self.assertGreater(buy.output_quantity, 0)
-        self.assertGreater(sell.output_quantity, 0)
-        self.assertTrue(any(item == f"router:{ROUTER}" for item in buy.route))
+        self.assertEqual(buy.quote_source, "bonding_curve_quote")
+        self.assertEqual(sell.quote_source, "bonding_curve_quote")
+        self.assertIn(FOUR_MEME_HELPER3, buy.route)
+        self.assertIn("fundraising:native", buy.route)
 
-    def test_four_bonding_curve_candidate_uses_curve_quote_for_both_sides(self) -> None:
-        provider = BscReadOnlyQuoteProvider(rpc=_Rpc(), helper_path=Path(__file__))
-        info = (TOKEN, NATIVE, 0, 0, 0, 0, 0, 0, 0, 10**18, 0, 0, 0)
-        provider._four_token_info = lambda _mint, _curve: info  # type: ignore[method-assign]
-        provider._four_fee = lambda _curve, _info, _amount: 1  # type: ignore[method-assign]
-        provider._four_call_uint = lambda _curve, selector, _info, _amount: (  # type: ignore[method-assign]
-            1 if selector == _CALC_TRADING_FEE_SELECTOR else 1000000000000000000
+    def test_stable_bonding_curve_uses_real_asset_decimals_and_router_conversion(self) -> None:
+        router = _Router()
+        provider = BscReadOnlyQuoteProvider(
+            rpc=_Rpc(quote=STABLE), helper_path=Path(__file__), router_client=router
         )
 
-        buy, sell, error = provider.quote_candidate(
-            TOKEN,
-            Decimal("0.01"),
-            {"protocol": 2002, "migrate_status": 0, "pair_address": NATIVE, "token_decimals": 18},
+        buy, sell, error = provider.quote_candidate(TOKEN, Decimal("0.01"))
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(buy)
+        self.assertIsNotNone(sell)
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(router.calls[0]["outputToken"], STABLE)
+        self.assertEqual(router.calls[0]["outputDecimals"], 6)
+        self.assertEqual(router.calls[1]["inputToken"], STABLE)
+        self.assertEqual(router.calls[1]["inputDecimals"], 6)
+
+    def test_migrated_four_token_uses_pancakeswap_context_not_binance_hint(self) -> None:
+        router = _Router()
+        provider = BscReadOnlyQuoteProvider(
+            rpc=_Rpc(migrated=True), helper_path=Path(__file__), router_client=router
         )
+
+        buy, sell, error = provider.quote_candidate(TOKEN, Decimal("0.01"), {"protocol": 2002})
 
         self.assertIsNone(error)
         self.assertIsNotNone(buy)
         self.assertIsNotNone(sell)
         assert buy is not None and sell is not None
-        self.assertEqual(buy.quote_source, "bonding_curve")
-        self.assertEqual(sell.quote_source, "bonding_curve")
-        self.assertIn(FOUR_MEME_TOKEN_MANAGER, buy.route)
+        self.assertEqual(buy.quote_source, "pancakeswap_quote")
+        self.assertEqual(sell.quote_source, "pancakeswap_quote")
+        self.assertEqual(len(router.calls), 2)
+
+    def test_missing_helper_context_has_dedicated_error_and_never_calls_router(self) -> None:
+        class MissingContextRpc(_Rpc):
+            def call_hex(self, _to, _data):
+                return "0x"
+
+        router = _Router()
+        provider = BscReadOnlyQuoteProvider(
+            rpc=MissingContextRpc(), helper_path=Path(__file__), router_client=router
+        )
+        buy, sell, error = provider.quote_candidate(TOKEN, Decimal("0.01"))
+
+        self.assertIsNone(buy)
+        self.assertIsNone(sell)
+        self.assertEqual(error, "fourmeme_context_unavailable")
+        self.assertEqual(router.calls, [])
+
+    def test_bsc_context_errors_are_not_collapsed_to_generic_buy_quote_error(self) -> None:
+        decision = BaselineStrategy(bsc_baseline_config()).evaluate_entry(
+            EntryFeatures(
+                token_age_sec=None,
+                unique_buyers_15s=None,
+                buy_sell_count_ratio_15s=None,
+                net_buy_15s=None,
+                flow_windows_non_negative=(None, None),
+                creator_confirmed_sold=None,
+                buy_quote=None,
+                sell_quote=None,
+                evaluated_at=datetime.now(timezone.utc),
+                holders=200,
+                market_cap_usd=Decimal("2000"),
+                liquidity_usd=Decimal("200"),
+                pricing_mode="bsc_executable_quote",
+                pricing_error="fourmeme_context_unavailable",
+            )
+        )
+
+        reasons = {check.reason_code for check in decision.checks}
+        self.assertIn("fourmeme_context_unavailable", reasons)
+        self.assertNotIn("buy_quote_unavailable", reasons)
