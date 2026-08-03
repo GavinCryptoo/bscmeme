@@ -27,7 +27,9 @@ MIGRATIONS = (
 
 def initialize_database(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    # The realtime position scheduler owns mutations through its coordinator
+    # lock but runs on a dedicated thread; permit that shared connection.
+    connection = sqlite3.connect(path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA busy_timeout=5000")

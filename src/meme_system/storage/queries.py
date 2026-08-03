@@ -178,16 +178,14 @@ class LedgerQueries:
         """Attach read-only trade details and time-bounded market snapshots."""
         for row in rows:
             entry = self.connection.execute(
-                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at, "
-                "quote_source, quote_route, pricing_mode, legacy_valuation "
+                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'entry' "
                 "ORDER BY recorded_at ASC, rowid ASC LIMIT 1",
                 (self.mode, row["position_id"]),
             ).fetchone()
             exit_row = self.connection.execute(
                 "SELECT quote_input_quantity, quote_output_quantity, "
-                "net_pnl_estimated_sol, quote_quoted_at, recorded_at, quote_source, "
-                "quote_route, pricing_mode, pnl_status, legacy_valuation "
+                "net_pnl_estimated_sol, quote_quoted_at, recorded_at "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'exit' "
                 "ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
                 (self.mode, row["position_id"]),
@@ -233,18 +231,6 @@ class LedgerQueries:
             pnl_sol = exit_row["net_pnl_estimated_sol"] if exit_row is not None else None
             row["pnl_sol"] = pnl_sol
             row["pnl_rate_pct"] = _percentage(pnl_sol, row.get("quantity_sol"))
-            source_row = exit_row or entry
-            row["quote_source"] = source_row["quote_source"] if source_row is not None else None
-            row["quote_route"] = _decode_json(source_row["quote_route"]) if source_row is not None else None
-            row["pricing_mode"] = source_row["pricing_mode"] if source_row is not None else None
-            row["pnl_status"] = exit_row["pnl_status"] if exit_row is not None else None
-            row["legacy_valuation"] = bool(
-                (source_row["legacy_valuation"] if source_row is not None else 0)
-                or row.get("pricing_mode") == "legacy_binance_indicative"
-            )
-            row["valuation_label"] = (
-                "旧版指示价估算" if row["legacy_valuation"] else "BSC 可执行只读报价"
-            )
             self._attach_market_snapshots(row, entry, exit_row)
 
     def _attach_market_snapshots(

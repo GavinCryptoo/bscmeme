@@ -309,6 +309,7 @@ class BinanceRealtimeFeatureProvider:
         chain_id: str = "CT_501",
         live_executor: object | None = None,
         bsc_quote_provider: BscReadOnlyQuoteProvider | None = None,
+        bsc_executable_quote_enabled: bool = False,
         bsc_pool_resolver: BscPoolResolver | None = None,
         solana_price_monitor: SolanaPriceMonitor | None = None,
     ) -> None:
@@ -319,6 +320,7 @@ class BinanceRealtimeFeatureProvider:
         self.is_bsc = chain_id == "56"
         self.live_executor = live_executor
         self.bsc_quote_provider = bsc_quote_provider
+        self.bsc_executable_quote_enabled = bool(bsc_executable_quote_enabled)
         self.bsc_pool_resolver = bsc_pool_resolver
         self.solana_price_monitor = solana_price_monitor
         self._position_snapshots: dict[str, BinanceMarketSnapshot] = {}
@@ -391,8 +393,12 @@ class BinanceRealtimeFeatureProvider:
         buy_quote: ExecutableQuote | None = None
         sell_quote: ExecutableQuote | None = None
         quote_errors: list[str] = []
-        pricing_mode = "bsc_executable_quote" if self.is_bsc else "executable_quote"
-        executable_quote = not self.is_bsc
+        pricing_mode = (
+            "bsc_executable_quote"
+            if self.is_bsc and self.bsc_executable_quote_enabled
+            else "binance_indicative" if self.is_bsc else "executable_quote"
+        )
+        executable_quote = not self.is_bsc or self.bsc_executable_quote_enabled
         pricing_error: str | None = None
         if self.is_bsc and self.live_executor is not None:
             try:
@@ -419,7 +425,7 @@ class BinanceRealtimeFeatureProvider:
             )
             if pricing_error is not None:
                 soft["pricing_error"] = pricing_error
-        elif self.is_bsc:
+        elif self.is_bsc and self.bsc_executable_quote_enabled:
             if self.bsc_quote_provider is not None:
                 quote_fields = {
                     name: _field_value(fields, name)
@@ -445,6 +451,22 @@ class BinanceRealtimeFeatureProvider:
                     "net_pnl_is_estimated": False,
                     "pricing_reference_mode": "binance_indicative_reference",
                     "pricing_reference_executable_quote": False,
+                }
+            )
+            if pricing_error is not None:
+                soft["pricing_error"] = pricing_error
+        elif self.is_bsc:
+            buy_quote, sell_quote, pricing_error = self._indicative_entry_quotes(
+                normalized.signal.mint,
+                fields,
+                dynamic,
+                evaluated_at,
+            )
+            soft.update(
+                {
+                    "pricing_mode": "binance_indicative",
+                    "executable_quote": False,
+                    "net_pnl_is_estimated": True,
                 }
             )
             if pricing_error is not None:
@@ -493,16 +515,35 @@ class BinanceRealtimeFeatureProvider:
                     )
                 except Exception:
                     return None
-            if self.bsc_quote_provider is None or position.active_quantity_token <= 0:
+            if position.active_quantity_token <= 0:
+                return None
+            if self.bsc_executable_quote_enabled:
+                if self.bsc_quote_provider is None:
+                    return None
+                try:
+                    return self.bsc_quote_provider.quote(
+                        position.mint,
+                        "sell",
+                        position.active_quantity_token,
+                    )
+                except Exception:
+                    return None
+            if self.market_data is None:
                 return None
             try:
-                return self.bsc_quote_provider.quote(
-                    position.mint,
-                    "sell",
-                    position.active_quantity_token,
-                )
+                snapshot = self.market_data.snapshot(position.mint)
             except Exception:
                 return None
+            self._position_snapshots[position.position_id] = snapshot
+            self._latest_market_snapshots[position.mint] = snapshot
+            return self._indicative_quote(
+                position.mint,
+                "sell",
+                position.active_quantity_token,
+                snapshot.fields,
+                snapshot.observed_at,
+                snapshot.raw_response_hash,
+            )
         if self.quote_provider is None or position.active_quantity_token <= 0:
             return None
         try:
@@ -602,9 +643,41 @@ class BinanceRealtimeFeatureProvider:
         event: BscPairEvent,
         descriptor: BscPoolDescriptor | None,
     ) -> ExecutableQuote | None:
-        """WSS is a trigger only; it never becomes a simulated fill quote."""
+        """Convert an observed BSC pool price into an indicative valuation.
 
-        return None
+        This is the existing Paper/Shadow fast-path.  It remains explicitly
+        non-executable and the 2-second Binance snapshot poll remains the
+        fallback when a pool event cannot be decoded.
+        """
+        if self.bsc_executable_quote_enabled or self.bsc_pool_resolver is None:
+            return None
+        if position.active_quantity_token <= 0 or descriptor is None:
+            return None
+        pool_price = self.bsc_pool_resolver.price_from_event(descriptor, event)
+        if pool_price is None or pool_price.mint.lower() != position.mint.lower():
+            return None
+        output_quantity = position.active_quantity_token * pool_price.native_token_price
+        if output_quantity <= 0:
+            return None
+        return ExecutableQuote(
+            quote_id=(
+                f"bsc-pool-wss:{pool_price.pool_address}:{pool_price.block_number or 'na'}:"
+                f"{pool_price.log_index or 'na'}"
+            ),
+            mint=position.mint,
+            side="sell",
+            input_quantity=position.active_quantity_token,
+            output_quantity=output_quantity,
+            route_fee=None,
+            price_impact_pct=None,
+            quoted_at=pool_price.observed_at,
+            age_ms=0,
+            provider="bsc_pool_wss",
+            route=(pool_price.pool_type,),
+            raw_response_hash=pool_price.raw_response_hash,
+            executable_style=False,
+            confidence="indicative",
+        )
 
     def position_holders(self, position_id: str) -> int | None:
         """Return holders from the latest BSC position snapshot, if available."""
@@ -1345,9 +1418,9 @@ class RealtimeCoordinator:
     def run_position_cycle(self, *, trigger: str = "poll") -> PositionCycleResult:
         """Refresh holdings and evaluate the existing exit rules.
 
-        For BSC, a decoded pool event is only an immediate refresh trigger.
-        The simulated price always comes from a fresh read-only executable
-        quote; neither the event spot nor Binance is a settlement price.
+        For BSC, the default Paper/Shadow mode retains the established
+        indicative pool-event fast path with a Binance 2-second fallback.
+        The staged executable-quote path is opt-in only.
         """
 
         started = self.clock()
@@ -1355,6 +1428,15 @@ class RealtimeCoordinator:
         if events:
             trigger = "wss"
             for event in events:
+                descriptor = self._bsc_descriptors_by_pool.get(event.pair_address)
+                if not self.features.bsc_executable_quote_enabled and descriptor is not None:
+                    for mode, engine in self.engines.items():
+                        for position in tuple(engine.ledger.active_positions):
+                            if position.mint not in self._bsc_mints_by_pool.get(descriptor.address, set()):
+                                continue
+                            quote = self.features.bsc_pool_quote_for_event(position, event, descriptor)
+                            if quote is not None:
+                                self._bsc_last_pool_quotes[position.position_id] = quote
                 for mode in self.engines:
                     self._audit(mode, "BSC_PAIR_EVENT_REFRESH", {
                         "pair_address": event.pair_address,
@@ -1378,9 +1460,20 @@ class RealtimeCoordinator:
         if self.features.is_bsc:
             fetched_quotes: dict[tuple[str, str], ExecutableQuote | None] = {}
             for mode, _engine, position in jobs:
-                # WSS only wakes this loop. Every invocation obtains a fresh
-                # executable sell quote, including the 2-second fallback poll.
-                quote = self.features.quote_for_position(position)
+                quote: ExecutableQuote | None = None
+                if not self.features.bsc_executable_quote_enabled and self._bsc_wss_healthy:
+                    cached = self._bsc_last_pool_quotes.get(position.position_id)
+                    if (
+                        cached is not None
+                        and cached.input_quantity == position.active_quantity_token
+                        and cached.unusable_reason(self.clock()) is None
+                    ):
+                        quote = cached
+                if quote is None:
+                    # In default mode this is the bounded 2-second Binance
+                    # indicative fallback.  In staged mode it is a fresh
+                    # read-only executable quote.
+                    quote = self.features.quote_for_position(position)
                 fetched_quotes[(mode, position.position_id)] = quote
                 self._audit(mode, "BSC_POSITION_QUOTE_REFRESH", {
                     "position_id": position.position_id,
@@ -1389,7 +1482,7 @@ class RealtimeCoordinator:
                     "quote_source": quote.quote_source or quote.provider if quote is not None else None,
                     "executable_quote": bool(quote.executable_style) if quote is not None else False,
                     "quote_unavailable": quote is None,
-                    "wss_is_trigger_only": True,
+                    "wss_is_trigger_only": self.features.bsc_executable_quote_enabled,
                 })
         else:
             # Quote GETs are the only work done concurrently. Simulation
@@ -1468,9 +1561,15 @@ class RealtimeCoordinator:
                     "position_id": position_id,
                     "window_sec": window,
                     "return_pct": return_pct,
-                    "pricing_mode": "bsc_executable_quote" if self.features.is_bsc else "jupiter_quote",
-                    "executable_quote": True,
-                    "net_pnl_is_estimated": False if self.features.is_bsc else None,
+                    "pricing_mode": (
+                        "bsc_executable_quote"
+                        if self.features.is_bsc and self.features.bsc_executable_quote_enabled
+                        else "binance_indicative" if self.features.is_bsc else "jupiter_quote"
+                    ),
+                    "executable_quote": not self.features.is_bsc or self.features.bsc_executable_quote_enabled,
+                    "net_pnl_is_estimated": (
+                        False if self.features.bsc_executable_quote_enabled else True
+                    ) if self.features.is_bsc else None,
                     "unavailable": return_pct is None,
                 })
             if len(followup.returns_after_exit_pct) < len(windows):

@@ -431,10 +431,8 @@ class SimulationTests(unittest.TestCase):
 
         self.assertIsNotNone(result.closed_position)
         self.assertEqual(result.closed_position.closed_reason, "max_hold_timeout")
-        self.assertEqual(
-            (result.closed_position.closed_at - result.closed_position.opened_at).total_seconds(),
-            600,
-        )
+        self.assertEqual(result.closed_position.closed_at, NOW)
+        self.assertEqual(result.closed_position.exit_quote_at, NOW)
         execution = engine.ledger.executions[-1]
         self.assertEqual(execution.pricing_mode, "executable_quote")
         self.assertTrue(execution.executable_quote)

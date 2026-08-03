@@ -954,10 +954,9 @@ class DeterministicSimulation:
             identity=position.identity,
             returns_after_exit_pct=returns,
             paper_tp_reached=paper_tp_reached,
-            avoided_loss_pct=avoided_loss_pct,
-            missed_profit_pct=missed_profit_pct,
+                avoided_loss_pct=avoided_loss_pct,
+                missed_profit_pct=missed_profit_pct,
                 recorded_at=now,
-                price_snapshot=snapshot,
             )
         self.ledger.record_shadow_outcome(outcome)
         return ExitResult(position, decision, closed, outcome)

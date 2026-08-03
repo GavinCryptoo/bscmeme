@@ -216,7 +216,6 @@ class DashboardService:
             "p.strategy_name, p.mint, p.token_name, p.quantity_sol, p.closed_reason "
             "FROM executions e JOIN virtual_positions p ON p.position_id = e.position_id "
             "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL "
-            "AND COALESCE(e.legacy_valuation, 0) = 0 "
             "ORDER BY e.recorded_at DESC, e.rowid DESC",
             (mode,),
         ).fetchall()
@@ -540,14 +539,9 @@ class DashboardService:
             "chain_id": "56" if chain == "bsc" else "CT_501",
             "read_only": True,
             "pricing": {
-                "pricing_mode": "bsc_executable_quote" if chain == "bsc" else "jupiter_quote",
-                "executable_quote": True if chain == "bsc" else True,
-                "net_pnl_is_estimated": False if chain == "bsc" else None,
-                "binance_reference": {
-                    "pricing_mode": "binance_indicative_reference",
-                    "executable_quote": False,
-                    "participates_in_pnl": False,
-                } if chain == "bsc" else None,
+                "pricing_mode": "binance_indicative" if chain == "bsc" else "jupiter_quote",
+                "executable_quote": False if chain == "bsc" else True,
+                "net_pnl_is_estimated": True if chain == "bsc" else None,
             },
             "safety": {
                 "paper_only": self.safety.paper_only,
@@ -568,8 +562,7 @@ class DashboardService:
         display_since: str | None = None,
     ) -> dict[str, object]:
         where = (
-            "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL "
-            "AND COALESCE(e.legacy_valuation, 0) = 0"
+            "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL"
         )
         params: tuple[object, ...] = (mode,)
         if display_since is not None:
@@ -648,9 +641,9 @@ class DashboardService:
         config = bsc_baseline_config() if is_bsc else BaselineConfig()
         entry_config = (
             {
-                "pricing_mode": "bsc_executable_quote",
-                "executable_quote": True,
-                "binance_indicative_reference_only": True,
+                "pricing_mode": "binance_indicative",
+                "executable_quote": False,
+                "binance_current_price_required": True,
                 "observation_delay_sec": config.observation_delay_sec,
                 "observation_price_rise_required": True,
                 "require_holders_non_decreasing_after_observation": config.require_holders_non_decreasing_after_observation,
@@ -705,20 +698,15 @@ class DashboardService:
             "chain_key": chain,
             "chain_id": "56" if chain == "bsc" else "CT_501",
             "pricing": {
-                "pricing_mode": "bsc_executable_quote" if is_bsc else "jupiter_quote",
-                "executable_quote": True,
-                "net_pnl_is_estimated": False if is_bsc else None,
-                "binance_reference": {
-                    "pricing_mode": "binance_indicative_reference",
-                    "executable_quote": False,
-                    "participates_in_pnl": False,
-                } if is_bsc else None,
+                "pricing_mode": "binance_indicative" if is_bsc else "jupiter_quote",
+                "executable_quote": False if is_bsc else True,
+                "net_pnl_is_estimated": True if is_bsc else None,
             },
             "strategy": BSC_BASELINE_IDENTITY.strategy_name if is_bsc else config.identity.strategy_name,
             "ruleset_name": config.identity.ruleset_name,
             "ruleset_version": config.identity.ruleset_version,
-            "display_name": "BSC 可执行只读报价 Paper/Shadow 策略" if is_bsc else "Solana 超早期基线策略",
-            "display_ruleset_name": "BSC 链上报价最小规则" if is_bsc else "超早期最小规则",
+            "display_name": "BSC Binance 指示价 Paper/Shadow 策略" if is_bsc else "Solana 超早期基线策略",
+            "display_ruleset_name": "BSC 指示价最小规则" if is_bsc else "超早期最小规则",
             "live_engine": False,
             "wallet_path": None,
             "signing_path": None,

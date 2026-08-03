@@ -16,6 +16,11 @@ htmlcov/
 data/solana/paper/*
 data/solana/shadow/*
 data/solana/token_decimals_cache.json
+data/solana/locks/*
 data/bsc/live/*
+data/bsc/paper/*
+data/bsc/shadow/*
+data/bsc/locks/*
+data/*/runtime_control.json
 logs/*
 !logs/.gitkeep

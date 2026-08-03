@@ -86,7 +86,7 @@
     sol_ultra_early_baseline: 'Solana 超早期基线策略',
     ultra_early_minimal: '超早期最小规则',
     binance_web3: 'Binance Web3',
-    bsc_binance_indicative: 'BSC 链上可执行只读报价 Paper/Shadow 策略',
+    bsc_binance_indicative: 'BSC Binance 指示价 Paper/Shadow 策略',
   };
   const healthLabels = {
     HEALTHY: '健康',
@@ -505,13 +505,13 @@
     const isBsc = config.chain_key === 'bsc';
     const observation = observationWindowText();
     $('#strategy-modal-subtitle').textContent = isBsc
-      ? 'BSC 当前运行配置：实际 bonding curve / DEX Router 只读报价 Paper/Shadow；Binance 仅作辅助对照，不包含钱包、签名、广播或真实交易。'
+      ? 'BSC 当前运行配置：Binance 指示价 Paper/Shadow，不包含钱包、签名、广播或真实交易。'
       : 'Solana 当前运行基线：Jupiter Quote 只读 Paper/Shadow，不包含真实交易。';
     const labels = { entry: isBsc ? 'BSC 入场与定价规则' : '入场硬条件', paper_exit: 'Paper 退出规则', shadow_exit: 'Shadow 规则', risk: '虚拟风控' };
     const textFor = (key, value) => {
       const names = {
         token_age_sec: `币龄 ${value[0]}–${value[1]} 秒`, unique_buyers_15s_min: `15 秒独立买家数 ≥ ${value}`, buy_sell_count_ratio_15s_min: `15 秒买卖笔数比 ≥ ${value}`, net_buy_15s: `15 秒净买入 > 0`, require_two_non_negative_flow_windows: '两个短窗口净流量均非负', creator_confirmed_sold_at_entry: '创建者确认卖出必须为否', require_executable_buy_route: '必须存在可执行买入 Quote', require_executable_sell_route: '必须存在可执行卖出 Quote', max_buy_price_impact_pct: `买入价格影响 ≤ ${value}%`, max_immediate_exit_impact_pct: `即时卖出价格影响 ≤ ${value}%`, min_holders: `${groups.entry?.min_holders_inclusive ? '入场时持币地址数 ≥' : '入场时持币地址数 >'} ${value}`, min_market_cap_usd: `入场时市值 ≥ ${value} USD`, min_liquidity_usd: `入场时流动性 ≥ ${value} USD`, take_profit_pct: `止盈 ≥ ${value}% · 全部退出`, stop_loss_trigger_pct: `止损 ≤ ${value}% · 全部退出`, max_hold_sec: `最长持仓 ${value} 秒`, take_profit_sell_pct: `止盈卖出 ${value}%`, stop_loss_sell_pct: `止损卖出 ${value}%`, partial_take_profit_enabled: '不启用分批止盈', moving_stop_enabled: '不启用移动止损', shadow_holders_drop_pct: `Shadow 持币地址数下降超过 ${value}% 时提前退出`, shadow_liquidity_drop_pct: `Shadow 流动性下降超过 ${value}% 时提前退出`, shadow_defense_pct: `防御退出收益率 ≤ ${value}%`, shadow_time_sec: `Shadow 时间退出 ≥ ${value} 秒`, shadow_mfe_pct: `Shadow MFE 门槛 ${value}%`, rules: 'Shadow 规则组', position_size_sol: `单笔虚拟仓位 ${value} SOL`, initial_virtual_balance_sol: `初始虚拟余额 ${value} SOL`, max_open_positions: `最大同时持仓 ${value}`, same_name_cooldown_sec: `同名冷却 ${value} 秒`, one_trade_per_mint: '同一 Mint 只允许一个生命周期', daily_full_loss_sol_limit: `每日完整亏损上限 ${value} SOL`, pause_new_entries_after_large_losses: `大亏 ${value} 次后暂停新入场`, large_loss_threshold_pct: `大亏阈值 ${value}%`,
-        pricing_mode: '定价模式：BSC 链上可执行只读报价', executable_quote: value ? '可执行报价：是' : '可执行报价：否（不接入真实交易路由）', binance_indicative_reference_only: 'Binance 指示价仅作 Dashboard 对照，不参与 PnL', observation_delay_sec: `观察期 ${observation}`, observation_price_rise_required: value ? `${observation}观察后价格必须高于首次发现价格` : `${observation}观察后价格不得低于首次发现价格`, require_holders_non_decreasing_after_observation: value ? `${observation}观察后持币地址数不得低于首次发现值` : '观察后持币地址数不设下降门槛', optional_unavailable_fields: `不可用字段（仅记录、不阻断）：${Array.isArray(value) ? value.join('、') : value}`, position_size_bnb: `单笔虚拟仓位 ${value} BNB`, initial_virtual_balance_bnb: `初始虚拟余额 ${value} BNB`, daily_full_loss_bnb: `每日完整亏损上限 ${value} BNB`,
+        pricing_mode: '定价模式：Binance 指示价（仅模拟）', executable_quote: value ? '可执行报价：是' : '可执行报价：否（不接入真实交易路由）', binance_current_price_required: 'Binance 当前价格缺失或无效时拒绝入场', observation_delay_sec: `观察期 ${observation}`, observation_price_rise_required: value ? `${observation}观察后价格必须高于首次发现价格` : `${observation}观察后价格不得低于首次发现价格`, require_holders_non_decreasing_after_observation: value ? `${observation}观察后持币地址数不得低于首次发现值` : '观察后持币地址数不设下降门槛', optional_unavailable_fields: `不可用字段（仅记录、不阻断）：${Array.isArray(value) ? value.join('、') : value}`, position_size_bnb: `单笔虚拟仓位 ${value} BNB`, initial_virtual_balance_bnb: `初始虚拟余额 ${value} BNB`, daily_full_loss_bnb: `每日完整亏损上限 ${value} BNB`,
       };
       if (key === 'rules') {
         const ruleLabels = {

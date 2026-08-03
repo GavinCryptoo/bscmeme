@@ -24,7 +24,7 @@ class RuntimeLockError(RuntimeError):
 
 
 class SingleInstanceLock:
-    """Exclusive lock file; stale locks are reported, never silently deleted."""
+    """Exclusive lock file that preserves verified-stale lock evidence."""
 
     def __init__(self, path: Path, *, name: str) -> None:
         self.path = path
@@ -43,11 +43,24 @@ class SingleInstanceLock:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
             existing = "unavailable"
+            existing_pid: int | None = None
             try:
                 existing = self.path.read_text(encoding="utf-8")[:500]
-            except OSError:
+                parsed = json.loads(existing)
+                value = parsed.get("pid") if isinstance(parsed, Mapping) else None
+                existing_pid = value if isinstance(value, int) and value > 0 else None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
-            raise RuntimeLockError(f"{self.name} already running: {existing}") from exc
+            if existing_pid is not None and _pid_is_running(existing_pid):
+                raise RuntimeLockError(f"{self.name} already running: {existing}") from exc
+            stale_path = self.path.with_name(
+                f"{self.path.name}.stale-{utc_now().strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            try:
+                self.path.replace(stale_path)
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except OSError as stale_exc:
+                raise RuntimeLockError(f"{self.name} stale lock could not be preserved: {existing}") from stale_exc
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, ensure_ascii=False, sort_keys=True)
         self._owned = True
@@ -67,6 +80,16 @@ class SingleInstanceLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class JsonlAuditWriter:

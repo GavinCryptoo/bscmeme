@@ -111,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     paths = RuntimePaths.from_env(args.chain)
     paths.validate_isolation()
+    bsc_executable_quote_enabled = (
+        args.chain == "bsc"
+        and args.mode != "live"
+        and os.environ.get("BSC_EXECUTABLE_QUOTE_ENABLED", "false").strip().lower() == "true"
+    )
     modes = _modes(args.mode)
     chain_id = "56" if args.chain == "bsc" else "CT_501"
     connections = {}
@@ -180,9 +185,13 @@ def main(argv: list[str] | None = None) -> int:
                 pricing_mode=(
                     "pancakeswap_smart_router"
                     if mode == "live"
-                    else "bsc_executable_quote" if args.chain == "bsc" else "executable_quote"
+                    else "bsc_executable_quote"
+                    if bsc_executable_quote_enabled
+                    else "binance_indicative" if args.chain == "bsc" else "executable_quote"
                 ),
-                executable_quote=True if args.chain == "bsc" else mode == "live" or args.chain != "bsc",
+                executable_quote=(
+                    mode == "live" or args.chain != "bsc" or bsc_executable_quote_enabled
+                ),
                 live_executor=live_executor if mode == "live" else None,
                 live_max_entries=live_config.max_entries if mode == "live" and live_config else 0,
             )
@@ -193,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         client = BinanceWeb3Client.from_env()
         bsc_quote_provider = (
             BscReadOnlyQuoteProvider.from_env(project_root=Path.cwd())
-            if args.chain == "bsc" and args.mode != "live"
+            if bsc_executable_quote_enabled
             else None
         )
         solana_rpc = SolanaRpcClient.from_env() if args.chain == "solana" else None
@@ -225,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             chain_id=chain_id,
             live_executor=live_executor,
             bsc_quote_provider=bsc_quote_provider,
+            bsc_executable_quote_enabled=bsc_executable_quote_enabled,
             bsc_pool_resolver=(BscPoolResolver.from_env() if args.chain == "bsc" else None),
             solana_price_monitor=solana_price_monitor,
         )
@@ -374,9 +384,9 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator.update_bsc_wss_status(bsc_wss_monitor.safe_status())
             print(json.dumps({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes}, ensure_ascii=False))
         else:
-            # Solana holdings use account WSS for local prices and a bounded
-            # 10-second executable Jupiter check; no fixed 2-second Quote GET.
-            position_poll_sec = 10.0
+            # Solana holdings retain the established 2-second Jupiter quote
+            # refresh, with account WSS able to trigger earlier processing.
+            position_poll_sec = 2.0
 
             def run_solana_position_scheduler() -> None:
                 next_position_at = time.monotonic()

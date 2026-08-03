@@ -361,7 +361,7 @@ class SimulationLedger:
                 "closed_at, closed_reason, signal_observed_at, evaluated_at, "
                 "entry_quote_at, exit_quote_at, raw_name, display_name, symbol, "
                 "entry_price_snapshot_json, exit_price_snapshot_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (" + ", ".join("?" for _ in range(41)) + ")",
                 (
                     position.position_id,
                     position.mint,
@@ -729,6 +729,7 @@ class SimulationLedger:
         closed_at: datetime | None = None,
         closed_reason: str | None = None,
         exit_quote_at: datetime | None = None,
+        exit_price_snapshot: PriceSnapshot | None = None,
     ) -> VirtualPosition:
         position = self.positions.pop(position_id)
         closed_at = closed_at or position.last_observed_at or position.opened_at
@@ -741,18 +742,21 @@ class SimulationLedger:
             closed_at=closed_at,
             closed_reason=closed_reason,
             exit_quote_at=exit_quote_at,
+            exit_price_snapshot=exit_price_snapshot,
         )
         self.closed_positions[position_id] = closed
         if self.connection is not None:
             self.connection.execute(
                 "UPDATE virtual_positions SET status = ?, remaining_quantity_token = ?, "
-                "closed_at = ?, closed_reason = ?, exit_quote_at = ? WHERE position_id = ?",
+                "closed_at = ?, closed_reason = ?, exit_quote_at = ?, "
+                "exit_price_snapshot_json = ? WHERE position_id = ?",
                 (
                     "CLOSED",
                     "0",
                     closed_at.isoformat(),
                     closed_reason,
                     exit_quote_at.isoformat() if exit_quote_at is not None else None,
+                    _snapshot_json(exit_price_snapshot),
                     position_id,
                 ),
             )
@@ -776,9 +780,8 @@ class SimulationLedger:
             "quote_input_quantity, quote_output_quantity, price_impact_pct, quote_quoted_at, "
             "route_fee, estimated_network_fee, estimated_priority_fee, gross_pnl_sol, "
             "gross_pnl_pct, net_pnl_estimated_sol, net_pnl_is_estimated, recorded_at, "
-            "pricing_mode, executable_quote, exit_status, pnl_status, quote_source, "
-            "quote_route, legacy_valuation) "
-            "VALUES (" + ", ".join("?" for _ in range(26)) + ") ",
+            "pricing_mode, executable_quote, exit_status, pnl_status) "
+            "VALUES (" + ", ".join("?" for _ in range(23)) + ") ",
             (
                 execution.execution_id,
                 execution.position_id,
@@ -817,9 +820,6 @@ class SimulationLedger:
                 int(execution.executable_quote),
                 execution.exit_status,
                 execution.pnl_status,
-                execution.quote_source,
-                json.dumps(execution.quote_route, ensure_ascii=False),
-                int(execution.pricing_mode == "legacy_binance_indicative"),
             ),
         )
         self.connection.commit()
