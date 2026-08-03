@@ -12,6 +12,34 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class PriceSnapshot:
+    """One atomic native/USD price observation used for a lifecycle boundary."""
+
+    price_native: Decimal | None
+    native_symbol: str | None
+    native_usd: Decimal | None
+    price_usd: Decimal | None
+    price_source: str | None
+    quoted_at: datetime | None
+    executable_quote: bool
+    estimated: bool
+    price_age_ms: int | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "price_native": str(self.price_native) if self.price_native is not None else None,
+            "native_symbol": self.native_symbol,
+            "native_usd": str(self.native_usd) if self.native_usd is not None else None,
+            "price_usd": str(self.price_usd) if self.price_usd is not None else None,
+            "price_source": self.price_source,
+            "quoted_at": self.quoted_at.isoformat() if self.quoted_at is not None else None,
+            "executable_quote": self.executable_quote,
+            "estimated": self.estimated,
+            "price_age_ms": self.price_age_ms,
+        }
+
+
+@dataclass(frozen=True)
 class StrategyIdentity:
     strategy_name: str
     ruleset_name: str
@@ -33,8 +61,16 @@ class StrategyIdentity:
 BASELINE_IDENTITY = StrategyIdentity(
     strategy_name="sol_ultra_early_baseline",
     ruleset_name="ultra_early_minimal",
-    ruleset_version="0.1.0",
-    config_version="0.1.0",
+    ruleset_version="0.1.1",
+    config_version="0.1.1",
+)
+
+
+BSC_BASELINE_IDENTITY = StrategyIdentity(
+    strategy_name="bsc_binance_indicative",
+    ruleset_name="ultra_early_selective_bsc",
+    ruleset_version="0.1.5",
+    config_version="0.1.5",
 )
 
 
@@ -44,6 +80,7 @@ class Signal:
     mint: str
     observed_at: datetime
     source: str
+    chain: str = "solana"
 
 
 @dataclass(frozen=True)
@@ -53,6 +90,7 @@ class Candidate:
     mint: str
     identity: StrategyIdentity
     status: str
+    chain: str = "solana"
     filter_reason: str | None = None
     checks: tuple["RuleCheck", ...] = ()
     soft_features: Mapping[str, object] | None = None
@@ -70,14 +108,43 @@ class VirtualPosition:
     remaining_quantity_token: Decimal = Decimal("0")
     entry_quote_id: str | None = None
     token_name: str | None = None
+    raw_name: str | None = None
+    display_name: str | None = None
+    symbol: str | None = None
+    entry_price_snapshot: PriceSnapshot | None = None
+    exit_price_snapshot: PriceSnapshot | None = None
+    entry_holders: int | None = None
+    entry_liquidity_usd: Decimal | None = None
+    exit_holders: int | None = None
+    exit_holders_observed_at: datetime | None = None
+    exit_holders_source: str | None = None
+    exit_holders_status: str | None = None
+    exit_market_cap_usd: Decimal | None = None
+    exit_liquidity_usd: Decimal | None = None
+    exit_market_observed_at: datetime | None = None
+    exit_market_source: str | None = None
+    exit_market_status: str | None = None
     status: str = "OPEN"
     mfe_pct: Decimal = Decimal("0")
     mae_pct: Decimal = Decimal("0")
     last_return_pct: Decimal | None = None
     last_observed_at: datetime | None = None
     last_quote_id: str | None = None
+    local_price_sol_per_token: Decimal | None = None
+    local_price_observed_at: datetime | None = None
+    local_price_source: str | None = None
+    local_return_pct: Decimal | None = None
+    jupiter_price_sol_per_token: Decimal | None = None
+    jupiter_price_observed_at: datetime | None = None
+    jupiter_return_pct: Decimal | None = None
     closed_at: datetime | None = None
     closed_reason: str | None = None
+    # BSC Paper/Shadow lifecycle timestamps are kept separate from the
+    # evaluation and execution-record timestamps.
+    signal_observed_at: datetime | None = None
+    evaluated_at: datetime | None = None
+    entry_quote_at: datetime | None = None
+    exit_quote_at: datetime | None = None
 
     @property
     def active_quantity_token(self) -> Decimal:
@@ -119,6 +186,16 @@ class EntryFeatures:
     evaluated_at: datetime
     token_name: str | None = None
     soft_features: Mapping[str, object] | None = None
+    holders: int | None = None
+    market_cap_usd: Decimal | None = None
+    liquidity_usd: Decimal | None = None
+    pricing_mode: str = "executable_quote"
+    executable_quote: bool = True
+    pricing_error: str | None = None
+    raw_name: str | None = None
+    display_name: str | None = None
+    symbol: str | None = None
+    native_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +211,18 @@ class EntryDecision:
             check.reason_code
             for check in self.checks
             if not check.passed and check.reason_code is not None
+        )
+
+    @property
+    def unavailable_reason_codes(self) -> tuple[str, ...]:
+        """Reason codes retained for fields that were unavailable but optional."""
+
+        return tuple(
+            check.reason_code
+            for check in self.checks
+            if check.passed
+            and check.reason_code is not None
+            and check.reason_code.endswith("_unavailable")
         )
 
 
@@ -168,6 +257,8 @@ class ShadowExitFeatures:
     independent_buyer_growth_stopped: bool
     creator_sell_confident: bool
     buyer_growth_and_flow_slowed: bool
+    holders: int | None = None
+    liquidity_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +287,13 @@ class ExecutionRecord:
     price_impact_pct: Decimal | None = None
     quote_quoted_at: datetime | None = None
     recorded_at: datetime | None = None
+    pricing_mode: str = "executable_quote"
+    executable_quote: bool = True
+    exit_status: str | None = None
+    pnl_status: str | None = None
+    price_snapshot: PriceSnapshot | None = None
+    quote_source: str | None = None
+    quote_route: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

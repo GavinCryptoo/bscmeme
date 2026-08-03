@@ -20,7 +20,7 @@
 | `binance_pagination_error` | page/pageSize 形状无法解释 | 否 | 停止该页 |
 | `binance_duplicate_signal` | 同一稳定 signal id 重复出现 | 否 | 去重，不重复生命周期 |
 | `binance_stale_signal` | 数据年龄超过消费方允许窗口 | 否 | 不触发 Paper |
-| `binance_unsupported_chain` | 非 `CT_501` | 否 | fail closed |
+| `binance_unsupported_chain` | 非已审计 `CT_501` 或 `56` | 否 | fail closed |
 | `unsupported_auth_method` | 配置要求 API key/cookie/wallet 等未审计模式 | 否 | fail closed |
 | `binance_response_too_large` | 响应超过配置上限 | 否 | 丢弃响应 |
 | `binance_business_error` | 业务码非 `000000` | 视码而定 | 100004 限流，其它不猜测 |

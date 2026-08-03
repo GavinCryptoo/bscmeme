@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -16,34 +17,103 @@ def _decode_json(value: str | None) -> Any:
         return value
 
 
+def _unit_price(numerator: object, denominator: object) -> str | None:
+    """Return a precise string price while preserving unavailable values as null."""
+    if numerator in (None, "") or denominator in (None, "", "0"):
+        return None
+    try:
+        return str(Decimal(str(numerator)) / Decimal(str(denominator)))
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _percentage(numerator: object, denominator: object) -> str | None:
+    value = _unit_price(numerator, denominator)
+    if value is None:
+        return None
+    try:
+        return str(Decimal(value) * Decimal("100"))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _price_source(quote_id: object) -> str | None:
+    """Expose the current quote venue; old values remain readable."""
+
+    if not isinstance(quote_id, str):
+        return None
+    if quote_id.startswith("bsc-pool-wss:"):
+        return "bsc_pool_wss"
+    if quote_id.startswith("binance-indicative:"):
+        return "binance_indicative_fallback"
+    if quote_id.startswith("bsc-quote:pancakeswap:"):
+        return "pancakeswap_router"
+    if quote_id.startswith("bsc-quote:bonding_curve:"):
+        return "bonding_curve"
+    return None
+
+
+def _price_delta_pct(local_price: object, jupiter_price: object) -> str | None:
+    if local_price in (None, "", "0") or jupiter_price in (None, ""):
+        return None
+    try:
+        local = Decimal(str(local_price))
+        jupiter = Decimal(str(jupiter_price))
+        if local <= 0:
+            return None
+        return str((jupiter / local - Decimal("1")) * Decimal("100"))
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 class LedgerQueries:
     """Read-only, newest-first views over one Paper or Shadow database."""
 
-    def __init__(self, connection: sqlite3.Connection, mode: str) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        mode: str,
+        display_since: str | None = None,
+    ) -> None:
         if mode not in {"paper", "shadow"}:
             raise ValueError("mode must be paper or shadow")
         self.connection = connection
         self.mode = mode
+        self.display_since = display_since
 
     def _rows(self, sql: str, params: tuple[object, ...] = ()) -> tuple[dict[str, object], ...]:
         return tuple(dict(row) for row in self.connection.execute(sql, params))
 
     def signals(self, limit: int = 100) -> tuple[dict[str, object], ...]:
         self._validate_limit(limit)
+        where = ""
+        params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where = " WHERE s.observed_at >= ?"
+            params.append(self.display_since)
+        params.append(limit)
         return self._rows(
             "SELECT s.* FROM signals s "
             "JOIN candidates c ON c.signal_id = s.signal_id AND c.mode = ? "
-            "GROUP BY s.signal_id ORDER BY s.observed_at DESC, s.rowid DESC LIMIT ?",
-            (self.mode, limit),
+            + where
+            + " GROUP BY s.signal_id ORDER BY s.observed_at DESC, s.rowid DESC LIMIT ?",
+            tuple(params),
         )
 
     def candidates(self, limit: int = 100) -> tuple[dict[str, object], ...]:
         self._validate_limit(limit)
+        where = "WHERE c.mode = ?"
+        params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where += " AND s.observed_at >= ?"
+            params.append(self.display_since)
+        params.append(limit)
         rows = self._rows(
             "SELECT c.*, s.observed_at AS signal_observed_at "
             "FROM candidates c JOIN signals s ON s.signal_id = c.signal_id "
-            "WHERE c.mode = ? ORDER BY s.observed_at DESC, c.rowid DESC LIMIT ?",
-            (self.mode, limit),
+            + where
+            + " ORDER BY s.observed_at DESC, c.rowid DESC LIMIT ?",
+            tuple(params),
         )
         decoded: list[dict[str, object]] = []
         for row in rows:
@@ -60,34 +130,206 @@ class LedgerQueries:
         status: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         self._validate_limit(limit)
-        where = "WHERE mode = ?"
+        where = "WHERE vp.mode = ?"
         params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where += " AND vp.opened_at >= ?"
+            params.append(self.display_since)
         if status is not None:
-            where += " AND status = ?"
+            where += " AND vp.status = ?"
             params.append(status)
-        return self._rows(
-            "SELECT * FROM virtual_positions "
+        rows = list(self._rows(
+            "SELECT vp.*, "
+            "COALESCE("
+            "(SELECT c.soft_features_json FROM candidates c "
+            " WHERE c.mode = vp.mode "
+            " AND c.candidate_id = substr(vp.position_id, 1, length(vp.position_id) - length(':position')) "
+            " LIMIT 1), "
+            "(SELECT c.soft_features_json FROM candidates c "
+            " JOIN signals s ON s.signal_id = c.signal_id "
+            " WHERE c.mode = vp.mode AND c.mint = vp.mint "
+            " AND s.observed_at <= vp.opened_at "
+            " ORDER BY s.observed_at DESC, c.rowid DESC LIMIT 1)"
+            ") AS position_soft_features_json "
+            "FROM virtual_positions vp "
             + where
-            + " ORDER BY COALESCE(last_observed_at, opened_at) DESC, rowid DESC LIMIT ?",
+            + " ORDER BY COALESCE(vp.last_observed_at, vp.opened_at) DESC, vp.rowid DESC LIMIT ?",
             (*params, limit),
+        ))
+        for row in rows:
+            soft_features = _decode_json(row.pop("position_soft_features_json", None))
+            if isinstance(soft_features, dict):
+                for name in ("price_usd", "holders", "market_cap_usd", "liquidity_usd"):
+                    row[name] = soft_features.get(name)
+                if row.get("entry_holders") is None:
+                    row["entry_holders"] = soft_features.get("holders")
+            else:
+                if row.get("entry_holders") is None:
+                    row["entry_holders"] = None
+            row["price_source"] = _price_source(row.get("last_quote_id"))
+            row["price_delta_pct"] = _price_delta_pct(
+                row.get("local_price_sol_per_token"),
+                row.get("jupiter_price_sol_per_token"),
+            )
+        if status == "CLOSED":
+            self._attach_closed_trade_details(rows)
+        return rows
+    def _attach_closed_trade_details(self, rows: list[dict[str, object]]) -> None:
+        """Attach read-only trade details and time-bounded market snapshots."""
+        for row in rows:
+            entry = self.connection.execute(
+                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at, "
+                "quote_source, quote_route, pricing_mode, legacy_valuation "
+                "FROM executions WHERE mode = ? AND position_id = ? AND action = 'entry' "
+                "ORDER BY recorded_at ASC, rowid ASC LIMIT 1",
+                (self.mode, row["position_id"]),
+            ).fetchone()
+            exit_row = self.connection.execute(
+                "SELECT quote_input_quantity, quote_output_quantity, "
+                "net_pnl_estimated_sol, quote_quoted_at, recorded_at, quote_source, "
+                "quote_route, pricing_mode, pnl_status, legacy_valuation "
+                "FROM executions WHERE mode = ? AND position_id = ? AND action = 'exit' "
+                "ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
+                (self.mode, row["position_id"]),
+            ).fetchone()
+            row["buy_price_sol"] = _unit_price(
+                entry["quote_input_quantity"], entry["quote_output_quantity"]
+                if entry is not None
+                else None,
+            ) if entry is not None else None
+            row["sell_price_sol"] = _unit_price(
+                exit_row["quote_output_quantity"], exit_row["quote_input_quantity"]
+                if exit_row is not None
+                else None,
+            ) if exit_row is not None else None
+            entry_quote_at = (
+                row.get("entry_quote_at")
+                or (entry["quote_quoted_at"] if entry is not None else None)
+            )
+            exit_quote_at = (
+                row.get("exit_quote_at")
+                or (exit_row["quote_quoted_at"] if exit_row is not None else None)
+            )
+            row["entry_quote_at"] = entry_quote_at
+            row["exit_quote_at"] = exit_quote_at
+            row["buy_time"] = entry_quote_at
+            row["sell_time"] = exit_quote_at
+            row["entry_time_status"] = "quote_quoted_at" if entry_quote_at else "unknown"
+            row["exit_time_status"] = "quote_quoted_at" if exit_quote_at else "unknown"
+            if not row.get("signal_observed_at"):
+                signal_row = self.connection.execute(
+                    "SELECT s.observed_at FROM candidates c "
+                    "JOIN signals s ON s.signal_id = c.signal_id "
+                    "WHERE c.mode = ? AND c.candidate_id = ? LIMIT 1",
+                    (
+                        self.mode,
+                        str(row["position_id"]).removesuffix(":position"),
+                    ),
+                ).fetchone()
+                row["signal_observed_at"] = (
+                    signal_row["observed_at"] if signal_row is not None else None
+                )
+            row["exit_reason"] = row.get("closed_reason")
+            pnl_sol = exit_row["net_pnl_estimated_sol"] if exit_row is not None else None
+            row["pnl_sol"] = pnl_sol
+            row["pnl_rate_pct"] = _percentage(pnl_sol, row.get("quantity_sol"))
+            source_row = exit_row or entry
+            row["quote_source"] = source_row["quote_source"] if source_row is not None else None
+            row["quote_route"] = _decode_json(source_row["quote_route"]) if source_row is not None else None
+            row["pricing_mode"] = source_row["pricing_mode"] if source_row is not None else None
+            row["pnl_status"] = exit_row["pnl_status"] if exit_row is not None else None
+            row["legacy_valuation"] = bool(
+                (source_row["legacy_valuation"] if source_row is not None else 0)
+                or row.get("pricing_mode") == "legacy_binance_indicative"
+            )
+            row["valuation_label"] = (
+                "旧版指示价估算" if row["legacy_valuation"] else "BSC 可执行只读报价"
+            )
+            self._attach_market_snapshots(row, entry, exit_row)
+
+    def _attach_market_snapshots(
+        self,
+        row: dict[str, object],
+        entry_execution: sqlite3.Row | None,
+        exit_execution: sqlite3.Row | None,
+    ) -> None:
+        """Attach snapshots without substituting a current or post-close value."""
+        position_id = str(row["position_id"])
+        entry_candidate_id = (
+            position_id[:-len(":position")]
+            if position_id.endswith(":position")
+            else None
         )
+        entry_snapshot = None
+        if entry_candidate_id is not None:
+            entry_snapshot = self.connection.execute(
+                "SELECT c.candidate_id, c.soft_features_json, s.observed_at "
+                "FROM candidates c JOIN signals s ON s.signal_id = c.signal_id "
+                "WHERE c.mode = ? AND c.candidate_id = ? LIMIT 1",
+                (self.mode, entry_candidate_id),
+            ).fetchone()
+
+        opened_at = row.get("opened_at")
+        if entry_snapshot is None and opened_at is not None:
+            entry_snapshot = self.connection.execute(
+                "SELECT c.candidate_id, c.soft_features_json, s.observed_at "
+                "FROM candidates c JOIN signals s ON s.signal_id = c.signal_id "
+                "WHERE c.mode = ? AND c.mint = ? AND s.observed_at <= ? "
+                "ORDER BY s.observed_at DESC, c.rowid DESC LIMIT 1",
+                (self.mode, row["mint"], opened_at),
+            ).fetchone()
+
+        entry_features = _decode_json(
+            entry_snapshot["soft_features_json"] if entry_snapshot is not None else None
+        )
+        row["entry_market_cap_usd"] = (
+            entry_features.get("market_cap_usd")
+            if isinstance(entry_features, dict)
+            else None
+        )
+        row["entry_liquidity_usd"] = (
+            entry_features.get("liquidity_usd")
+            if isinstance(entry_features, dict)
+            else None
+        )
+
+        # Exit values are read only from the persisted close-time snapshot.
+        # Never infer them from the latest candidate or the current market.
+        row["exit_market_cap_usd"] = row.get("exit_market_cap_usd")
+        row["exit_liquidity_usd"] = row.get("exit_liquidity_usd")
 
     def executions(self, limit: int = 100) -> tuple[dict[str, object], ...]:
         self._validate_limit(limit)
+        where = "WHERE e.mode = ?"
+        params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where += " AND p.opened_at >= ?"
+            params.append(self.display_since)
+        params.append(limit)
         return self._rows(
-            "SELECT * FROM executions WHERE mode = ? "
-            "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
-            (self.mode, limit),
+            "SELECT e.* FROM executions e "
+            "JOIN virtual_positions p ON p.position_id = e.position_id "
+            + where
+            + " ORDER BY e.recorded_at DESC, e.rowid DESC LIMIT ?",
+            tuple(params),
         )
 
     def shadow_outcomes(self, limit: int = 100) -> tuple[dict[str, object], ...]:
         if self.mode != "shadow":
             raise ValueError("shadow_outcomes is only available for shadow mode")
         self._validate_limit(limit)
+        where = "WHERE p.mode = ?"
+        params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where += " AND p.opened_at >= ?"
+            params.append(self.display_since)
+        params.append(limit)
         rows = self._rows(
-            "SELECT * FROM shadow_outcomes "
-            "ORDER BY recorded_at DESC, rowid DESC LIMIT ?",
-            (limit,),
+            "SELECT so.* FROM shadow_outcomes so "
+            "JOIN virtual_positions p ON p.position_id = so.position_id "
+            + where
+            + " ORDER BY so.recorded_at DESC, so.rowid DESC LIMIT ?",
+            tuple(params),
         )
         decoded: list[dict[str, object]] = []
         for row in rows:
@@ -103,15 +345,19 @@ class LedgerQueries:
         position_id: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         self._validate_limit(limit)
-        where = "WHERE mode = ?"
+        where = "WHERE le.mode = ?"
         params: list[object] = [self.mode]
+        if self.display_since is not None:
+            where += " AND vp.opened_at >= ?"
+            params.append(self.display_since)
         if position_id is not None:
-            where += " AND position_id = ?"
+            where += " AND le.position_id = ?"
             params.append(position_id)
         rows = self._rows(
-            "SELECT * FROM lifecycle_events "
+            "SELECT le.* FROM lifecycle_events le "
+            "JOIN virtual_positions vp ON vp.position_id = le.position_id "
             + where
-            + " ORDER BY occurred_at DESC, rowid DESC LIMIT ?",
+            + " ORDER BY le.occurred_at DESC, le.rowid DESC LIMIT ?",
             (*params, limit),
         )
         decoded: list[dict[str, object]] = []

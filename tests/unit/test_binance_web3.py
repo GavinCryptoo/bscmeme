@@ -157,11 +157,27 @@ class BinanceWeb3NormalizerTests(unittest.TestCase):
 
         dynamic = load_fixture("token_dynamic_live.json")
         snapshot = normalize_dynamic(dynamic["data"], mint="live", chain_id="CT_501", fetched_at=now)
+        self.assertEqual(snapshot.value("market_cap_usd"), Decimal("4129.854997735061109808567714390000000000"))
         self.assertTrue(snapshot.fields["volume_usd_5m"].available)
         self.assertFalse(snapshot.fields["net_buy_usd_5m"].available)
 
 
 class BinanceWeb3AdapterTests(unittest.TestCase):
+    def test_bsc_meme_rush_uses_chain_56_and_preserves_chain_identity(self) -> None:
+        payload = load_fixture("meme_rush_normal.json")
+        transport = QueueTransport(json_response(payload))
+        source = BinanceWeb3SignalSource(
+            BinanceWeb3Client(transport=transport),
+            chain_id="56",
+            limit=2,
+        )
+        records = source.fetch_once()
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record.signal.chain == "bsc" for record in records))
+        self.assertTrue(all(record.chain_id == "56" for record in records))
+        request_body = json.loads(transport.calls[0][3].decode("utf-8"))
+        self.assertEqual(request_body["chainId"], "56")
+
     def test_bootstrap_and_duplicate_suppression(self) -> None:
         payload = load_fixture("meme_rush_normal.json")
         new_row = dict(payload["data"][0])

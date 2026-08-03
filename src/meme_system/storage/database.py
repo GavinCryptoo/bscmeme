@@ -6,12 +6,22 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 13
 
 MIGRATIONS = (
     (1, "001_initial.sql"),
     (2, "002_lifecycle_recovery.sql"),
     (3, "003_runtime_observability.sql"),
+    (4, "004_pricing_metadata.sql"),
+    (5, "005_exit_holders.sql"),
+    (6, "006_entry_holders.sql"),
+    (7, "007_entry_liquidity.sql"),
+    (8, "008_timeout_exit_status.sql"),
+    (9, "009_exit_holders_backfill.sql"),
+    (10, "010_exit_market_snapshot.sql"),
+    (11, "011_quote_lifecycle_timestamps.sql"),
+    (12, "012_solana_price_observation.sql"),
+    (13, "013_price_snapshots_and_token_names.sql"),
 )
 
 

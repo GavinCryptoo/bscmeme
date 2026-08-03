@@ -4,17 +4,17 @@
 
 ## 结论
 
-- 当前链：Solana，`chainId=CT_501`。
+- 当前链：Solana，`chainId=CT_501`；BSC Meme Rush，`chainId=56`。
 - 当前公开 endpoint 鉴权：`auth_mode=none`。官方 skill 源码只设置 User-Agent 和 `Accept-Encoding: identity`，本实现不发送 API Key、Cookie、Session、钱包或 Jupiter 凭据。
-- 当前允许：Meme Rush、Smart Money、Token Dynamic、Kline 的有限只读请求。
-- 当前不允许：`baw` 私有信号列表、交易/Execute、签名、广播、钱包、RPC/WSS、Jupiter、BSC。
+- 当前允许：Solana 的 Meme Rush、Smart Money、Token Dynamic、Kline，以及 BSC `56` 的 Meme Rush 有限只读请求；BSC Paper/Shadow 只消费这些标准化候选，不执行真实交易。
+- 当前不允许：`baw` 私有信号列表、交易/Execute、签名、广播、钱包、RPC/WSS、Jupiter 执行接口、BSC Live。
 - 配额窗口、精确 QPS、完整历史回放能力和部分时间单位未被本阶段资料确认，保持 `unknown` 或 `unavailable`。
 
 ## Endpoint 清单
 
 | endpoint | Host + Path | Method | Solana 参数 | 状态 |
 |---|---|---|---|---|
-| Meme Rush | `https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/rank/list/ai` | POST | `chainId=CT_501`、`rankType=10/20/30`、`limit<=200` | `verified` |
+| Meme Rush | `https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/rank/list/ai` | POST | `chainId=CT_501`（Solana）或 `56`（BSC）、`rankType=10/20/30`、`limit<=200` | `verified` |
 | Smart Money | `https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/web/signal/smart-money/ai` | POST | `chainId=CT_501`、`page`、`pageSize` | `verified` |
 | Token Dynamic | `https://web3.binance.com/bapi/defi/v4/public/wallet-direct/buw/wallet/market/token/dynamic/info/ai?chainId=CT_501&contractAddress=...` | GET | `chainId`、`contractAddress` | `verified` |
 | Kline | `https://dquery.sintral.io/u-kline/v1/k-line/candles?platform=solana&address=...&interval=...` | GET | `platform=solana`、`address`、`interval`、`limit<=500` | `verified` |

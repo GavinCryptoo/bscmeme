@@ -1,4 +1,3 @@
-"""meme0801 Stage 0 package."""
+"""meme0801 Paper/Shadow and isolated BSC Live package."""
 
-__version__ = "0.1.0"
-
+__version__ = "0.1.41"

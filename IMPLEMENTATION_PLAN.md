@@ -42,18 +42,18 @@
 
 ## 阶段 3：Binance Web3 官方只读适配
 
-- 固化官方 endpoint、Host、Method、Solana chain ID、可确认字段、错误码和未确认字段。
+- 固化官方 endpoint、Host、Method、Solana/BSC chain ID、可确认字段、错误码和未确认字段。
 - 实现 `binance_web3` client、auth mode、models、normalizer、signal source、market data、Kline、Smart Money、rate limit 和 redaction。
 - `DATA_SOURCE` 支持 `fixture`、`replay`、`binance_web3`，默认 `fixture`。
 - 只做有限、可终止的单次或短时探测；不启动长期 runner，不启动 Dashboard。
 - Binance Smart Money 仅 Shadow；历史 bootstrap 只标记，不导入 Paper。
 - 用官方 schema 样例构造脱敏 fixture；若网络受阻，不伪造真实 live capture。
 
-阶段三验收：审计文档、字段覆盖、错误目录、有限探测报告、适配器单测、Phase 2 回归测试和本地 commit 均可审计；钱包、签名、广播、Live、RPC/WSS、Jupiter、BSC 和 Dashboard 均未进入。
+阶段三验收：审计文档、字段覆盖、错误目录、有限探测报告、适配器单测、Phase 2 回归测试和本地 commit 均可审计；钱包、签名、广播、Live 和真实交易均未进入。
 
 ## 阶段 4 Gate A：实时只读数据与 Paper/Shadow 运行
 
-- 使用已审计 Binance Web3 Solana `CT_501` 信号源。
+- 使用已审计 Binance Web3 Solana `CT_501` 与 BSC `56` Meme Rush 信号源。
 - 使用 Solana RPC/WSS、Pump/PumpSwap 只读状态模型；未知布局 fail-closed。
 - 使用 Jupiter 当前官方 Quote GET，禁止 Swap、交易构建、签名和广播。
 - 通过冻结基线策略评估候选，记录逐项过滤原因。
@@ -71,4 +71,4 @@
 
 ## 永不自动进入的阶段
 
-Live、钱包、私钥、签名、广播、链上写入和 BSC 实现不在本计划自动范围内，必须由用户另行授权。
+Live、钱包、私钥、签名、广播、链上写入和 BSC Live 不在本计划自动范围内，必须由用户另行授权。

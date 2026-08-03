@@ -1,7 +1,7 @@
 # CURRENT_DECISIONS.md
 
-版本：0.2.0
-状态：冻结，作为当前实现最高优先级
+版本：0.4.2
+状态：当前实现最高优先级；BSC Live 已获明确授权，Solana 保持只读与 Paper/Shadow
 
 优先级顺序：
 
@@ -12,23 +12,25 @@
 ## 项目边界
 
 - 项目：meme0801
-- 第一阶段链：Solana
-- 第一阶段模式：Paper + Shadow
+- 当前范围链：Solana + BSC
+- 第一阶段模式：Paper + Shadow；BSC 另有独立小额 Live 模式
 - Dashboard：实现，默认 127.0.0.1:8788
-- Telegram：Gate A 默认关闭；开启后仅允许 Paper/Shadow 通知与暂停/恢复新入场
-- Live、钱包、私钥读取、签名、广播、链上写入：不实现
-- BSC：本阶段不实现，只保留最小 Protocol 接口
+- Telegram 默认关闭；开启后可用于 Paper/Shadow 通知与暂停/恢复新入场；BSC Live 仅允许通知、状态和暂停/恢复新入场
+- Solana Live、Solana 钱包、Solana 私钥读取、Solana 签名、Solana 广播和 Solana 链上写入：不实现
+- BSC Live 允许，但必须使用独立 Live 进程、数据库、审计日志、锁和配置；不得复用 Paper/Shadow 状态
+- BSC Live 只允许通过当前官方 PancakeSwap Smart Router SDK 生成实时报价和 calldata；不得使用 Binance indicative price 作为成交价
+- BSC Live 启动时只允许启动后复合策略产生的新代币入场；启动首轮现有列表及 Live 数据库已见代币只观察、不买入，且不改变既有策略参数
+- BSC Live 的交易执行必须 fail-closed：chainId=56、余额、nonce、decimals、allowance、实时报价、estimateGas、非零最低到账和 deadline 任一检查失败即拒绝发送
 - 当前工作区按全新项目重建
 - 不恢复历史 V2、V2.1、V2.2、V4 为可运行策略
 - 只建立一个新的基线策略
-- 当前实现阶段为阶段 4 Gate A：实时只读数据源、Paper/Shadow、Dashboard 与运行运维
-- Gate A 完成后必须停止，等待单独的 Gate B Live 授权
+- 当前实现阶段：BSC Live 最小实现与 Paper/Shadow 并行维护；Solana 不进入 Live
 
 ## 基线策略身份
 
 strategy_name: sol_ultra_early_baseline
 ruleset_name: ultra_early_minimal
-ruleset_version: 0.1.0
+ruleset_version: 0.1.1
 
 每个候选、持仓、退出和影子结果必须记录：
 
@@ -50,8 +52,8 @@ require_two_non_negative_flow_windows: true
 require_executable_buy_route: true
 require_executable_sell_route: true
 creator_confirmed_sold_at_entry: false
-max_buy_price_impact_pct: 3
-max_immediate_exit_impact_pct: 8
+max_buy_price_impact_pct: 10
+max_immediate_exit_impact_pct: 15
 one_trade_per_mint: true
 same_name_cooldown_sec: 900
 max_open_positions: 2
@@ -77,16 +79,19 @@ Shadow 建立独立虚拟生命周期和持仓，不修改 Paper 仓位、PnL、
 - shadow_defense_v1：收益率 <= -8%、最近短窗口净流量为负、独立买家增长停止时触发。
 - shadow_creator_sell：高置信识别创建者或明确关联地址卖出时触发。
 - shadow_time_exit：持仓 >=120s、MFE <5%、买家增长和净流量同时放缓时触发。
+- BSC Shadow 另外继承 BSC Paper 的 `take_profit`、`stop_loss` 和
+  `max_hold_timeout` 退出规则，使用同一组阈值和全部退出比例；Solana Shadow
+  保持本节原有规则，不继承 BSC 规则。
 - 触发后记录 5s、15s、30s、60s、120s 收益、是否达到 Paper TP、避免损失和错过利润。
 
 ## Paper 参数
 
-initial_virtual_balance_sol: 10
+initial_virtual_balance_sol: 1
 position_size_sol: 0.001
 max_open_positions: 2
 assume_position_can_lose_100_percent: true
-daily_full_loss_units_limit: 5
-pause_new_entries_after_large_losses: 3
+daily_full_loss_sol_limit: 0.01
+pause_new_entries_after_large_losses: 5
 large_loss_threshold_pct: -40
 
 暂停新开仓后，已有持仓继续监控和退出。
@@ -94,13 +99,14 @@ large_loss_threshold_pct: -40
 ## 数据源与报价
 
 - Fixture/Replay 仍是默认数据源和确定性测试事实来源；`DATA_SOURCE=fixture` 为默认值。
-- 阶段 4 Gate A 允许 Binance Web3 官方只读接口：Solana `CT_501` 的 Meme Rush、Smart Money、Token Dynamic 和 Kline；允许 Solana 主网 RPC/WSS 只读订阅、Pump/PumpSwap 状态读取，以及 Jupiter 当前官方 Quote GET。
+- 当前允许 Binance Web3 官方只读接口：Solana `CT_501` 的 Meme Rush、Smart Money、Token Dynamic 和 Kline，以及 BSC `56` 的 Meme Rush；允许 Solana 主网 RPC/WSS 只读订阅、Pump/PumpSwap 状态读取，以及 Jupiter 当前官方 Quote GET。
 - Binance Web3 当前冻结为公开 `auth_mode=none`；适配器不读取或发送钱包、Jupiter、API Key、Cookie、Session 或签名材料。
 - Binance Smart Money 只作为 Shadow 观察信号，`trigger_entry=false`，不得触发 Paper 入场或退出。
 - Meme Rush 的 `createTime`/`migrateTime` 单位未被官方参考明确为毫秒，因此在可证实前保持 unavailable。
-- Binance 不能提供的 15 秒独立买家、15 秒买卖比、15 秒净买、可执行买卖路由、price impact 和可靠创建者卖出确认，不得用其它字段填补，也不得触发 Paper。
+- Binance 不能提供的 15 秒独立买家、15 秒买卖比、15 秒净买、price impact 和可靠创建者卖出确认，不得用其它字段填补；这些字段保持 unavailable。BSC 没有 Quote Provider 时，`buy_quote_unavailable`/`sell_quote_unavailable` 不再单独阻断 BSC Paper/Shadow。
 - Jupiter 只允许 Quote endpoint；没有 `/swap`、`/swap-instructions`、构建交易、签名或发送交易。`priceImpactPct` 的单位未在当前官方接口契约中冻结，默认保持 unavailable，不得自行换算。
-- 无有效可执行报价不得模拟成交；Token Dynamic、Kline、Pump 曲线指示价不得冒充 Jupiter 可执行报价。
+- Solana Paper/Shadow 继续必须使用 Jupiter Quote；无有效 Jupiter 可执行报价不得模拟成交。
+- BSC Paper/Shadow 只使用实际 bonding curve 或 DEX Router 的只读可执行报价进行模拟买入、持仓更新和平仓，且必须记录 `pricing_mode=bsc_executable_quote`、`executable_quote=true`、`quote_source=bonding_curve|pancakeswap_router`、`quoted_at`、`price_age_ms`、`route`、`amount_in`、`amount_out`。Binance Meme Rush 仅负责发现和 Dashboard 辅助对照，标记 `pricing_mode=binance_indicative_reference`、`executable_quote=false`，不得参与 PnL；缺少有效 route、非零 amountOut、quote_at 或 price impact 时拒绝，不填默认价格。历史指示价记录保留原值并标记 `legacy_binance_indicative`，排除正式统计。
 
 ## 报价、成交和成本
 
@@ -135,9 +141,11 @@ large_loss_threshold_pct: -40
 - SQLite WAL 是运行事实来源。
 - JSONL 是不可变审计日志；CSV 仅导出；Parquet 延后。
 - latest_status.json 仅为 Dashboard 快照，不是事实账本。
-- Paper：data/solana/paper/runtime.db
-- Shadow：data/solana/shadow/runtime.db
-- 两个 runner 不得写同一数据库或状态目录。
+- Solana Paper：data/solana/paper/runtime.db
+- Solana Shadow：data/solana/shadow/runtime.db
+- BSC Paper：data/bsc/paper/runtime.db
+- BSC Shadow：data/bsc/shadow/runtime.db
+- 每条链的 Paper/Shadow runner 不得写同一数据库或状态目录；Solana 与 BSC 必须隔离。
 
 ## 观察与历史数据
 
@@ -162,28 +170,80 @@ large_loss_threshold_pct: -40
 
 必须存在并强制验证：
 
-PAPER_ONLY=true
-LIVE_TRADING=false
+PAPER_ONLY=true（Paper/Shadow 默认值；BSC Live 必须显式设置 LIVE_TRADING=true）
+LIVE_TRADING=false（BSC Live 启动时必须显式为 true）
 WALLET_ENABLED=false
 SIGNING_ENABLED=false
-BROADCAST_ENABLED=false
+BROADCAST_ENABLED=false（Paper/Shadow 默认值；BSC Live 执行路径由 LIVE_TRADING+BSC_LIVE_ENABLED 显式开启）
 TELEGRAM_ENABLED=false
 
-Gate A 默认保持 `TELEGRAM_ENABLED=false`；如需开启，只能在以上 Paper/Shadow 执行安全开关不变时用于通知和暂停/恢复新入场。
+BSC_LIVE_ENABLED=false
 
-MVP 代码中不得存在可到达的签名和广播实现；不得创建 PrivateKey、Keypair 或 Wallet 类实例；不得安装非必要的钱包执行依赖。
+Telegram 默认保持 `TELEGRAM_ENABLED=false`；BSC Live 开启 Telegram 后只接受状态查看和暂停/恢复新开仓，不接受下单、卖出、金额、滑点、钱包或进程控制。
 
-## 阶段四 Gate A 当前授权范围
+Paper/Shadow 代码中不得存在可到达的签名和广播实现。BSC Live 仅在显式 Live 配置完整时创建本地签名账户；私钥只从本地 `.env` 读取，不写入日志、数据库、审计文件或提交。
 
-允许：实现已审计的 Binance Web3、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 只读适配；实现实时 Paper/Shadow 协调器、持仓生命周期、重启恢复、Dashboard、Telegram Paper/Shadow 控制、健康、锁、导出和文档；执行有限、可终止的只读探测。
+## 当前授权范围
 
-禁止：任何写链、Jupiter 执行接口、交易构建、钱包、私钥、签名、广播、Live、BSC、未确认字段或 endpoint、自动进入 Gate B。
+允许：实现已审计的 Binance Web3（Solana 与 BSC Meme Rush）、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 只读适配；实现实时 Paper/Shadow 协调器、BSC Live 独立持仓生命周期、重启恢复、Dashboard、健康、锁、导出、Telegram 通知和仅新开仓暂停/恢复控制；执行有限、可终止的只读探测。BSC Live 代码必须先完成测试，不自动启动真实交易。
 
-## Gate B 单独授权边界
+禁止：Solana 写链、Jupiter 执行接口、Solana 交易构建、Solana 钱包/私钥/签名/广播、BSC 未确认字段或 endpoint、Paper/Shadow 触发 Live、Live 无限重试、`amountOutMin=0`、绕过 chainId/余额/报价/到账核对。
 
-Gate B Live 只有在用户单独明确授权后才可审计和设计；在此之前不得创建 Live Engine、钱包适配、签名器、交易构建器或广播路径。
+BSC read-only + Paper/Shadow + explicitly configured isolated BSC Live is allowed. Solana Live remains disabled.
 
-## 阶段 0 授权范围
+## BSC Paper/Shadow 数据回测覆盖（2026-08-02）
+
+基于当前 BSC Paper 已平仓的 92 个独立 Mint 做最小参数调整，仅作用于 BSC
+Paper/Shadow，不改变 Solana 基线、不改变市值、流动性、观察期和 Binance
+指示价要求：
+
+- strategy_name: bsc_binance_indicative
+- ruleset_name: ultra_early_selective_bsc
+- ruleset_version: 0.1.5
+- config_version: 0.1.5
+- min_holders: 100
+- min_holders_inclusive: true
+- stop_loss_trigger_pct: -10
+- take_profit_pct: 10（保持）
+- max_hold_sec: 600（保持）
+
+BSC 新增入场观察门槛：
+
+- 观察期为 60 秒。
+- 首次发现时记录持币地址数；观察结束时当前持币地址数必须不低于首次值。
+- 首次或观察结束的持币地址数缺失时拒绝入场，不填默认值。
+- 该门槛只作用于 BSC Paper/Shadow；Solana 观察期、Jupiter Quote 和原有规则不变。
+
+BSC Shadow 新增影子提前退出观察：
+
+- 开仓后持币地址数较入场下降超过 10%，记录一次 `shadow_holders_drop_over_10pct`。
+- 开仓后流动性较入场下降超过 15%，记录一次 `shadow_liquidity_drop_over_15pct`。
+- 以上规则只作用于 BSC Shadow 的结构性提前退出；BSC Shadow 同时按 BSC Paper
+  执行止盈、止损和最长持仓退出，不改变 BSC Paper 的阈值、全部退出比例或 Solana
+  Shadow 规则。
+- 当前地址数或流动性不可用时不触发该规则；不填默认值。
+- 每次 BSC Shadow 退出评估记录入场值、当前值、降幅和是否触发，持续用于比较 `-50%` 以上极端亏损的减少效果；缺少后续窗口时标记为 `pending_follow_up`。
+
+BSC Shadow 观察期新增流动性门槛：
+
+- 观察期结束时，当前 liquidity 必须不低于首次发现时的 liquidity；如果已经下降，跳过 Shadow 入场并记录 `liquidity_below_first_discovery_after_observation`。
+- 该门槛只作用于 BSC Shadow；BSC Paper、Solana、其他市值/流动性/持币地址数/观察期和退出规则保持不变。
+- 首次或观察结束的 liquidity 不可用时，不填默认值，按 `observation_liquidity_unavailable` 拒绝 Shadow 入场。
+
+## BSC Paper/Shadow 资本统计会话（2026-08-03）
+
+- 从下一笔 BSC Paper/Shadow 交易开始重新计算当前 Dashboard 的盈亏额与盈亏率。
+- 初始虚拟资金：`0.1 BNB`。
+- 单笔虚拟仓位：`0.01 BNB`。
+- 历史 SQLite 账本保留，不删除、不重算、不篡改；历史记录仍可通过原始数据库审计。
+- 本次资本统计会话只作用于 BSC Paper/Shadow；Solana 继续使用 `1 SOL` 初始虚拟资金与 `0.001 SOL` 单笔仓位。
+
+该调整只用于 Paper/Shadow 验证；不改变 BSC Live 使用独立 Smart Router
+报价、独立状态和显式小额配置的边界。
+
+## 历史阶段记录（不覆盖当前 BSC Live 授权）
+
+以下阶段 0 约束只记录早期重建过程，不覆盖本版本已明确的 BSC Live 最小实现授权。
 
 允许：只读残留进程检查、Git 初始化、文档、目录、pyproject.toml、.gitignore、.env.example、最小 Python package、安全 schema、fail-closed 测试、空 adapter Protocol、基础 domain model、SQLite migration 框架、Fixture/Replay 测试骨架。
 

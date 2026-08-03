@@ -1,0 +1,11 @@
+{
+  "name": "meme0801-bsc-live-router",
+  "private": true,
+  "description": "Official PancakeSwap Smart Router helper for isolated BSC Live",
+  "dependencies": {
+    "@pancakeswap/smart-router": "7.6.0",
+    "@pancakeswap/sdk": "5.9.0",
+    "@pancakeswap/chains": "0.8.0",
+    "viem": "2.37.13"
+  }
+}

@@ -1,4 +1,4 @@
-"""Fail-closed safety configuration for the non-live MVP."""
+"""Fail-closed capability switches for Paper/Shadow and BSC Live."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ class SafetyConfig:
     signing_enabled: bool = False
     broadcast_enabled: bool = False
     telegram_enabled: bool = False
+    bsc_live_enabled: bool = False
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> "SafetyConfig":
@@ -35,6 +36,7 @@ class SafetyConfig:
             signing_enabled=read_bool("SIGNING_ENABLED", "false"),
             broadcast_enabled=read_bool("BROADCAST_ENABLED", "false"),
             telegram_enabled=read_bool("TELEGRAM_ENABLED", "false"),
+            bsc_live_enabled=read_bool("BSC_LIVE_ENABLED", "false"),
         )
         config.validate()
         return config
@@ -46,14 +48,35 @@ class SafetyConfig:
     def validate(self) -> None:
         required_safe_values = {
             "PAPER_ONLY": self.paper_only,
-            "LIVE_TRADING": not self.live_trading,
-            "WALLET_ENABLED": not self.wallet_enabled,
-            "SIGNING_ENABLED": not self.signing_enabled,
-            "BROADCAST_ENABLED": not self.broadcast_enabled,
         }
         invalid = [name for name, safe in required_safe_values.items() if not safe]
+        if self.bsc_live_enabled != self.live_trading:
+            invalid.extend(("LIVE_TRADING", "BSC_LIVE_ENABLED"))
+        if not self.bsc_live_enabled:
+            for name, enabled in {
+                "WALLET_ENABLED": self.wallet_enabled,
+                "SIGNING_ENABLED": self.signing_enabled,
+                "BROADCAST_ENABLED": self.broadcast_enabled,
+            }.items():
+                if enabled:
+                    invalid.append(name)
         if invalid:
             raise SafetyViolation(
-                "Gate A permits only Paper/Shadow with all execution capabilities disabled: "
-                + ", ".join(invalid)
+                "invalid execution capability combination: " + ", ".join(dict.fromkeys(invalid))
             )
+
+    def validate_for_mode(self, *, chain: str, mode: str) -> None:
+        """Reject capability/mode mismatches before any network or wallet work."""
+
+        if mode == "live":
+            if chain != "bsc":
+                raise SafetyViolation("live mode is available only for BSC")
+            if not self.live_trading or not self.bsc_live_enabled:
+                raise SafetyViolation("LIVE_TRADING=true and BSC_LIVE_ENABLED=true are required for BSC Live")
+            return
+        if mode not in {"paper", "shadow", "both"}:
+            raise SafetyViolation(f"unsupported runtime mode: {mode}")
+        if self.live_trading or self.bsc_live_enabled:
+            raise SafetyViolation("BSC Live switches require --chain bsc --mode live")
+        if not self.paper_only or self.wallet_enabled or self.signing_enabled or self.broadcast_enabled:
+            raise SafetyViolation("Paper/Shadow require PAPER_ONLY=true and execution capabilities disabled")

@@ -46,6 +46,7 @@ class BinanceNormalizedSignal:
     raw_response_hash: str
     fields: Mapping[str, ObservedField] = field(default_factory=dict)
     endpoint_type: str = "meme_rush"
+    chain_id: str = "CT_501"
 
 
 @dataclass(frozen=True)

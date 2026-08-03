@@ -30,12 +30,14 @@ SQLite WAL / JSONL Audit / CSV-Parquet Export / Dashboard / Telegram safe contro
 - 阶段 4 不包含签名、广播、钱包或链上写入模块。
 - Binance Web3 client 只允许官方公开只读 endpoint，当前鉴权模式为 `none`。
 - Smart Money adapter 是 Shadow-only，不能改变 Paper 入口或退出。
-- Jupiter 仅 Quote GET；Pump/PumpSwap 仅状态读取；BSC 仍只有未来 Protocol。
+- Solana 仅使用 Jupiter Quote GET；Pump/PumpSwap 仅状态读取；BSC Meme Rush 只负责发现，Paper/Shadow 使用实际 bonding curve 或 PancakeSwap Router 的只读可执行报价，Binance 仅作 Dashboard 参考，BSC Live 仍按独立安全边界处理。
 
 ## 数据隔离
 
-Paper：data/solana/paper/runtime.db
-Shadow：data/solana/shadow/runtime.db
+Solana Paper：data/solana/paper/runtime.db
+Solana Shadow：data/solana/shadow/runtime.db
+BSC Paper：data/bsc/paper/runtime.db
+BSC Shadow：data/bsc/shadow/runtime.db
 
 两种模式使用独立数据库和独立生命周期 ID。所有候选、持仓、退出和影子结果保留策略身份与配置版本。
 
@@ -44,12 +46,12 @@ Shadow：data/solana/shadow/runtime.db
 - SignalSource：产生标准化信号。
 - MarketDataAdapter：提供只读市场快照。
 - QuoteProvider：提供可执行报价，不等于执行。
-- BscAdapterProtocol：仅定义未来链适配边界，不连接 BSC。
+- BscAdapterProtocol：定义 BSC 只读候选边界，不包含钱包、签名、广播或 Live。
 - LedgerQueries：为 Dashboard 提供只读、最新优先的数据结构；Dashboard 的唯一写操作是安全暂停标志。
 
 ## Binance Web3 边界
 
-- `BinanceWeb3SignalSource`：Meme Rush `rankType` 10/20/30，Solana `CT_501`。
+- `BinanceWeb3SignalSource`：Meme Rush `rankType` 10/20/30，支持 Solana `CT_501` 和 BSC `56`。
 - `BinanceWeb3SmartMoneyAdapter`：Smart Money 观察记录，固定 `trigger_entry=false`。
 - `BinanceWeb3MarketDataAdapter`：Token Dynamic 指示性市场字段，不声称可执行报价。
 - `BinanceWeb3KlineAdapter`：Kline candles，只读历史/短窗数据。

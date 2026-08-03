@@ -14,10 +14,12 @@ class SafetyConfigTests(unittest.TestCase):
         self.assertFalse(config.signing_enabled)
         self.assertFalse(config.broadcast_enabled)
         self.assertFalse(config.telegram_enabled)
+        self.assertFalse(config.bsc_live_enabled)
 
-    def test_any_dangerous_capability_fails_closed(self) -> None:
+    def test_dangerous_capabilities_fail_closed_without_bsc_live_switch(self) -> None:
         for name in (
             "LIVE_TRADING",
+            "BSC_LIVE_ENABLED",
             "WALLET_ENABLED",
             "SIGNING_ENABLED",
             "BROADCAST_ENABLED",
@@ -25,6 +27,25 @@ class SafetyConfigTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises(SafetyViolation):
                     SafetyConfig.from_mapping({name: "true"})
+
+    def test_bsc_live_switches_must_be_enabled_together(self) -> None:
+        config = SafetyConfig.from_mapping({"LIVE_TRADING": "true", "BSC_LIVE_ENABLED": "true"})
+        config.validate_for_mode(chain="bsc", mode="live")
+        with self.assertRaises(SafetyViolation):
+            config.validate_for_mode(chain="solana", mode="live")
+
+    def test_bsc_live_telegram_is_allowed_for_safe_controls(self) -> None:
+        config = SafetyConfig.from_mapping({
+            "LIVE_TRADING": "true",
+            "BSC_LIVE_ENABLED": "true",
+            "TELEGRAM_ENABLED": "true",
+        })
+        config.validate_for_mode(chain="bsc", mode="live")
+
+    def test_bsc_live_switches_cannot_start_paper(self) -> None:
+        config = SafetyConfig.from_mapping({"LIVE_TRADING": "true", "BSC_LIVE_ENABLED": "true"})
+        with self.assertRaises(SafetyViolation):
+            config.validate_for_mode(chain="bsc", mode="paper")
 
     def test_paper_only_false_fails_closed(self) -> None:
         with self.assertRaises(SafetyViolation):

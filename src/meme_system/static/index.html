@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071019">
+  <title>多链信号控制台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <div id="file-protocol-notice" class="file-protocol-notice" hidden>当前打开的是本地文件预览，请使用 <a href="http://127.0.0.1:8788/">Dashboard 服务地址</a> 查看实时数据。</div>
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark"><span></span><span></span><span></span></div>
+        <div>
+          <div class="brand-name">信号 / 控制台</div>
+          <div class="brand-caption">只读市场运行</div>
+        </div>
+      </div>
+      <div class="topbar-controls">
+        <div class="mode-switch" role="tablist" aria-label="观察模式">
+          <button class="mode-tab active" data-mode="paper" type="button">Paper</button>
+          <button class="mode-tab" data-mode="shadow" type="button">Shadow</button>
+        </div>
+        <button id="strategy-guide-btn" class="button secondary" type="button">策略介绍 <span>↗</span></button>
+        <button id="refresh-btn" class="button ghost" type="button">手动刷新</button>
+      </div>
+      <div class="topbar-right">
+        <div class="chain-switch" role="tablist" aria-label="链选择">
+          <button class="chain-tab active" data-chain="solana" type="button" aria-selected="true">SOLANA <span>CT_501</span></button>
+          <button class="chain-tab" data-chain="bsc" type="button" aria-selected="false">BSC <span>56</span></button>
+        </div>
+        <div id="connection-pill" class="connection-pill pending"><i></i><span>连接中</span></div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero-grid">
+      <div class="hero-copy">
+          <div class="eyebrow" hidden><span class="eyebrow-dot"></span> <span id="chain-eyebrow">主网 · Paper / Shadow</span></div>
+          <h1 hidden>只读信号控制台</h1>
+          <p hidden>把实时信号、过滤原因与两套虚拟生命周期放在同一条可审计链路上。</p>
+        </div>
+        <div class="hero-status panel-glass" hidden>
+          <div class="status-header"><span>运行快照</span><span id="last-updated">等待数据</span></div>
+          <div class="status-main"><div id="runtime-state" class="status-value">连接中</div><div class="status-ring"><span></span></div></div>
+          <div class="status-grid">
+            <div><span>数据源</span><strong>Binance Web3</strong></div>
+            <div><span>报价</span><strong id="status-quote">只读报价</strong></div>
+            <div><span>RPC</span><strong id="status-rpc">只读链上状态</strong></div>
+            <div><span>写入权限</span><strong class="green">已禁用</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="核心指标">
+        <article class="metric-card accent-blue"><span class="metric-label">实时信号</span><strong id="metric-signals">—</strong><small>当前模式 · 最新优先</small></article>
+        <article class="metric-card accent-lime"><span class="metric-label">代币盈亏数量</span><strong id="metric-pnl-tokens">—</strong><small>盈利代币 / 亏损代币</small></article>
+        <article class="metric-card accent-amber"><span class="metric-label">当前持仓</span><strong id="metric-open">—</strong><small>虚拟生命周期</small></article>
+        <article class="metric-card accent-purple"><span class="metric-label">已平仓</span><strong id="metric-closed">—</strong><small>Paper / Shadow 独立</small></article>
+        <article class="metric-card accent-blue"><span class="metric-label">盈亏率</span><strong id="metric-pnl-rate">—</strong><small>已实现 · 净盈亏估算</small></article>
+        <article class="metric-card accent-red"><span class="metric-label">盈亏额</span><strong id="metric-pnl-amount">—</strong><small id="metric-pnl-caption">已实现 · 原生币</small></article>
+      </section>
+
+      <section class="insight-grid" aria-label="运行分析">
+        <article class="panel chart-panel">
+          <div class="panel-heading"><div><span class="section-kicker">过滤结果</span><h2>亏损原因占比</h2></div><span id="loss-reason-total" class="tag neutral">—</span></div>
+          <div class="donut-layout"><canvas id="loss-reason-chart" class="donut-chart" width="220" height="220" role="img" aria-label="亏损原因占比图表"></canvas><div id="loss-reason-legend" class="chart-legend"><div class="empty-state">暂无亏损记录</div></div></div>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-heading"><div><span class="section-kicker">入场过滤</span><h2>拒绝原因占比</h2></div><span id="rejection-reason-total" class="tag neutral">—</span></div>
+          <div class="donut-layout"><canvas id="rejection-reason-chart" class="donut-chart" width="220" height="220" role="img" aria-label="拒绝原因占比图表"></canvas><div id="rejection-reason-legend" class="chart-legend"><div class="empty-state">暂无拒绝记录</div></div></div>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-heading"><div><span class="section-kicker">字段覆盖</span><h2>不可用字段（不阻断）</h2></div><span id="unavailable-reason-total" class="tag neutral">—</span></div>
+          <div class="donut-layout"><canvas id="unavailable-reason-chart" class="donut-chart" width="220" height="220" role="img" aria-label="不可用字段统计图表"></canvas><div id="unavailable-reason-legend" class="chart-legend"><div class="empty-state">暂无不可用字段</div></div></div>
+        </article>
+        <article class="panel chart-panel trend-panel">
+          <div class="panel-heading"><div><span class="section-kicker">滚动表现</span><h2>盈亏趋势</h2></div><select id="trend-window" class="trend-window-select" aria-label="盈亏趋势时间范围"><option value="24h">24 小时</option><option value="3d">3 天</option><option value="7d">7 天</option><option value="1m">1 个月</option><option value="all">总计</option></select></div>
+          <div class="trend-meta"><span><i class="legend-dot lime"></i>每小时盈亏</span><span><i class="legend-dot blue"></i>累计盈亏</span><span id="trend-unit">原生币</span></div>
+          <canvas id="pnl-trend-chart" class="trend-chart" width="960" height="280" role="img" aria-label="近24小时盈亏趋势图表"></canvas>
+        </article>
+        <article class="panel strategy-results-panel" aria-label="策略独立盈亏">
+          <div class="panel-heading"><div><span class="section-kicker">策略拆分</span><h2>每个策略独立盈亏</h2></div><span id="strategy-results-summary" class="tag neutral">按策略分别计算</span></div>
+          <div id="strategy-results" class="strategy-results"><div class="empty-state">正在读取策略盈亏…</div></div>
+        </article>
+      </section>
+
+      <section class="content-grid" hidden>
+        <article class="panel health-panel">
+          <div class="panel-heading"><div><span class="section-kicker">01 / 系统监控</span><h2>系统健康</h2></div><span id="health-summary" class="tag neutral">检查中</span></div>
+          <div id="health-list" class="health-list"><div class="empty-state">正在读取健康状态…</div></div>
+        </article>
+        <article class="panel strategy-panel">
+          <div class="panel-heading"><div><span class="section-kicker">02 / 冻结基线</span><h2>当前策略</h2></div><button id="strategy-guide-btn-inline" class="icon-button" type="button" title="查看完整规则">↗</button></div>
+          <div class="strategy-identity"><div id="strategy-icon" class="strategy-icon">?</div><div><strong id="strategy-name">当前运行策略</strong><span id="strategy-version">等待配置</span></div></div>
+          <div id="strategy-summary" class="strategy-summary"><div class="empty-state">正在读取策略配置…</div></div>
+          <div class="safety-strip"><span class="shield">◇</span><span>仅 Paper 安全边界已锁定</span><b>真实交易关闭</b></div>
+        </article>
+      </section>
+
+      <section class="content-grid lower-grid">
+        <article class="panel positions-panel">
+          <div class="panel-heading"><div><span class="section-kicker">04 / 虚拟账本</span><h2>当前持仓</h2></div><div class="position-tools"><span id="position-mode-tag" class="tag blue">Paper</span><button id="position-prev" class="pagination-button" type="button" disabled>上一页</button><span id="position-page" class="pagination-page">第 1 / 1 页</span><button id="position-next" class="pagination-button" type="button" disabled>下一页</button></div></div>
+          <div class="table-wrap compact"><table><thead><tr><th>代币名称</th><th>实时观察价（SOL/代币）</th><th>可执行退出价（SOL/代币）</th><th>价格差</th><th>本地观察时间</th><th>Quote时间</th><th>持币地址数</th><th>市值</th><th>流动性</th></tr></thead><tbody id="position-body"><tr><td colspan="9" class="empty-state">暂无虚拟持仓</td></tr></tbody></table></div>
+        </article>
+        <article class="panel closed-panel">
+          <div class="panel-heading"><div><span class="section-kicker">03 / 虚拟账本</span><h2>已平仓记录</h2></div><div class="position-tools"><button id="closed-prev" class="pagination-button" type="button" disabled>上一页</button><span id="closed-page" class="pagination-page">第 1 / 1 页</span><button id="closed-next" class="pagination-button" type="button" disabled>下一页</button><label class="page-size-control" for="closed-page-size">每页<select id="closed-page-size" class="page-size-select" aria-label="已平仓记录每页条数"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>条</label><span id="closed-count" class="tag neutral">—</span></div></div>
+          <div class="filters-panel embedded-filters" aria-label="筛选查看">
+            <div class="embedded-filters-heading"><span class="section-kicker">筛选查看</span><button id="filter-reset" class="button ghost" type="button">重置筛选</button></div>
+            <div class="filter-grid">
+              <label class="filter-field filter-search"><span>代币 / Mint</span><input id="filter-token" type="search" placeholder="输入名称或地址" autocomplete="off"></label>
+              <label class="filter-field"><span>策略</span><select id="filter-strategy"><option value="all">全部策略</option></select></label>
+              <label class="filter-field"><span>盈亏结果</span><select id="filter-outcome"><option value="all">全部</option><option value="profit">盈利</option><option value="loss">亏损</option></select></label>
+              <label class="filter-field"><span>记录状态</span><select id="filter-status"><option value="all">全部状态</option><option value="OPEN">持仓中</option><option value="CLOSED">已平仓</option></select></label>
+              <label class="filter-field"><span>时间范围</span><select id="filter-window"><option value="24h">近 24 小时</option><option value="7d">近 7 天</option><option value="all">全部记录</option></select></label>
+            </div>
+          </div>
+          <div class="table-wrap closed-table"><table><thead><tr><th>代币名称</th><th>信号观测时间</th><th>评估时间</th><th>入场报价时间</th><th>开仓时间</th><th>出场报价时间</th><th>平仓时间</th><th id="closed-buy-price-label">买入价格（原生币/代币）</th><th id="closed-sell-price-label">卖出价格（原生币/代币）</th><th id="closed-pnl-label">盈亏额（原生币）</th><th>盈亏率</th><th>入场持币地址数</th><th>出场持币地址数</th><th>入场市值</th><th>出场市值</th><th>入场流动性</th><th>出场流动性</th></tr></thead><tbody id="closed-body"><tr><td colspan="17" class="empty-state">暂无已平仓记录</td></tr></tbody></table></div>
+        </article>
+      </section>
+
+    </main>
+
+    <footer class="footer"><span>本地控制面板 · 127.0.0.1:8788 · Dashboard v0.1.37</span><span>无钱包 · 无签名 · 无广播</span></footer>
+  </div>
+
+  <div id="strategy-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="strategy-modal-title">
+    <div class="modal-backdrop" data-modal-close></div>
+    <section class="modal-card">
+      <header class="modal-header"><div><span class="section-kicker">冻结配置</span><h2 id="strategy-modal-title">策略介绍</h2><p id="strategy-modal-subtitle">当前运行时基线，不包含历史策略。</p></div><button id="strategy-modal-close" class="icon-button" type="button" aria-label="关闭">×</button></header>
+      <div id="strategy-modal-content" class="modal-content"><div class="empty-state">正在读取策略配置…</div></div>
+    </section>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>

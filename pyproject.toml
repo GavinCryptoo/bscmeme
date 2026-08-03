@@ -4,10 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meme0801"
-version = "0.1.0"
-description = "Solana Paper and Shadow strategy system skeleton"
+version = "0.1.41"
+description = "Solana Paper/Shadow and isolated BSC Live strategy system"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+bsc-wss = [
+    "websockets>=12,<16",
+]
+bsc-live = [
+    "web3>=7,<8",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -17,4 +25,3 @@ meme_system = ["storage/migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -1,4 +1,4 @@
-"""Small SQLite writer for Gate A runtime state and observability facts."""
+"""Small SQLite writer for isolated runtime state and observability facts."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ def utc_now_iso() -> str:
 
 class RuntimeStore:
     def __init__(self, connection: sqlite3.Connection, mode: str) -> None:
-        if mode not in {"paper", "shadow"}:
-            raise ValueError("mode must be paper or shadow")
+        if mode not in {"paper", "shadow", "live"}:
+            raise ValueError("mode must be paper, shadow or live")
         self.connection = connection
         self.mode = mode
 
@@ -64,4 +64,3 @@ class RuntimeStore:
             (self.mode, max(1, min(1000, int(limit)))),
         )
         return tuple(dict(row) for row in rows)
-

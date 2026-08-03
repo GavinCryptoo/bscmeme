@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from meme_system.adapters.protocols import ExecutableQuote
 from meme_system.domain.models import (
+    BSC_BASELINE_IDENTITY,
     BASELINE_IDENTITY,
     CostBreakdown,
     EntryDecision,
@@ -25,11 +26,14 @@ from meme_system.domain.models import (
 
 
 ZERO = Decimal("0")
+SOLANA_SHADOW_MIN_LIQUIDITY_USD = Decimal("5000")
 
 
 @dataclass(frozen=True)
 class BaselineConfig:
     identity: StrategyIdentity = BASELINE_IDENTITY
+    observation_delay_sec: int = 15
+    require_holders_non_decreasing_after_observation: bool = True
     token_age_min_sec: int = 5
     token_age_max_sec: int = 120
     unique_buyers_15s_min: int = 6
@@ -38,22 +42,50 @@ class BaselineConfig:
     require_executable_buy_route: bool = True
     require_executable_sell_route: bool = True
     creator_confirmed_sold_at_entry: bool = False
-    max_buy_price_impact_pct: Decimal = Decimal("3")
-    max_immediate_exit_impact_pct: Decimal = Decimal("8")
+    max_buy_price_impact_pct: Decimal = Decimal("10")
+    max_immediate_exit_impact_pct: Decimal = Decimal("15")
     one_trade_per_mint: bool = True
     same_name_cooldown_sec: int = 900
-    max_open_positions: int = 2
-    initial_virtual_balance_sol: Decimal = Decimal("10")
+    max_open_positions: int = 50
+    min_holders: int = 20
+    min_holders_inclusive: bool = False
+    min_market_cap_usd: Decimal = Decimal("1000")
+    min_liquidity_usd: Decimal = Decimal("100")
+    initial_virtual_balance_sol: Decimal = Decimal("1")
     position_size_sol: Decimal = Decimal("0.001")
     take_profit_pct: Decimal = Decimal("0.10")
     stop_loss_trigger_pct: Decimal = Decimal("-0.20")
     max_hold_sec: int = 600
-    daily_full_loss_units_limit: int = 5
-    pause_new_entries_after_large_losses: int = 3
+    daily_full_loss_sol_limit: Decimal = Decimal("0.01")
+    pause_new_entries_after_large_losses: int = 50
     large_loss_threshold_pct: Decimal = Decimal("-0.40")
     shadow_defense_pct: Decimal = Decimal("-0.08")
     shadow_time_sec: int = 120
     shadow_mfe_pct: Decimal = Decimal("0.05")
+    shadow_holders_drop_pct: Decimal = Decimal("0.10")
+    shadow_liquidity_drop_pct: Decimal = Decimal("0.15")
+
+
+def bsc_baseline_config() -> BaselineConfig:
+    """Return the data-backed BSC Paper/Shadow overlay.
+
+    This is intentionally a BSC-only configuration.  Solana continues to use
+    the frozen ``BaselineConfig`` defaults and Jupiter quote requirements.
+    """
+    from meme_system.domain.models import BSC_BASELINE_IDENTITY
+
+    return BaselineConfig(
+        identity=BSC_BASELINE_IDENTITY,
+        observation_delay_sec=60,
+        require_holders_non_decreasing_after_observation=True,
+        min_holders=100,
+        min_holders_inclusive=True,
+        initial_virtual_balance_sol=Decimal("0.1"),
+        position_size_sol=Decimal("0.01"),
+        stop_loss_trigger_pct=Decimal("-0.10"),
+        shadow_holders_drop_pct=Decimal("0.10"),
+        shadow_liquidity_drop_pct=Decimal("0.15"),
+    )
 
 
 class BaselineStrategy:
@@ -63,97 +95,182 @@ class BaselineStrategy:
     def evaluate_entry(self, features: EntryFeatures) -> EntryDecision:
         checks: list[RuleCheck] = []
         checks.append(
-            self._check(
+            self._optional_numeric_check(
                 "token_age",
-                features.token_age_sec is not None
-                and self.config.token_age_min_sec <= features.token_age_sec <= self.config.token_age_max_sec,
                 features.token_age_sec,
                 f"{self.config.token_age_min_sec}..{self.config.token_age_max_sec}",
-                "token_age_unavailable" if features.token_age_sec is None else "token_age_out_of_range",
-                "币龄不可用" if features.token_age_sec is None else "币龄不在 5–120 秒范围",
+                lambda value: self.config.token_age_min_sec <= value <= self.config.token_age_max_sec,
+                "token_age_unavailable",
+                "币龄不可用；本项仅记录，不阻断入场",
+                "token_age_out_of_range",
+                "币龄不在 5–120 秒范围",
             )
         )
         checks.append(
-            self._check(
+            self._optional_numeric_check(
                 "unique_buyers_15s",
-                features.unique_buyers_15s is not None
-                and features.unique_buyers_15s >= self.config.unique_buyers_15s_min,
                 features.unique_buyers_15s,
                 self.config.unique_buyers_15s_min,
-                "unique_buyers_unavailable" if features.unique_buyers_15s is None else "unique_buyers_below_min",
-                "15 秒独立买家数不可用" if features.unique_buyers_15s is None else "15 秒独立买家数不足",
+                lambda value: value >= self.config.unique_buyers_15s_min,
+                "unique_buyers_unavailable",
+                "15 秒独立买家数不可用；本项仅记录，不阻断入场",
+                "unique_buyers_below_min",
+                "15 秒独立买家数不足",
             )
         )
         checks.append(
-            self._check(
+            self._optional_numeric_check(
                 "buy_sell_count_ratio_15s",
-                features.buy_sell_count_ratio_15s is not None
-                and features.buy_sell_count_ratio_15s >= self.config.buy_sell_count_ratio_15s_min,
                 features.buy_sell_count_ratio_15s,
                 self.config.buy_sell_count_ratio_15s_min,
-                "buy_sell_ratio_unavailable" if features.buy_sell_count_ratio_15s is None else "buy_sell_ratio_below_min",
-                "15 秒买卖笔数比不可用" if features.buy_sell_count_ratio_15s is None else "15 秒买卖笔数比不足",
+                lambda value: value >= self.config.buy_sell_count_ratio_15s_min,
+                "buy_sell_ratio_unavailable",
+                "15 秒买卖笔数比不可用；本项仅记录，不阻断入场",
+                "buy_sell_ratio_below_min",
+                "15 秒买卖笔数比不足",
             )
         )
         checks.append(
-            self._check(
+            self._optional_numeric_check(
                 "net_buy_15s",
-                features.net_buy_15s is not None and features.net_buy_15s > ZERO,
                 features.net_buy_15s,
                 "> 0",
-                "net_buy_unavailable" if features.net_buy_15s is None else "net_buy_not_positive",
-                "15 秒净买入不可用" if features.net_buy_15s is None else "15 秒净买入不为正",
+                lambda value: value > ZERO,
+                "net_buy_unavailable",
+                "15 秒净买入不可用；本项仅记录，不阻断入场",
+                "net_buy_not_positive",
+                "15 秒净买入不为正",
             )
         )
         checks.append(
-            self._check(
-                "two_non_negative_flow_windows",
-                all(value is True for value in features.flow_windows_non_negative),
-                features.flow_windows_non_negative,
-                (True, True),
-                "flow_window_unavailable" if any(value is None for value in features.flow_windows_non_negative) else "flow_window_negative",
-                "短窗口净流量不可用" if any(value is None for value in features.flow_windows_non_negative) else "两个短窗口中存在非正净流量",
-            )
+            self._optional_flow_check(features.flow_windows_non_negative)
         )
         checks.append(
-            self._check(
-                "creator_not_confirmed_sold",
-                features.creator_confirmed_sold is not None
-                and features.creator_confirmed_sold is self.config.creator_confirmed_sold_at_entry,
-                features.creator_confirmed_sold,
-                self.config.creator_confirmed_sold_at_entry,
-                "creator_sell_unavailable" if features.creator_confirmed_sold is None else "creator_confirmed_sold",
-                "创建者卖出状态不可用" if features.creator_confirmed_sold is None else "入场时已确认创建者卖出",
+            self._optional_creator_check(features.creator_confirmed_sold)
+        )
+        checks.append(self._holders_check(features.holders))
+        checks.append(self._market_cap_check(features.market_cap_usd))
+        checks.append(self._liquidity_check(features.liquidity_usd))
+        if features.pricing_mode == "binance_indicative":
+            checks.append(
+                self._check(
+                    "binance_indicative_price",
+                    features.pricing_error is None
+                    and features.buy_quote is not None
+                    and features.sell_quote is not None,
+                    features.pricing_error or "available",
+                    "valid Binance current price",
+                    "bsc_price_unavailable",
+                    "Binance 当前价格缺失或无效，拒绝开仓",
+                )
             )
-        )
-        checks.append(
-            self._quote_check(
-                "buy_route",
-                features.buy_quote,
-                self.config.position_size_sol,
-                features.evaluated_at,
-                self.config.max_buy_price_impact_pct,
-                "buy",
+        else:
+            checks.append(
+                self._quote_check(
+                    "buy_route",
+                    features.buy_quote,
+                    self.config.position_size_sol,
+                    features.evaluated_at,
+                    self.config.max_buy_price_impact_pct,
+                    "buy",
+                )
             )
-        )
-        expected_sell_quantity = (
-            features.buy_quote.output_quantity if features.buy_quote is not None else None
-        )
-        checks.append(
-            self._quote_check(
-                "sell_route",
-                features.sell_quote,
-                expected_sell_quantity,
-                features.evaluated_at,
-                self.config.max_immediate_exit_impact_pct,
-                "sell",
+            expected_sell_quantity = (
+                features.buy_quote.output_quantity if features.buy_quote is not None else None
             )
-        )
+            checks.append(
+                self._quote_check(
+                    "sell_route",
+                    features.sell_quote,
+                    expected_sell_quantity,
+                    features.evaluated_at,
+                    self.config.max_immediate_exit_impact_pct,
+                    "sell",
+                )
+            )
         return EntryDecision(
             accepted=all(check.passed for check in checks),
             identity=self.config.identity,
             checks=tuple(checks),
             soft_features=dict(features.soft_features or {}),
+        )
+
+    def _holders_check(self, holders: int | None) -> RuleCheck:
+        if holders is None:
+            return RuleCheck(
+                name="holders",
+                passed=False,
+                actual=None,
+                threshold=self._holders_threshold(),
+                reason_code="holders_unavailable",
+                reason_zh="入场时持币地址数缺失，拒绝开仓",
+            )
+        passed = holders >= self.config.min_holders if self.config.min_holders_inclusive else holders > self.config.min_holders
+        return RuleCheck(
+            name="holders",
+            passed=passed,
+            actual=holders,
+            threshold=self._holders_threshold(),
+            reason_code=None if passed else "holders_below_min",
+            reason_zh=None if passed else "入场时持币地址数低于最低值",
+        )
+
+    def _holders_threshold(self) -> str:
+        operator = ">=" if self.config.min_holders_inclusive else ">"
+        return f"{operator} {self.config.min_holders}"
+
+    def _market_cap_check(self, market_cap_usd: Decimal | None) -> RuleCheck:
+        if market_cap_usd is None:
+            return RuleCheck(
+                name="market_cap_usd",
+                passed=False,
+                actual=None,
+                threshold=f">= {self.config.min_market_cap_usd} USD",
+                reason_code="market_cap_unavailable",
+                reason_zh="入场时 Binance market_cap 缺失，拒绝开仓",
+            )
+        return RuleCheck(
+            name="market_cap_usd",
+            passed=market_cap_usd >= self.config.min_market_cap_usd,
+            actual=market_cap_usd,
+            threshold=f">= {self.config.min_market_cap_usd} USD",
+            reason_code=(
+                None
+                if market_cap_usd >= self.config.min_market_cap_usd
+                else "market_cap_below_min"
+            ),
+            reason_zh=(
+                None
+                if market_cap_usd >= self.config.min_market_cap_usd
+                else "入场时 Binance market_cap 低于最低值"
+            ),
+        )
+
+    def _liquidity_check(self, liquidity_usd: Decimal | None) -> RuleCheck:
+        if liquidity_usd is None:
+            return RuleCheck(
+                name="liquidity_usd",
+                passed=False,
+                actual=None,
+                threshold=f">= {self.config.min_liquidity_usd} USD",
+                reason_code="liquidity_unavailable",
+                reason_zh="入场时 Binance liquidity 缺失，拒绝开仓",
+            )
+        return RuleCheck(
+            name="liquidity_usd",
+            passed=liquidity_usd >= self.config.min_liquidity_usd,
+            actual=liquidity_usd,
+            threshold=f">= {self.config.min_liquidity_usd} USD",
+            reason_code=(
+                None
+                if liquidity_usd >= self.config.min_liquidity_usd
+                else "liquidity_below_min"
+            ),
+            reason_zh=(
+                None
+                if liquidity_usd >= self.config.min_liquidity_usd
+                else "入场时 Binance liquidity 低于最低值"
+            ),
         )
 
     def evaluate_paper_exit(
@@ -184,14 +301,7 @@ class BaselineStrategy:
             estimated_network_fee_sol,
             estimated_priority_fee_sol,
         )
-        if cost.gross_pnl_pct <= self.config.stop_loss_trigger_pct:
-            reason = "stop_loss"
-        elif cost.gross_pnl_pct >= self.config.take_profit_pct:
-            reason = "take_profit"
-        elif age_sec >= self.config.max_hold_sec:
-            reason = "max_hold_timeout"
-        else:
-            reason = None
+        reason = self._paper_exit_reason(cost.gross_pnl_pct, age_sec)
         return ExitDecision(
             triggered=reason is not None,
             identity=position.identity,
@@ -212,7 +322,19 @@ class BaselineStrategy:
         estimated_priority_fee_sol: Decimal | None = None,
     ) -> ExitDecision:
         reason: str | None = None
-        if (
+        if self._relative_drop_exceeds(
+            position.entry_holders,
+            features.holders,
+            self.config.shadow_holders_drop_pct,
+        ):
+            reason = "shadow_holders_drop_over_10pct"
+        elif self._relative_drop_exceeds(
+            position.entry_liquidity_usd,
+            features.liquidity_usd,
+            self.config.shadow_liquidity_drop_pct,
+        ):
+            reason = "shadow_liquidity_drop_over_15pct"
+        elif (
             features.return_pct <= self.config.shadow_defense_pct
             and features.recent_net_flow_negative
             and features.independent_buyer_growth_stopped
@@ -227,44 +349,99 @@ class BaselineStrategy:
         ):
             reason = "shadow_time_exit"
 
+        # Shadow keeps its structural early-exit overlay, but its standard
+        # quote-based TP/SL/timeout rules are the same as Paper.  This keeps
+        # the comparison lifecycle complete instead of treating TP/SL as
+        # observation-only metrics.
+        cost: CostBreakdown | None = None
+        if reason is None:
+            quote_error = self._validate_sell_quote(position, sell_quote, now)
+            if quote_error is not None:
+                return ExitDecision(
+                    triggered=False,
+                    identity=position.identity,
+                    reason=quote_error,
+                    position_age_sec=features.position_age_sec,
+                    return_pct=None,
+                    quote=sell_quote,
+                    cost=None,
+                )
+            assert sell_quote is not None
+            cost = self._cost_breakdown(
+                position,
+                sell_quote,
+                estimated_network_fee_sol,
+                estimated_priority_fee_sol,
+            )
+            reason = self._paper_exit_reason(
+                cost.gross_pnl_pct,
+                features.position_age_sec,
+            )
+
         if reason is None:
             return ExitDecision(
                 triggered=False,
                 identity=position.identity,
                 reason=None,
                 position_age_sec=features.position_age_sec,
-                return_pct=features.return_pct,
+                return_pct=cost.gross_pnl_pct if cost is not None else features.return_pct,
                 quote=sell_quote,
-                cost=None,
+                cost=cost,
             )
 
-        quote_error = self._validate_sell_quote(position, sell_quote, now)
-        if quote_error is not None:
-            return ExitDecision(
-                triggered=True,
-                identity=position.identity,
-                reason=quote_error,
-                position_age_sec=features.position_age_sec,
-                return_pct=features.return_pct,
-                quote=sell_quote,
-                cost=None,
+        if cost is None:
+            quote_error = self._validate_sell_quote(position, sell_quote, now)
+            if quote_error is not None:
+                return ExitDecision(
+                    triggered=True,
+                    identity=position.identity,
+                    reason=quote_error,
+                    position_age_sec=features.position_age_sec,
+                    return_pct=features.return_pct,
+                    quote=sell_quote,
+                    cost=None,
+                )
+            assert sell_quote is not None
+            cost = self._cost_breakdown(
+                position,
+                sell_quote,
+                estimated_network_fee_sol,
+                estimated_priority_fee_sol,
             )
 
-        assert sell_quote is not None
+        assert cost is not None
         return ExitDecision(
             triggered=True,
             identity=position.identity,
             reason=reason,
             position_age_sec=features.position_age_sec,
-            return_pct=features.return_pct,
+            return_pct=cost.gross_pnl_pct,
             quote=sell_quote,
-            cost=self._cost_breakdown(
-                position,
-                sell_quote,
-                estimated_network_fee_sol,
-                estimated_priority_fee_sol,
-            ),
+            cost=cost,
         )
+
+    def _paper_exit_reason(self, gross_pnl_pct: Decimal, age_sec: int) -> str | None:
+        if gross_pnl_pct <= self.config.stop_loss_trigger_pct:
+            return "stop_loss"
+        if gross_pnl_pct >= self.config.take_profit_pct:
+            return "take_profit"
+        if age_sec >= self.config.max_hold_sec:
+            return "max_hold_timeout"
+        return None
+
+    @staticmethod
+    def _relative_drop_exceeds(
+        entry_value: Decimal | int | None,
+        current_value: Decimal | int | None,
+        threshold: Decimal,
+    ) -> bool:
+        if threshold <= ZERO or entry_value is None or current_value is None:
+            return False
+        entry = Decimal(str(entry_value))
+        current = Decimal(str(current_value))
+        if not entry.is_finite() or not current.is_finite() or entry <= ZERO or current < ZERO:
+            return False
+        return (entry - current) / entry > threshold
 
     def _check(
         self,
@@ -282,6 +459,62 @@ class BaselineStrategy:
             threshold=threshold,
             reason_code=None if passed else reason_code,
             reason_zh=None if passed else reason_zh,
+        )
+
+    def _optional_numeric_check(
+        self,
+        name: str,
+        actual: Decimal | int | None,
+        threshold: object,
+        predicate,
+        unavailable_code: str,
+        unavailable_zh: str,
+        failed_code: str,
+        failed_zh: str,
+    ) -> RuleCheck:
+        if actual is None:
+            return RuleCheck(name, True, None, threshold, unavailable_code, unavailable_zh)
+        return self._check(name, predicate(actual), actual, threshold, failed_code, failed_zh)
+
+    def _optional_flow_check(
+        self,
+        actual: tuple[bool | None, bool | None],
+    ) -> RuleCheck:
+        if any(value is None for value in actual):
+            return RuleCheck(
+                "two_non_negative_flow_windows",
+                True,
+                actual,
+                (True, True),
+                "flow_window_unavailable",
+                "短窗口净流量不可用；本项仅记录，不阻断入场",
+            )
+        return self._check(
+            "two_non_negative_flow_windows",
+            all(value is True for value in actual),
+            actual,
+            (True, True),
+            "flow_window_negative",
+            "两个短窗口中存在非正净流量",
+        )
+
+    def _optional_creator_check(self, actual: bool | None) -> RuleCheck:
+        if actual is None:
+            return RuleCheck(
+                "creator_not_confirmed_sold",
+                True,
+                None,
+                self.config.creator_confirmed_sold_at_entry,
+                "creator_sell_unavailable",
+                "创建者卖出状态不可用；本项仅记录，不阻断入场",
+            )
+        return self._check(
+            "creator_not_confirmed_sold",
+            actual is self.config.creator_confirmed_sold_at_entry,
+            actual,
+            self.config.creator_confirmed_sold_at_entry,
+            "creator_confirmed_sold",
+            "入场时已确认创建者卖出",
         )
 
     def _quote_check(
@@ -330,14 +563,23 @@ class BaselineStrategy:
                 f"{side}_quote_quantity_mismatch",
                 f"{side} 报价数量与预期不一致",
             )
-        if quote.price_impact_pct is None:
+        if quote.output_quantity <= ZERO:
             return self._check(
                 name,
                 False,
+                quote.output_quantity,
+                "> 0",
+                f"{side}_quote_output_unavailable",
+                f"{side} 报价 outAmount 必须大于 0",
+            )
+        if quote.price_impact_pct is None:
+            return RuleCheck(
+                name,
+                True,
                 None,
                 max_impact_pct,
                 f"{side}_price_impact_unavailable",
-                f"{side} 报价缺少 price impact",
+                f"{side} 报价 price impact 不可用；本项仅记录，不阻断入场",
             )
         return self._check(
             name,

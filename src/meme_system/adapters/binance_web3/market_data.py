@@ -12,9 +12,9 @@ from meme_system.adapters.binance_web3.normalizer import normalize_dynamic
 
 class BinanceWeb3MarketDataAdapter:
     def __init__(self, client: BinanceWeb3Client, *, chain_id: str = "CT_501") -> None:
-        if chain_id != "CT_501":
+        if chain_id not in {"CT_501", "56"}:
             raise BinanceWeb3Error(
-                "only Solana CT_501 is enabled in this phase",
+                "only Solana CT_501 and BSC 56 are enabled in this phase",
                 context=ErrorContext("binance_unsupported_chain", "token_dynamic"),
             )
         self.client = client

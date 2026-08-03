@@ -156,6 +156,7 @@ def normalize_meme_row(
     *,
     fetched_at: datetime,
     historical_bootstrap: bool,
+    chain_id: str = "CT_501",
 ) -> BinanceNormalizedSignal:
     mint = row.get("contractAddress")
     if not isinstance(mint, str) or not mint:
@@ -170,6 +171,18 @@ def normalize_meme_row(
     # unit. It is intentionally not used as signal time until a live sample proves it.
     fields = {
         "mint": _field(row, normalized_name="mint", source_field="contractAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        # On BSC the live Meme Rush response exposes the corresponding Pair
+        # as pairAnchorAddress. Solana keeps this field as raw/unavailable for
+        # pool monitoring because its value is not an EVM Pair address.
+        "pair_address": _field(row, normalized_name="pair_address", source_field="pairAnchorAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        # A bonding-curve contract is only usable when Binance explicitly
+        # identifies it.  Do not derive it from the token or marker address.
+        "bonding_curve_address": _field(row, normalized_name="bonding_curve_address", source_field="bondingCurveAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        # Protocol/version are discovery metadata used only to select a
+        # read-only venue adapter. They never create a quote by themselves.
+        "protocol": _field(row, normalized_name="protocol", source_field="protocol", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
+        "token_version": _field(row, normalized_name="token_version", source_field="tokenVersion", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
+        "token_decimals": _field(row, normalized_name="token_decimals", source_field="decimals", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
         "symbol": _field(row, normalized_name="symbol", source_field="symbol", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
         "name": _field(row, normalized_name="name", source_field="name", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
         "price_usd": _field(row, normalized_name="price_usd", source_field="price", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
@@ -187,7 +200,14 @@ def normalize_meme_row(
         "dev_position": _field(row, normalized_name="dev_position", source_field="devPosition", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
         "migrate_status": _field(row, normalized_name="migrate_status", source_field="migrateStatus", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
     }
-    signal = Signal(signal_id=stable_id, mint=mint, observed_at=fetched_at, source="binance_web3:meme_rush")
+    chain = "bsc" if chain_id == "56" else "solana" if chain_id == "CT_501" else chain_id
+    signal = Signal(
+        signal_id=stable_id,
+        mint=mint,
+        observed_at=fetched_at,
+        source="binance_web3:meme_rush",
+        chain=chain,
+    )
     return BinanceNormalizedSignal(
         signal=signal,
         source_signal_id=source_signal_id,
@@ -196,6 +216,7 @@ def normalize_meme_row(
         historical_bootstrap=historical_bootstrap,
         raw_response_hash=schema_hash(row),
         fields=fields,
+        chain_id=chain_id,
     )
 
 
@@ -255,6 +276,9 @@ def normalize_dynamic(
     decimal_fields = {
         "price_usd": "price",
         "native_token_price": "nativeTokenPrice",
+        # Token Dynamic live responses include marketCap. Preserve it only
+        # when the field is present and parseable; missing stays unavailable.
+        "market_cap_usd": "marketCap",
         "liquidity_usd": "liquidity",
     }
     for window in ("5m", "1h", "4h", "24h"):

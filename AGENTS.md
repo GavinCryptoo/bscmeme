@@ -2,17 +2,18 @@
 
 ## 当前安全边界
 
-- 默认只允许 Paper；Shadow 必须独立运行。
-- Live、钱包、私钥读取、Keypair/PrivateKey/Wallet 实例、签名、广播和链上写入均不属于当前项目。
-- PAPER_ONLY=true、LIVE_TRADING=false、WALLET_ENABLED=false、SIGNING_ENABLED=false、BROADCAST_ENABLED=false 必须强制校验；TELEGRAM_ENABLED 默认 false，显式开启时也只能用于 Paper/Shadow 控制。
-- 不安装非必要的钱包或交易执行依赖。
+- 默认 Paper/Shadow 必须独立运行；BSC Live 仅在显式完整配置下独立运行。
+- Solana Live、Solana 钱包、私钥、签名、广播和链上写入仍不属于当前项目；BSC Live 私钥只从本地 `.env` 读取，不输出、不记录、不提交。
+- BSC Live 必须显式设置 `LIVE_TRADING=true`、`BSC_LIVE_ENABLED=true`、交易金额、最大持仓、滑点；Paper/Shadow 的安全默认值保持不变。
+- 不安装非必要的钱包或交易执行依赖；BSC Live 仅使用官方 PancakeSwap Smart Router SDK 与受控的 web3 依赖。
+- Telegram Token/Chat ID 使用本地 `.env` 配置，不输出、不提交；Telegram 仅允许通知、状态和暂停/恢复新开仓，不允许下单、卖出、钱包或进程控制。
 - 不输出密钥、Token、API Secret 或私钥内容。
 
 ## 开发规则
 
 - 当前最高优先级：CURRENT_DECISIONS.md，其次是规格文档，最后才是历史上下文。
 - 写入真实数据源前，先检索官方 SDK 文档和可靠 GitHub 开源实现。
-- 一次只实施一个阶段；每个阶段完成后运行测试并停止，等待确认。
+- 一次只实施一个最小变更；完成后运行测试并停止，不自动启动真实交易。
 - 不猜测未知接口、URL、字段、配额或鉴权方式。
 - 不自动启动长期进程，不自动终止现有进程，不修改 launchd。
 - 不未经确认扩大任务范围。
@@ -21,6 +22,4 @@
 
 ## 当前阶段
 
-当前已获确认进入阶段 4 Gate A：允许已审计 Binance Web3、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 的只读接入，以及实时 Paper/Shadow、Dashboard、健康检查和有限 Telegram Paper/Shadow 控制。
-
-阶段 4 仍禁止 Jupiter 执行接口、钱包、私钥、Keypair/PrivateKey/Wallet、签名、广播、链上写入、Live、BSC 和自动 Gate B。Binance Web3 的当前公开接口鉴权模式冻结为 `none`；不得自行添加 API Key、Cookie 或 Session。
+当前允许 BSC 独立小额 Live 最小实现；Solana 仍只允许只读数据与 Paper/Shadow。BSC Live 禁止使用 Binance indicative price 作为成交价，必须先通过官方 PancakeSwap Smart Router 生成实时报价和 calldata，并完成余额、nonce、decimals、allowance、estimateGas、最低到账和 deadline 检查。Binance Web3 的公开接口鉴权模式仍为 `none`。

@@ -15,8 +15,11 @@ shadow_feature_only: true
 
 ## Shadow 退出规则
 
+- BSC Shadow 先保留结构性提前退出，并在未触发结构规则时继承 BSC Paper 的止盈、止损和最长持仓退出，阈值和全部退出比例与 Paper 相同。
 - `shadow_defense_v1`：收益率 <= -8%、最近短窗口净流量为负、独立买家增长停止。
 - `shadow_creator_sell`：只有高置信创建者或明确关联地址卖出事件才触发；`devSellPercent` 不自动等同于该事件。
 - `shadow_time_exit`：持仓 >=120s、MFE <5%、买家增长和净流量同时放缓。
+
+Solana Shadow 保持上述原有 Shadow 规则，不继承 BSC Paper 的退出规则。
 
 触发后记录 5s、15s、30s、60s、120s 观察收益、是否达到 Paper TP、避免损失和错过利润。无法获得字段时保留 unavailable，不回填。

@@ -34,6 +34,11 @@ class ExecutableQuote:
     confidence: str = "verified"
     error_class: str | None = None
     raw_response_hash: str | None = None
+    request_times: tuple[datetime, ...] = ()
+    request_statuses: tuple[int, ...] = ()
+    # Explicit venue label persisted by the BSC read-only quote adapter.
+    # ``provider`` remains for backward compatibility with older adapters.
+    quote_source: str | None = None
 
     def unusable_reason(self, now: datetime) -> str | None:
         if not self.route_available:
@@ -62,6 +67,6 @@ class RealtimeFeatureProvider(Protocol):
 
 
 class BscAdapterProtocol(Protocol):
-    """Future interface only; Stage 0 must not connect to BSC."""
+    """Read-only BSC adapter boundary for Paper/Shadow candidate sources."""
 
     def chain_id(self) -> int: ...

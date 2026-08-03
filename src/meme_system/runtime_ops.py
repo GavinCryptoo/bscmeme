@@ -1,4 +1,4 @@
-"""Gate A runtime controls, health, latency, locks, and append-only audit."""
+"""Runtime controls, health, latency, locks, and append-only audit."""
 
 from __future__ import annotations
 
@@ -91,19 +91,28 @@ class JsonlAuditWriter:
 
 
 class RuntimeControl:
-    """Persist only safe Paper/Shadow pause flags; Live flags are not editable."""
+    """Persist new-entry pause flags without exposing execution controls."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self._state = {"paper_new_entries_paused": False, "shadow_new_entries_paused": False, "updated_at": None}
+        self._state = {
+            "paper_new_entries_paused": False,
+            "shadow_new_entries_paused": False,
+            "live_new_entries_paused": False,
+            "updated_at": None,
+        }
         self._load()
 
     def _load(self) -> None:
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(loaded, Mapping):
-                for key in ("paper_new_entries_paused", "shadow_new_entries_paused"):
+                for key in (
+                    "paper_new_entries_paused",
+                    "shadow_new_entries_paused",
+                    "live_new_entries_paused",
+                ):
                     if isinstance(loaded.get(key), bool):
                         self._state[key] = loaded[key]
                 self._state["updated_at"] = loaded.get("updated_at")
@@ -115,8 +124,8 @@ class RuntimeControl:
             return dict(self._state)
 
     def set_paused(self, mode: str, paused: bool) -> dict[str, object]:
-        if mode not in {"paper", "shadow"}:
-            raise ValueError("mode must be paper or shadow")
+        if mode not in {"paper", "shadow", "live"}:
+            raise ValueError("mode must be paper, shadow or live")
         with self._lock:
             self._state[f"{mode}_new_entries_paused"] = bool(paused)
             self._state["updated_at"] = utc_now().isoformat()

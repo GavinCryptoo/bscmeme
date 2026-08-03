@@ -56,9 +56,9 @@ class BinanceWeb3SignalSource:
         limit: int = 40,
         tracker: BootstrapTracker | None = None,
     ) -> None:
-        if chain_id != "CT_501":
+        if chain_id not in {"CT_501", "56"}:
             raise BinanceWeb3Error(
-                "only Solana CT_501 is enabled in this phase",
+                "only Solana CT_501 and BSC 56 are enabled in this phase",
                 context=ErrorContext("binance_unsupported_chain", "meme_rush"),
             )
         if rank_type not in {10, 20, 30}:
@@ -79,12 +79,22 @@ class BinanceWeb3SignalSource:
         )
         records: list[BinanceNormalizedSignal] = []
         for row in _rows(response.payload, "meme_rush"):
-            normalized = normalize_meme_row(row, fetched_at=fetched_at, historical_bootstrap=False)
+            normalized = normalize_meme_row(
+                row,
+                fetched_at=fetched_at,
+                historical_bootstrap=False,
+                chain_id=self.chain_id,
+            )
             is_new, historical = self.tracker.mark(normalized.signal.signal_id)
             if not is_new:
                 continue
             records.append(
-                normalize_meme_row(row, fetched_at=fetched_at, historical_bootstrap=historical)
+                normalize_meme_row(
+                    row,
+                    fetched_at=fetched_at,
+                    historical_bootstrap=historical,
+                    chain_id=self.chain_id,
+                )
             )
         self.tracker.complete()
         return tuple(records)
