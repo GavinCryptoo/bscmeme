@@ -29,8 +29,10 @@ from meme_system.adapters.protocols import ExecutableQuote
 
 
 FOUR_MEME_TOKEN_MANAGER = "0x5c952063c7fc8610ffdb798152d69f0b9550762b"
+FOUR_MEME_RUSH_TOKEN_MANAGER = "0x87fd30d61a8dce9150e173be9bf53e7f1c55dff8"
 FOUR_MEME_PROTOCOL = 2002
 FOUR_MEME_BONDING_CURVE_ROUTE = "fourmeme_token_manager2"
+FOUR_MEME_RUSH_BONDING_CURVE_ROUTE = "fourmeme_token_manager_rush"
 DEFAULT_BSC_RPC_URLS = (
     "https://bsc-dataseed.bnbchain.org",
     "https://bsc-dataseed-public.bnbchain.org",
@@ -42,6 +44,10 @@ _TOKEN_INFOS_TYPES = (
     "uint256", "uint256", "uint256", "uint256", "uint256", "uint256",
     "uint256",
 )
+_RUSH_TOKEN_INFOS_TYPES = (
+    "address", "address", "uint256", "uint256", "uint256", "uint256",
+    "uint256", "uint256", "uint256", "uint256", "uint256", "uint256",
+)
 _TOKEN_INFOS_SELECTOR = "0x" + keccak(text="_tokenInfos(address)")[:4].hex()
 _CALC_TRADING_FEE_SELECTOR = "0x" + keccak(
     text="calcTradingFee((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
@@ -52,6 +58,18 @@ _CALC_BUY_AMOUNT_SELECTOR = "0x" + keccak(
 _CALC_SELL_COST_SELECTOR = "0x" + keccak(
     text="calcSellCost((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
 )[:4].hex()
+_RUSH_CALC_BUY_AMOUNT_SELECTOR = "0x" + keccak(
+    text="calcBuyAmount((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
+)[:4].hex()
+_RUSH_CALC_SELL_COST_SELECTOR = "0x" + keccak(
+    text="calcSellCost((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256)"
+)[:4].hex()
+_RUSH_CALC_TRADING_FEE_SELECTOR = "0x" + keccak(text="calcTradingFee(uint256)")[:4].hex()
+_NATIVE_QUOTE_ADDRESSES = frozenset({
+    "0x0000000000000000000000000000000000000000",
+    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+})
 
 
 class BscQuoteUnavailable(RuntimeError):
@@ -90,17 +108,36 @@ def _quote_error(exc: BaseException) -> str:
 @dataclass(frozen=True)
 class BscMarketHint:
     pair_address: str | None = None
+    bonding_curve_address: str | None = None
     migrate_status: int | None = None
     protocol: int | None = None
+    token_version: int | None = None
     token_decimals: int | None = None
 
     @property
     def is_four_bonding_curve(self) -> bool:
+        # A confirmed pair takes precedence over stale migration metadata.
         return (
             self.protocol == FOUR_MEME_PROTOCOL
             and self.migrate_status == 0
             and self.pair_address is None
         )
+
+    @property
+    def venue(self) -> str:
+        return "bonding_curve" if self.is_four_bonding_curve else "pancakeswap"
+
+
+@dataclass(frozen=True)
+class _FourCurveSpec:
+    manager: str
+    route_name: str
+    token_info_types: tuple[str, ...]
+    last_price_index: int
+    fee_selector: str
+    buy_selector: str
+    sell_selector: str
+    fee_uses_token_info: bool
 
 
 class BscReadOnlyQuoteProvider:
@@ -148,8 +185,10 @@ class BscReadOnlyQuoteProvider:
     def remember_candidate(self, mint: str, fields: Mapping[str, object]) -> BscMarketHint:
         hint = BscMarketHint(
             pair_address=normalize_bsc_address(fields.get("pair_address")),
+            bonding_curve_address=normalize_bsc_address(fields.get("bonding_curve_address")),
             migrate_status=self._int_or_none(fields.get("migrate_status")),
             protocol=self._int_or_none(fields.get("protocol")),
+            token_version=self._int_or_none(fields.get("token_version")),
             token_decimals=self._int_or_none(fields.get("token_decimals")),
         )
         self._hints[mint.lower()] = hint
@@ -165,7 +204,7 @@ class BscReadOnlyQuoteProvider:
 
         hint = self.remember_candidate(mint, fields)
         try:
-            if hint.is_four_bonding_curve:
+            if hint.venue == "bonding_curve":
                 buy = self._four_quote(mint, "buy", amount_bnb, hint)
             else:
                 buy = self._pancake_quote(mint, "buy", amount_bnb, hint)
@@ -185,7 +224,7 @@ class BscReadOnlyQuoteProvider:
             return None
         hint = self._hints.get(mint.lower(), BscMarketHint())
         try:
-            if hint.is_four_bonding_curve:
+            if hint.venue == "bonding_curve":
                 return self._four_quote(mint, side, input_quantity, hint)
             return self._pancake_quote(mint, side, input_quantity, hint)
         except Exception:
@@ -261,25 +300,24 @@ class BscReadOnlyQuoteProvider:
             decimals = self.rpc.call_uint(mint, _TOKEN_DECIMALS_SELECTOR)
         if decimals is None or decimals < 0 or decimals > 36:
             raise BscQuoteUnavailable("token_decimals_unavailable")
-        info = self._four_token_info(mint)
-        if info[0].lower() != mint.lower() or info[1].lower() != "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee":
+        curve = self._four_curve_spec(hint)
+        info = self._four_token_info(mint, curve)
+        if info[0].lower() != mint.lower() or info[1].lower() not in _NATIVE_QUOTE_ADDRESSES:
             # The curve quote must be for the actual token and native quote.
             raise BscQuoteUnavailable("bonding_curve_quote_context_invalid")
         input_raw = _decimal_to_raw(input_quantity, 18 if side == "buy" else decimals)
         if side == "buy":
-            fee = self._four_call_uint(_CALC_TRADING_FEE_SELECTOR, info, input_raw)
+            fee = self._four_fee(curve, info, input_raw)
             if fee is None or fee >= input_raw:
                 raise BscQuoteUnavailable("bonding_curve_fee_unavailable")
-            output_raw = self._four_call_uint(_CALC_BUY_AMOUNT_SELECTOR, info, input_raw - fee)
+            output_raw = self._four_call_uint(curve, curve.buy_selector, info, input_raw - fee)
             if output_raw is None or output_raw <= 0:
-                # The deployed FOUR contract is known to reject its deprecated
-                # calcBuyAmount helper; estimates are intentionally not used.
                 raise BscQuoteUnavailable("bonding_curve_exact_buy_unavailable")
         else:
-            output_raw = self._four_call_uint(_CALC_SELL_COST_SELECTOR, info, input_raw)
+            output_raw = self._four_call_uint(curve, curve.sell_selector, info, input_raw)
             if output_raw is None or output_raw <= 0:
                 raise BscQuoteUnavailable("bonding_curve_exact_sell_unavailable")
-        last_price_raw = info[9]
+        last_price_raw = info[curve.last_price_index]
         if last_price_raw <= 0:
             raise BscQuoteUnavailable("bonding_curve_price_unavailable")
         output_decimals = decimals if side == "buy" else 18
@@ -311,7 +349,13 @@ class BscReadOnlyQuoteProvider:
             age_ms=0,
             expires_at=now + timedelta(milliseconds=self.quote_ttl_ms),
             provider="bonding_curve",
-            route=(FOUR_MEME_BONDING_CURVE_ROUTE, FOUR_MEME_TOKEN_MANAGER),
+            route=tuple(
+                item for item in (
+                    curve.route_name,
+                    curve.manager,
+                    hint.bonding_curve_address,
+                ) if item
+            ),
             executable_style=True,
             confidence="verified",
             requested_at=now,
@@ -319,25 +363,65 @@ class BscReadOnlyQuoteProvider:
             quote_source="bonding_curve",
         )
 
-    def _four_token_info(self, mint: str) -> tuple[object, ...]:
+    @staticmethod
+    def _four_curve_spec(hint: BscMarketHint) -> _FourCurveSpec:
+        if hint.token_version == 4:
+            return _FourCurveSpec(
+                manager=FOUR_MEME_RUSH_TOKEN_MANAGER,
+                route_name=FOUR_MEME_RUSH_BONDING_CURVE_ROUTE,
+                token_info_types=_RUSH_TOKEN_INFOS_TYPES,
+                last_price_index=5,
+                fee_selector=_RUSH_CALC_TRADING_FEE_SELECTOR,
+                buy_selector=_RUSH_CALC_BUY_AMOUNT_SELECTOR,
+                sell_selector=_RUSH_CALC_SELL_COST_SELECTOR,
+                fee_uses_token_info=False,
+            )
+        return _FourCurveSpec(
+            manager=FOUR_MEME_TOKEN_MANAGER,
+            route_name=FOUR_MEME_BONDING_CURVE_ROUTE,
+            token_info_types=_TOKEN_INFOS_TYPES,
+            last_price_index=9,
+            fee_selector=_CALC_TRADING_FEE_SELECTOR,
+            buy_selector=_CALC_BUY_AMOUNT_SELECTOR,
+            sell_selector=_CALC_SELL_COST_SELECTOR,
+            fee_uses_token_info=True,
+        )
+
+    def _four_token_info(self, mint: str, curve: _FourCurveSpec) -> tuple[object, ...]:
         token = normalize_bsc_address(mint)
         if token is None:
             raise BscQuoteUnavailable("invalid_token_address")
         data = _TOKEN_INFOS_SELECTOR + abi_encode(["address"], [token]).hex()
-        raw = self.rpc.call_hex(FOUR_MEME_TOKEN_MANAGER, data)
+        raw = self.rpc.call_hex(curve.manager, data)
         if raw is None:
             raise BscQuoteUnavailable("bonding_curve_state_unavailable")
         try:
-            values = abi_decode(list(_TOKEN_INFOS_TYPES), bytes.fromhex(raw[2:]))
+            values = abi_decode(list(curve.token_info_types), bytes.fromhex(raw[2:]))
         except Exception as exc:
             raise BscQuoteUnavailable("bonding_curve_state_invalid") from exc
-        if len(values) != 13:
+        if len(values) != len(curve.token_info_types):
             raise BscQuoteUnavailable("bonding_curve_state_invalid")
         return values
 
-    def _four_call_uint(self, selector: str, info: tuple[object, ...], amount_raw: int) -> int | None:
-        data = selector + abi_encode([f"({_TOKEN_INFOS_TYPES[0]},{','.join(_TOKEN_INFOS_TYPES[1:])})", "uint256"], [info, amount_raw]).hex()
-        raw = self.rpc.call_hex(FOUR_MEME_TOKEN_MANAGER, data)
+    def _four_fee(self, curve: _FourCurveSpec, info: tuple[object, ...], amount_raw: int) -> int | None:
+        if curve.fee_uses_token_info:
+            return self._four_call_uint(curve, curve.fee_selector, info, amount_raw)
+        raw = self.rpc.call_hex(curve.manager, curve.fee_selector + abi_encode(["uint256"], [amount_raw]).hex())
+        try:
+            return int(raw, 16) if raw is not None else None
+        except ValueError:
+            return None
+
+    def _four_call_uint(
+        self,
+        curve: _FourCurveSpec,
+        selector: str,
+        info: tuple[object, ...],
+        amount_raw: int,
+    ) -> int | None:
+        tuple_type = f"({curve.token_info_types[0]},{','.join(curve.token_info_types[1:])})"
+        data = selector + abi_encode([tuple_type, "uint256"], [info, amount_raw]).hex()
+        raw = self.rpc.call_hex(curve.manager, data)
         if raw is None:
             return None
         try:
@@ -348,38 +432,44 @@ class BscReadOnlyQuoteProvider:
     def _router_request(self, mint: str, side: str, amount_raw: int, decimals: int) -> Mapping[str, object]:
         if not self.helper_path.is_file():
             raise BscQuoteUnavailable("smart_router_helper_missing")
-        rpc_url = self.rpc.urls[0] if self.rpc.urls else None
-        if not rpc_url:
+        if not self.rpc.urls:
             raise BscQuoteUnavailable("bsc_rpc_unavailable")
-        payload = {
-            "operation": "quote",
-            "rpcUrl": rpc_url,
-            "side": side,
-            "token": mint,
-            "tokenDecimals": decimals,
-            "amountRaw": str(amount_raw),
-            "slippageBps": self.slippage_bps,
-            "deadline": int(_utc_now().timestamp()) + self.deadline_sec,
-        }
-        try:
-            completed = subprocess.run(
-                [self.node_binary, str(self.helper_path)],
-                input=json.dumps(payload),
-                text=True,
-                capture_output=True,
-                timeout=25,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise BscQuoteUnavailable("smart_router_process_unavailable") from exc
-        try:
-            result = json.loads(completed.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            raise BscQuoteUnavailable("smart_router_response_invalid") from exc
-        if completed.returncode != 0 or not isinstance(result, Mapping) or result.get("status") != "ok":
-            error_class = result.get("error_class") if isinstance(result, Mapping) else None
-            raise BscQuoteUnavailable(str(error_class or "smart_router_quote_unavailable"))
-        return result
+        last_error = "smart_router_quote_unavailable"
+        # Endpoint support for Router multicalls differs.  Each configured
+        # endpoint gets one bounded, read-only request before the route is
+        # declared unavailable.
+        for rpc_url in self.rpc.urls:
+            payload = {
+                "operation": "quote",
+                "rpcUrl": rpc_url,
+                "side": side,
+                "token": mint,
+                "tokenDecimals": decimals,
+                "amountRaw": str(amount_raw),
+                "slippageBps": self.slippage_bps,
+                "deadline": int(_utc_now().timestamp()) + self.deadline_sec,
+            }
+            try:
+                completed = subprocess.run(
+                    [self.node_binary, str(self.helper_path)],
+                    input=json.dumps(payload),
+                    text=True,
+                    capture_output=True,
+                    timeout=25,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise BscQuoteUnavailable("smart_router_process_unavailable") from exc
+            try:
+                result = json.loads(completed.stdout or "{}")
+            except json.JSONDecodeError:
+                last_error = "smart_router_response_invalid"
+                continue
+            if completed.returncode == 0 and isinstance(result, Mapping) and result.get("status") == "ok":
+                return result
+            if isinstance(result, Mapping):
+                last_error = str(result.get("error_class") or last_error)
+        raise BscQuoteUnavailable(last_error)
 
     @staticmethod
     def _quote_id(source: str, mint: str, side: str, input_quantity: Decimal, output_quantity: Decimal, now: datetime) -> str:

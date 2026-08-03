@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     bsc_executable_quote_enabled = (
         args.chain == "bsc"
         and args.mode != "live"
-        and os.environ.get("BSC_EXECUTABLE_QUOTE_ENABLED", "false").strip().lower() == "true"
+        and os.environ.get("BSC_EXECUTABLE_QUOTE_ENABLED", "true").strip().lower() == "true"
     )
     modes = _modes(args.mode)
     chain_id = "56" if args.chain == "bsc" else "CT_501"

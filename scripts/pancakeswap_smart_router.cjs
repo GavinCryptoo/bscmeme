@@ -10,8 +10,10 @@ const { Native, Token, CurrencyAmount, TradeType, Percent } = require('@pancakes
 const { ChainId } = require('@pancakeswap/chains');
 const { SmartRouter, SwapRouter, SMART_ROUTER_ADDRESSES } = require('@pancakeswap/smart-router/evm');
 
-function fail(errorClass) {
-  process.stdout.write(JSON.stringify({ status: 'error', error_class: errorClass }));
+function fail(error) {
+  const errorClass = error && error.name ? error.name : 'smart_router_error';
+  const message = error && error.message ? String(error.message).slice(0, 160) : null;
+  process.stdout.write(JSON.stringify({ status: 'error', error_class: errorClass, error_message: message }));
   process.exitCode = 1;
 }
 
@@ -104,4 +106,4 @@ async function main() {
   process.stdout.write(JSON.stringify(response));
 }
 
-main().catch((error) => fail(error && error.name ? error.name : 'smart_router_error'));
+main().catch(fail);

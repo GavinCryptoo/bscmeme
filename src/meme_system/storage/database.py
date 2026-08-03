@@ -22,7 +22,7 @@ MIGRATIONS = (
     (11, "011_quote_lifecycle_timestamps.sql"),
     (12, "012_solana_price_observation.sql"),
     (13, "013_price_snapshots_and_token_names.sql"),
-    # 014 is an isolated BSC migration. Keep it outside the Solana lineage.
+    (14, "014_bsc_quote_metadata.sql"),
     (15, "015_solana_price_snapshot_semantics.sql"),
 )
 

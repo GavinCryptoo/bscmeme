@@ -106,7 +106,7 @@ large_loss_threshold_pct: -40
 - Binance 不能提供的 15 秒独立买家、15 秒买卖比、15 秒净买、price impact 和可靠创建者卖出确认，不得用其它字段填补；这些字段保持 unavailable。BSC 没有 Quote Provider 时，`buy_quote_unavailable`/`sell_quote_unavailable` 不再单独阻断 BSC Paper/Shadow。
 - Jupiter 只允许 Quote endpoint；没有 `/swap`、`/swap-instructions`、构建交易、签名或发送交易。`priceImpactPct` 的单位未在当前官方接口契约中冻结，默认保持 unavailable，不得自行换算。
 - Solana Paper/Shadow 继续必须使用 Jupiter Quote；无有效 Jupiter 可执行报价不得模拟成交。
-- BSC Paper/Shadow 暂时使用 Binance Web3 当前价格的指示价模拟买入、持仓更新和平仓，且必须标记 `pricing_mode=binance_indicative`、`executable_quote=false`、`net_pnl_is_estimated=true`。当前价格缺失或无效时拒绝，不填默认价格。BSC executable quote 代码保留但默认关闭，不运行 014 迁移、不参与默认 Paper/Shadow 生命周期或 PnL。
+- BSC read-only + Paper/Shadow is allowed. BSC Live remains disabled. BSC Paper/Shadow 入场必须同时取得非零的链上只读买入和即时卖出报价；bonding curve 使用协议真实状态和计算，已迁移代币使用 PancakeSwap Router。缺少报价、route、`quoted_at` 或 price impact 时拒绝，不使用 Binance 指示价开仓。持仓和平仓使用最新链上卖出报价计算 PnL；无有效卖出报价的退出记录为 `pnl_status=unknown`，不得伪造价格。记录 `pricing_mode=bsc_executable_quote`、`executable_quote=true`、`quote_source`、route、输入输出和时间。Binance 仅作 Dashboard 对照，标记 `pricing_mode=binance_indicative_reference`、`executable_quote=false`，不参与 PnL；旧 BSC 指示价记录标记 `legacy_binance_indicative`，默认从正式统计排除。
 
 ## 报价、成交和成本
 

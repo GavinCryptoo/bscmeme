@@ -55,6 +55,18 @@ def _price_source(quote_id: object) -> str | None:
     return None
 
 
+def _price_source_label(quote_source: object, pricing_mode: object, legacy: object) -> str | None:
+    """Use stable UI labels without changing the persisted venue name."""
+
+    if bool(legacy) or pricing_mode == "legacy_binance_indicative":
+        return "binance_indicative_reference"
+    if quote_source == "bonding_curve":
+        return "bonding_curve_quote"
+    if quote_source == "pancakeswap_router":
+        return "pancakeswap_quote"
+    return None
+
+
 def _price_delta_pct(local_price: object, jupiter_price: object) -> str | None:
     if local_price in (None, "", "0") or jupiter_price in (None, ""):
         return None
@@ -187,14 +199,16 @@ class LedgerQueries:
         """Attach read-only trade details and time-bounded market snapshots."""
         for row in rows:
             entry = self.connection.execute(
-                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at, price_snapshot_json "
+                "SELECT quote_input_quantity, quote_output_quantity, quote_quoted_at, recorded_at, price_snapshot_json, "
+                "quote_source, quote_route, pricing_mode, legacy_valuation "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'entry' "
                 "ORDER BY recorded_at ASC, rowid ASC LIMIT 1",
                 (self.mode, row["position_id"]),
             ).fetchone()
             exit_row = self.connection.execute(
                 "SELECT quote_input_quantity, quote_output_quantity, "
-                "net_pnl_estimated_sol, quote_quoted_at, recorded_at, price_snapshot_json "
+                "net_pnl_estimated_sol, quote_quoted_at, recorded_at, price_snapshot_json, "
+                "quote_source, quote_route, pricing_mode, legacy_valuation, pnl_status "
                 "FROM executions WHERE mode = ? AND position_id = ? AND action = 'exit' "
                 "ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
                 (self.mode, row["position_id"]),
@@ -250,6 +264,16 @@ class LedgerQueries:
             pnl_sol = exit_row["net_pnl_estimated_sol"] if exit_row is not None else None
             row["pnl_sol"] = pnl_sol
             row["pnl_rate_pct"] = _percentage(pnl_sol, row.get("quantity_sol"))
+            source_row = exit_row or entry
+            if source_row is not None:
+                row["quote_source"] = source_row["quote_source"]
+                row["quote_route"] = _decode_json(source_row["quote_route"])
+                row["pricing_mode"] = source_row["pricing_mode"]
+                row["legacy_valuation"] = bool(source_row["legacy_valuation"])
+                row["pnl_status"] = exit_row["pnl_status"] if exit_row is not None else None
+                row["price_source_label"] = _price_source_label(
+                    row["quote_source"], row["pricing_mode"], row["legacy_valuation"]
+                )
             if row.get("price_snapshot_version", 0) < 1:
                 row["price_snapshot_status"] = "legacy_incomplete"
             elif not isinstance(entry_price_snapshot, dict) or not isinstance(exit_price_snapshot, dict):

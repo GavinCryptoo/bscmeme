@@ -443,6 +443,7 @@ class BinanceRealtimeFeatureProvider:
                         "pair_address",
                         "bonding_curve_address",
                         "protocol",
+                        "token_version",
                         "migrate_status",
                         "token_decimals",
                     )
@@ -1482,9 +1483,9 @@ class RealtimeCoordinator:
     def run_position_cycle(self, *, trigger: str = "poll") -> PositionCycleResult:
         """Refresh holdings and evaluate the existing exit rules.
 
-        For BSC, the default Paper/Shadow mode retains the established
-        indicative pool-event fast path with a Binance 2-second fallback.
-        The staged executable-quote path is opt-in only.
+        For BSC executable Paper/Shadow, WSS is only an immediate refresh
+        trigger; every value still comes from a new chain quote.  The
+        non-executable compatibility mode remains separately opt-out only.
         """
 
         started = self.clock()
@@ -1534,9 +1535,9 @@ class RealtimeCoordinator:
                     ):
                         quote = cached
                 if quote is None:
-                    # In default mode this is the bounded 2-second Binance
-                    # indicative fallback.  In staged mode it is a fresh
-                    # read-only executable quote.
+                    # Executable mode always obtains a fresh read-only sell
+                    # quote.  The compatibility mode retains its bounded
+                    # Binance reference fallback.
                     quote = self.features.quote_for_position(position)
                 fetched_quotes[(mode, position.position_id)] = quote
                 self._audit(mode, "BSC_POSITION_QUOTE_REFRESH", {
@@ -1836,6 +1837,8 @@ class RealtimeCoordinator:
                     soft = {}
                 if not isinstance(soft, Mapping):
                     continue
+                if self.features.bsc_executable_quote_enabled and self.features.bsc_quote_provider is not None:
+                    self.features.bsc_quote_provider.remember_candidate(position.mint, soft)
                 descriptor = self.features.resolve_bsc_pool(
                     position.mint,
                     soft.get("pair_address"),

@@ -211,11 +211,14 @@ class DashboardService:
                 continue
             positions.append(row)
 
+        legacy_filter = " AND COALESCE(e.legacy_valuation, 0) = 0" if chain == "bsc" else ""
         exit_rows = connection.execute(
             "SELECT e.position_id, e.reason, e.net_pnl_estimated_sol, e.recorded_at, "
             "p.strategy_name, p.mint, p.token_name, p.quantity_sol, p.closed_reason "
             "FROM executions e JOIN virtual_positions p ON p.position_id = e.position_id "
-            "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL "
+            "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL"
+            + legacy_filter
+            + " "
             "ORDER BY e.recorded_at DESC, e.rowid DESC",
             (mode,),
         ).fetchall()
@@ -539,9 +542,10 @@ class DashboardService:
             "chain_id": "56" if chain == "bsc" else "CT_501",
             "read_only": True,
             "pricing": {
-                "pricing_mode": "binance_indicative" if chain == "bsc" else "jupiter_quote",
-                "executable_quote": False if chain == "bsc" else True,
-                "net_pnl_is_estimated": True if chain == "bsc" else None,
+                "pricing_mode": "bsc_executable_quote" if chain == "bsc" else "jupiter_quote",
+                "executable_quote": True,
+                "net_pnl_is_estimated": False if chain == "bsc" else None,
+                "reference_pricing_mode": "binance_indicative_reference" if chain == "bsc" else None,
             },
             "safety": {
                 "paper_only": self.safety.paper_only,
@@ -564,6 +568,8 @@ class DashboardService:
         where = (
             "WHERE e.mode = ? AND e.action = 'exit' AND e.net_pnl_estimated_sol IS NOT NULL"
         )
+        if chain == "bsc":
+            where += " AND COALESCE(e.legacy_valuation, 0) = 0"
         params: tuple[object, ...] = (mode,)
         if display_since is not None:
             where += " AND p.opened_at >= ?"
@@ -641,9 +647,11 @@ class DashboardService:
         config = bsc_baseline_config() if is_bsc else BaselineConfig()
         entry_config = (
             {
-                "pricing_mode": "binance_indicative",
-                "executable_quote": False,
-                "binance_current_price_required": True,
+                "pricing_mode": "bsc_executable_quote",
+                "executable_quote": True,
+                "require_readonly_buy_quote": True,
+                "require_readonly_sell_quote": True,
+                "binance_indicative_reference_only": True,
                 "observation_delay_sec": config.observation_delay_sec,
                 "observation_price_rise_required": True,
                 "require_holders_non_decreasing_after_observation": config.require_holders_non_decreasing_after_observation,
@@ -698,15 +706,16 @@ class DashboardService:
             "chain_key": chain,
             "chain_id": "56" if chain == "bsc" else "CT_501",
             "pricing": {
-                "pricing_mode": "binance_indicative" if is_bsc else "jupiter_quote",
-                "executable_quote": False if is_bsc else True,
-                "net_pnl_is_estimated": True if is_bsc else None,
+                "pricing_mode": "bsc_executable_quote" if is_bsc else "jupiter_quote",
+                "executable_quote": True,
+                "net_pnl_is_estimated": False if is_bsc else None,
+                "reference_pricing_mode": "binance_indicative_reference" if is_bsc else None,
             },
             "strategy": BSC_BASELINE_IDENTITY.strategy_name if is_bsc else config.identity.strategy_name,
             "ruleset_name": config.identity.ruleset_name,
             "ruleset_version": config.identity.ruleset_version,
-            "display_name": "BSC Binance 指示价 Paper/Shadow 策略" if is_bsc else "Solana 超早期基线策略",
-            "display_ruleset_name": "BSC 指示价最小规则" if is_bsc else "超早期最小规则",
+            "display_name": "BSC 链上只读报价 Paper/Shadow 策略" if is_bsc else "Solana 超早期基线策略",
+            "display_ruleset_name": "BSC 链上报价最小规则" if is_bsc else "超早期最小规则",
             "live_engine": False,
             "wallet_path": None,
             "signing_path": None,

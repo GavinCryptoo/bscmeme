@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -785,8 +786,9 @@ class SimulationLedger:
             "quote_input_quantity, quote_output_quantity, price_impact_pct, quote_quoted_at, "
             "route_fee, estimated_network_fee, estimated_priority_fee, gross_pnl_sol, "
             "gross_pnl_pct, net_pnl_estimated_sol, net_pnl_is_estimated, recorded_at, "
-            "pricing_mode, executable_quote, exit_status, pnl_status, price_snapshot_json) "
-            "VALUES (" + ", ".join("?" for _ in range(24)) + ") ",
+            "pricing_mode, executable_quote, exit_status, pnl_status, price_snapshot_json, "
+            "quote_source, quote_route, legacy_valuation) "
+            "VALUES (" + ", ".join("?" for _ in range(27)) + ") ",
             (
                 execution.execution_id,
                 execution.position_id,
@@ -826,6 +828,9 @@ class SimulationLedger:
                 execution.exit_status,
                 execution.pnl_status,
                 _snapshot_json(execution.price_snapshot),
+                execution.quote_source,
+                json.dumps(execution.quote_route, ensure_ascii=False),
+                int(execution.pricing_mode == "legacy_binance_indicative"),
             ),
         )
         self.connection.commit()
@@ -913,12 +918,11 @@ class SimulationLedger:
             ).fetchone()
             if row is not None:
                 sequence = max(sequence, int(row["event_count"]))
-            while self.connection.execute(
-                "SELECT 1 FROM lifecycle_events WHERE event_id = ? LIMIT 1",
-                (f"{position_id}:{event_type}:{sequence}",),
-            ).fetchone() is not None:
-                sequence += 1
-        event_id = f"{position_id}:{event_type}:{sequence}"
+        # Polling and WSS price refreshes may record lifecycle events at the
+        # same time.  A count-derived suffix alone races in that case, which
+        # must never take down a Paper/Shadow runner.  Keep the readable
+        # prefix and add a process-independent unique suffix.
+        event_id = f"{position_id}:{event_type}:{sequence}:{uuid.uuid4().hex}"
         event = LifecycleEvent(
             event_id=event_id,
             position_id=position_id,

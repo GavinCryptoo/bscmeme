@@ -34,7 +34,7 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15])
+            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
             columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(virtual_positions)")
@@ -59,6 +59,9 @@ class StorageTests(unittest.TestCase):
             }
             self.assertIn("exit_status", execution_columns)
             self.assertIn("pnl_status", execution_columns)
+            self.assertIn("quote_source", execution_columns)
+            self.assertIn("quote_route", execution_columns)
+            self.assertIn("legacy_valuation", execution_columns)
             connection.close()
 
     def test_paper_and_shadow_paths_are_distinct(self) -> None:
