@@ -1,8 +1,8 @@
 """Read-only BSC Paper/Shadow quotes.
 
-Four.meme venue selection is derived from Four's on-chain Helper3 contract,
-never from Binance Meme Rush metadata.  The module deliberately contains no
-wallet, signer, approval, transaction, or broadcast capability.
+Venue selection is derived from each venue's on-chain contracts, never from
+Binance Meme Rush metadata.  The module deliberately contains no wallet,
+signer, approval, transaction, or broadcast capability.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, Union
 
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
@@ -30,6 +30,17 @@ from meme_system.adapters.protocols import ExecutableQuote
 # Four.meme publishes the Helper3 ABI in its Protocol Integration documents.
 # The helper returns the actual token manager, quote asset and migration flag.
 FOUR_MEME_HELPER3 = "0xf251f83e40a78868fcfa3fa4599dad6494e46034"
+FLAP_PORTAL = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0"
+# Flap publishes these BNB Chain implementations in its deployed-contracts
+# reference.  A 7777 Tax Token V3 is the fourth entry.
+FLAP_TOKEN_IMPLEMENTATIONS = frozenset(
+    {
+        "0x8b4329947e34b6d56d71a3385cac122bade7d78d",
+        "0x29e6383f0ce68507b5a72a53c2b118a118332aa8",
+        "0xae562c6a05b798499507c6276c6ed796027807ba",
+        "0x024f18294970b5c76c0691b87f138a0317156422",
+    }
+)
 WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 DEFAULT_BSC_RPC_URLS = (
@@ -42,12 +53,21 @@ _GET_TOKEN_INFO_SELECTOR = "0x" + keccak(text="getTokenInfo(address)")[:4].hex()
 _GET_PANCAKE_PAIR_SELECTOR = "0x" + keccak(text="getPancakePair(address)")[:4].hex()
 _TRY_BUY_SELECTOR = "0x" + keccak(text="tryBuy(address,uint256,uint256)")[:4].hex()
 _TRY_SELL_SELECTOR = "0x" + keccak(text="trySell(address,uint256)")[:4].hex()
+_GET_FLAP_TOKEN_V6_SELECTOR = "0x" + keccak(text="getTokenV6(address)")[:4].hex()
+_FLAP_QUOTE_EXACT_INPUT_SELECTOR = "0x" + keccak(text="quoteExactInput((address,address,uint256))")[:4].hex()
 _FOUR_INFO_TYPES = (
     "uint256", "address", "address", "uint256", "uint256", "uint256",
     "uint256", "uint256", "uint256", "uint256", "uint256", "bool",
 )
 _TRY_BUY_TYPES = ("address", "address", "uint256", "uint256", "uint256", "uint256", "uint256", "uint256")
 _TRY_SELL_TYPES = ("address", "address", "uint256", "uint256")
+_FLAP_TOKEN_V6_TYPES = (
+    "uint8", "uint256", "uint256", "uint256", "uint8", "uint256",
+    "uint256", "uint256", "uint256", "address", "bool", "bytes32",
+    "uint256", "address", "uint256",
+)
+_FLAP_STATUS_TRADABLE = 1
+_FLAP_STATUS_DEX = 4
 
 
 class BscQuoteUnavailable(RuntimeError):
@@ -90,6 +110,32 @@ class FourMemeContext:
     @property
     def fundraising_is_native(self) -> bool:
         return self.fundraising_currency is None
+
+
+@dataclass(frozen=True)
+class FlapContext:
+    """Current Flap Portal state for one EIP-1167 Flap token proxy."""
+
+    mint: str
+    token_proxy: str
+    token_implementation: str
+    launchpad: str
+    fundraising_currency: str | None
+    fundraising_decimals: int
+    token_decimals: int
+    status: int
+    migrated: bool
+    pancake_pair: str | None
+    native_to_quote_swap_enabled: bool
+    tax_rate_bps: int
+    progress: int
+
+    @property
+    def fundraising_is_native(self) -> bool:
+        return self.fundraising_currency is None
+
+
+BscVenueContext = Union[FourMemeContext, FlapContext]
 
 
 class _PancakeRouterClient:
@@ -180,7 +226,7 @@ class _PancakeRouterClient:
 
 
 class BscReadOnlyQuoteProvider:
-    """Read-only Four.meme/PancakeSwap quote provider for Paper and Shadow."""
+    """Read-only Flap/Four.meme/PancakeSwap quote provider for Paper/Shadow."""
 
     def __init__(
         self,
@@ -193,6 +239,7 @@ class BscReadOnlyQuoteProvider:
         quote_ttl_ms: int = 1800,
         deadline_sec: int = 60,
         four_helper_address: str = FOUR_MEME_HELPER3,
+        flap_portal_address: str = FLAP_PORTAL,
         router_client: _PancakeRouterClient | None = None,
     ) -> None:
         urls = (rpc_url,) if rpc_url else ()
@@ -203,13 +250,16 @@ class BscReadOnlyQuoteProvider:
         self.quote_ttl_ms = max(250, min(10000, int(quote_ttl_ms)))
         self.deadline_sec = max(15, min(300, int(deadline_sec)))
         self.four_helper_address = normalize_bsc_address(four_helper_address) or FOUR_MEME_HELPER3
-        self._contexts: dict[str, FourMemeContext | str] = {}
+        self.flap_portal_address = normalize_bsc_address(flap_portal_address) or FLAP_PORTAL
+        self._contexts: dict[str, BscVenueContext | str] = {}
         self._context_lock = threading.Lock()
         self._router = router_client or _PancakeRouterClient(self.node_binary, self.helper_path)
         self._metrics_lock = threading.Lock()
         self._metrics = {
             "quote_requests": 0,
             "context_invalid": 0,
+            "flap_recognized": 0,
+            "flap_quote_success": 0,
             "bonding_curve_quote_success": 0,
             "pancakeswap_quote_success": 0,
         }
@@ -227,6 +277,7 @@ class BscReadOnlyQuoteProvider:
             quote_ttl_ms=int(os.environ.get("BSC_QUOTE_TTL_MS", "1800")),
             deadline_sec=int(os.environ.get("BSC_TRADE_DEADLINE_SEC", "60")),
             four_helper_address=os.environ.get("FOUR_MEME_HELPER3_ADDRESS", FOUR_MEME_HELPER3),
+            flap_portal_address=os.environ.get("FLAP_PORTAL_ADDRESS", FLAP_PORTAL),
         )
 
     @property
@@ -247,7 +298,7 @@ class BscReadOnlyQuoteProvider:
         """Compatibility hook; context is resolved lazily from the chain."""
         self._context_for(mint)
 
-    def cached_context(self, mint: str) -> FourMemeContext | None:
+    def cached_context(self, mint: str) -> BscVenueContext | None:
         """Return already-resolved venue data without triggering chain I/O."""
 
         token = normalize_bsc_address(mint)
@@ -255,7 +306,7 @@ class BscReadOnlyQuoteProvider:
             return None
         with self._context_lock:
             cached = self._contexts.get(token)
-        return cached if isinstance(cached, FourMemeContext) else None
+        return cached if isinstance(cached, (FourMemeContext, FlapContext)) else None
 
     def quote_candidate(
         self,
@@ -267,29 +318,47 @@ class BscReadOnlyQuoteProvider:
         self._increment_metric("quote_requests")
         try:
             context = self._context_for(mint)
-            if context.migrated:
-                buy = self._pancake_quote(mint, "buy", amount_bnb, context)
-            elif context.fundraising_is_native:
-                buy = self._four_native_quote(context, "buy", amount_bnb)
+            if isinstance(context, FlapContext):
+                buy = self._flap_quote(context, "buy", amount_bnb)
             else:
-                buy = self._four_stable_quote(context, "buy", amount_bnb)
+                if context.migrated:
+                    buy = self._pancake_quote(mint, "buy", amount_bnb, context)
+                elif context.fundraising_is_native:
+                    buy = self._four_native_quote(context, "buy", amount_bnb)
+                else:
+                    buy = self._four_stable_quote(context, "buy", amount_bnb)
             if buy.output_quantity <= 0:
-                raise BscQuoteUnavailable("bonding_curve_buy_quote_unavailable")
+                raise BscQuoteUnavailable(
+                    "flap_buy_quote_unavailable"
+                    if isinstance(context, FlapContext)
+                    else "bonding_curve_buy_quote_unavailable"
+                )
             sell = self._quote_with_context(context, "sell", buy.output_quantity)
             if sell.output_quantity <= 0:
-                raise BscQuoteUnavailable("bonding_curve_sell_quote_unavailable")
-            if context.migrated:
+                raise BscQuoteUnavailable(
+                    "flap_sell_quote_unavailable"
+                    if isinstance(context, FlapContext)
+                    else "bonding_curve_sell_quote_unavailable"
+                )
+            if isinstance(context, FlapContext) and not context.migrated:
+                self._increment_metric("flap_quote_success")
+            elif context.migrated:
                 self._increment_metric("pancakeswap_quote_success")
             else:
                 self._increment_metric("bonding_curve_quote_success")
             return buy, sell, None
         except BscQuoteUnavailable as exc:
-            if str(exc) in {"fourmeme_context_unavailable", "unsupported_fundraising_asset"}:
+            if str(exc) in {
+                "venue_unrecognized",
+                "fourmeme_context_unavailable",
+                "unsupported_fundraising_asset",
+                "flap_context_unavailable",
+            }:
                 self._increment_metric("context_invalid")
             return None, None, str(exc)
         except Exception:
             self._increment_metric("context_invalid")
-            return None, None, "fourmeme_context_unavailable"
+            return None, None, "venue_unrecognized"
 
     def _increment_metric(self, name: str) -> None:
         with self._metrics_lock:
@@ -303,34 +372,50 @@ class BscReadOnlyQuoteProvider:
         except BscQuoteUnavailable:
             return None
 
-    def _quote_with_context(self, context: FourMemeContext, side: str, input_quantity: Decimal) -> ExecutableQuote:
+    def _quote_with_context(self, context: BscVenueContext, side: str, input_quantity: Decimal) -> ExecutableQuote:
+        if isinstance(context, FlapContext):
+            return self._flap_quote(self._refresh_flap_context(context), side, input_quantity)
         if context.migrated:
             return self._pancake_quote(context.mint, side, input_quantity, context)
         if context.fundraising_is_native:
             return self._four_native_quote(context, side, input_quantity)
         return self._four_stable_quote(context, side, input_quantity)
 
-    def _context_for(self, mint: str) -> FourMemeContext:
+    def _context_for(self, mint: str) -> BscVenueContext:
         token = normalize_bsc_address(mint)
         if token is None:
-            raise BscQuoteUnavailable("fourmeme_context_unavailable")
+            raise BscQuoteUnavailable("venue_unrecognized")
         with self._context_lock:
             cached = self._contexts.get(token)
+        if isinstance(cached, FlapContext):
+            return self._refresh_flap_context(cached)
         if isinstance(cached, FourMemeContext):
             return cached
         if isinstance(cached, str):
             raise BscQuoteUnavailable(cached)
         try:
-            context = self._read_four_context(token)
+            implementation = self._minimal_proxy_implementation(
+                self.rpc.call("eth_getCode", [token, "latest"])
+            )
+            if implementation in FLAP_TOKEN_IMPLEMENTATIONS:
+                context = self._read_flap_context(token, implementation)
+                self._increment_metric("flap_recognized")
+            else:
+                context = self._read_four_context(token, implementation=implementation)
         except BscQuoteUnavailable as exc:
+            reason = (
+                "venue_unrecognized"
+                if str(exc) == "fourmeme_context_unavailable"
+                else str(exc)
+            )
             with self._context_lock:
-                self._contexts[token] = str(exc)
-            raise
+                self._contexts[token] = reason
+            raise BscQuoteUnavailable(reason)
         with self._context_lock:
             self._contexts[token] = context
         return context
 
-    def _read_four_context(self, token: str) -> FourMemeContext:
+    def _read_four_context(self, token: str, *, implementation: str | None = None) -> FourMemeContext:
         raw = self.rpc.call_hex(
             self.four_helper_address,
             _GET_TOKEN_INFO_SELECTOR + abi_encode(["address"], [token]).hex(),
@@ -359,8 +444,6 @@ class BscReadOnlyQuoteProvider:
             _GET_PANCAKE_PAIR_SELECTOR + abi_encode(["address"], [token]).hex(),
         )
         migrated = bool(liquidity_added) or pair is not None
-        code = self.rpc.call("eth_getCode", [token, "latest"])
-        implementation = self._minimal_proxy_implementation(code)
         return FourMemeContext(
             mint=token,
             token_proxy=token,
@@ -373,6 +456,188 @@ class BscReadOnlyQuoteProvider:
             migrated=migrated,
             pancake_pair=pair,
             last_price_raw=int(last_price),
+        )
+
+    def _refresh_flap_context(self, context: FlapContext) -> FlapContext:
+        refreshed = self._read_flap_context(context.mint, context.token_implementation)
+        with self._context_lock:
+            self._contexts[context.mint] = refreshed
+        return refreshed
+
+    def _read_flap_context(self, token: str, implementation: str) -> FlapContext:
+        """Read the current Flap Portal state for an official proxy token.
+
+        `getTokenV6` supplies the quote asset, curve status and the official
+        DEX pool.  It is intentionally the only source of those fields: no
+        Binance field is accepted as a venue or funding-asset hint.
+        """
+
+        raw = self.rpc.call_hex(
+            self.flap_portal_address,
+            _GET_FLAP_TOKEN_V6_SELECTOR + abi_encode(["address"], [token]).hex(),
+        )
+        if raw in {None, "0x"}:
+            raise BscQuoteUnavailable("flap_context_unavailable")
+        try:
+            (
+                status,
+                _reserve,
+                _circulating_supply,
+                _price,
+                _version,
+                _r,
+                _h,
+                _k,
+                _dex_supply_thresh,
+                quote_token,
+                native_to_quote_swap_enabled,
+                _extension_id,
+                tax_rate_bps,
+                pool,
+                progress,
+            ) = abi_decode(list(_FLAP_TOKEN_V6_TYPES), bytes.fromhex(raw[2:]))
+        except Exception as exc:
+            raise BscQuoteUnavailable("flap_context_unavailable") from exc
+        if int(status) not in {_FLAP_STATUS_TRADABLE, _FLAP_STATUS_DEX}:
+            raise BscQuoteUnavailable("flap_context_unavailable")
+        quote_address = normalize_bsc_address(quote_token)
+        pool_address = normalize_bsc_address(pool)
+        token_decimals = self.rpc.call_uint(token, _TOKEN_DECIMALS_SELECTOR)
+        if not _valid_decimals(token_decimals):
+            raise BscQuoteUnavailable("flap_context_unavailable")
+        fundraising_decimals = 18
+        if quote_address is not None:
+            fundraising_decimals = self.rpc.call_uint(quote_address, _TOKEN_DECIMALS_SELECTOR)
+            if not _valid_decimals(fundraising_decimals):
+                raise BscQuoteUnavailable("flap_context_unavailable")
+        return FlapContext(
+            mint=token,
+            token_proxy=token,
+            token_implementation=implementation,
+            launchpad=self.flap_portal_address,
+            fundraising_currency=quote_address,
+            fundraising_decimals=int(fundraising_decimals),
+            token_decimals=int(token_decimals),
+            status=int(status),
+            migrated=int(status) == _FLAP_STATUS_DEX,
+            pancake_pair=pool_address,
+            native_to_quote_swap_enabled=bool(native_to_quote_swap_enabled),
+            tax_rate_bps=int(tax_rate_bps),
+            progress=int(progress),
+        )
+
+    def _flap_quote(self, context: FlapContext, side: str, quantity: Decimal) -> ExecutableQuote:
+        if context.migrated:
+            if context.pancake_pair is None:
+                raise BscQuoteUnavailable("pancakeswap_quote_unavailable")
+            quote = self._pancake_quote(context.mint, side, quantity, context)
+            return replace(
+                quote,
+                route=("venue:flap", f"flap_portal:{self.flap_portal_address}", f"flap_pool:{context.pancake_pair}", *quote.route),
+            )
+        if context.status != _FLAP_STATUS_TRADABLE:
+            raise BscQuoteUnavailable("flap_context_unavailable")
+        if side == "buy":
+            return self._flap_buy_quote(context, quantity)
+        if side == "sell":
+            return self._flap_sell_quote(context, quantity)
+        raise BscQuoteUnavailable("flap_context_unavailable")
+
+    def _flap_buy_quote(self, context: FlapContext, amount_bnb: Decimal) -> ExecutableQuote:
+        input_raw = _decimal_to_raw(amount_bnb, 18)
+        if context.fundraising_is_native or context.native_to_quote_swap_enabled:
+            output_raw = self._flap_quote_exact_input(
+                ZERO_ADDRESS, context.mint, input_raw, "flap_buy_quote_unavailable"
+            )
+            route = self._flap_route(context, "input:native_bnb")
+        else:
+            assert context.fundraising_currency is not None
+            funding_plan = self._router_request(
+                input_token=None,
+                input_decimals=18,
+                output_token=context.fundraising_currency,
+                output_decimals=context.fundraising_decimals,
+                amount_raw=input_raw,
+            )
+            funding_raw = self._router_output_raw(funding_plan)
+            output_raw = self._flap_quote_exact_input(
+                context.fundraising_currency,
+                context.mint,
+                funding_raw,
+                "flap_buy_quote_unavailable",
+            )
+            route = (*self._router_route(funding_plan), *self._flap_route(context, f"input:{context.fundraising_currency}"))
+        if output_raw <= 0:
+            raise BscQuoteUnavailable("flap_buy_quote_unavailable")
+        return self._quote(
+            "flap_bonding_curve_quote",
+            context,
+            "buy",
+            amount_bnb,
+            _raw_to_decimal(output_raw, context.token_decimals),
+            route=route,
+        )
+
+    def _flap_sell_quote(self, context: FlapContext, tokens: Decimal) -> ExecutableQuote:
+        token_raw = _decimal_to_raw(tokens, context.token_decimals)
+        output_token = ZERO_ADDRESS if context.fundraising_is_native else context.fundraising_currency
+        assert output_token is not None
+        funding_raw = self._flap_quote_exact_input(
+            context.mint,
+            output_token,
+            token_raw,
+            "flap_sell_quote_unavailable",
+        )
+        if funding_raw <= 0:
+            raise BscQuoteUnavailable("flap_sell_quote_unavailable")
+        if context.fundraising_is_native:
+            output = _raw_to_decimal(funding_raw, 18)
+            route = self._flap_route(context, "output:native_bnb")
+        else:
+            settlement_plan = self._router_request(
+                input_token=context.fundraising_currency,
+                input_decimals=context.fundraising_decimals,
+                output_token=None,
+                output_decimals=18,
+                amount_raw=funding_raw,
+            )
+            output = _raw_to_decimal(self._router_output_raw(settlement_plan), 18)
+            route = (*self._flap_route(context, f"output:{context.fundraising_currency}"), *self._router_route(settlement_plan))
+        if output <= 0:
+            raise BscQuoteUnavailable("flap_sell_quote_unavailable")
+        return self._quote("flap_bonding_curve_quote", context, "sell", tokens, output, route=route)
+
+    def _flap_quote_exact_input(
+        self,
+        input_token: str,
+        output_token: str,
+        amount_raw: int,
+        error: str,
+    ) -> int:
+        raw = self.rpc.call_hex(
+            self.flap_portal_address,
+            _FLAP_QUOTE_EXACT_INPUT_SELECTOR
+            + abi_encode(["(address,address,uint256)"], [(input_token, output_token, amount_raw)]).hex(),
+        )
+        if raw in {None, "0x"}:
+            raise BscQuoteUnavailable(error)
+        try:
+            output_raw = int(abi_decode(["uint256"], bytes.fromhex(raw[2:]))[0])
+        except Exception as exc:
+            raise BscQuoteUnavailable(error) from exc
+        if output_raw <= 0:
+            raise BscQuoteUnavailable(error)
+        return output_raw
+
+    def _flap_route(self, context: FlapContext, asset_leg: str) -> tuple[str, ...]:
+        fundraising = "native" if context.fundraising_is_native else str(context.fundraising_currency)
+        return (
+            "venue:flap",
+            f"flap_portal:{self.flap_portal_address}",
+            f"fundraising:{fundraising}",
+            f"fundraising_decimals:{context.fundraising_decimals}",
+            f"tax_rate_bps:{context.tax_rate_bps}",
+            asset_leg,
         )
 
     def _four_native_quote(self, context: FourMemeContext, side: str, quantity: Decimal) -> ExecutableQuote:
@@ -430,7 +695,7 @@ class BscReadOnlyQuoteProvider:
             route=("fourmeme_helper3", f"manager:{context.launchpad}", f"fundraising:{context.fundraising_currency}", *self._router_route(settlement_plan)),
         )
 
-    def _pancake_quote(self, mint: str, side: str, input_quantity: Decimal, context: FourMemeContext) -> ExecutableQuote:
+    def _pancake_quote(self, mint: str, side: str, input_quantity: Decimal, context: BscVenueContext) -> ExecutableQuote:
         amount_raw = _decimal_to_raw(input_quantity, 18 if side == "buy" else context.token_decimals)
         plan = self._router_request(
             input_token=None if side == "buy" else mint,
@@ -446,7 +711,7 @@ class BscReadOnlyQuoteProvider:
         self._cache_pancake_pair(context, route)
         return self._quote("pancakeswap_quote", context, side, input_quantity, output, route=route)
 
-    def _cache_pancake_pair(self, context: FourMemeContext, route: Sequence[str]) -> None:
+    def _cache_pancake_pair(self, context: BscVenueContext, route: Sequence[str]) -> None:
         if context.pancake_pair is not None:
             return
         pair = next(
@@ -457,7 +722,7 @@ class BscReadOnlyQuoteProvider:
             return
         with self._context_lock:
             cached = self._contexts.get(context.mint)
-            if isinstance(cached, FourMemeContext) and cached.pancake_pair is None:
+            if isinstance(cached, (FourMemeContext, FlapContext)) and cached.pancake_pair is None:
                 self._contexts[context.mint] = replace(cached, pancake_pair=pair)
 
     def _try_buy(self, context: FourMemeContext, funds_raw: int) -> tuple[object, ...]:
@@ -507,7 +772,7 @@ class BscReadOnlyQuoteProvider:
                 continue
         raise BscQuoteUnavailable("pancakeswap_quote_unavailable")
 
-    def _quote(self, source: str, context: FourMemeContext, side: str, input_quantity: Decimal, output_quantity: Decimal, *, route: Sequence[str]) -> ExecutableQuote:
+    def _quote(self, source: str, context: BscVenueContext, side: str, input_quantity: Decimal, output_quantity: Decimal, *, route: Sequence[str]) -> ExecutableQuote:
         now = _utc_now()
         return ExecutableQuote(
             quote_id=self._quote_id(source, context.mint, side, input_quantity, output_quantity, now),

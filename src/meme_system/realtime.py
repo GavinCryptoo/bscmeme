@@ -746,7 +746,7 @@ class BinanceRealtimeFeatureProvider:
     ) -> BscPoolDescriptor | None:
         if not self.is_bsc or self.bsc_pool_resolver is None:
             return None
-        # A resolved Four context is authoritative over Binance discovery
+        # A resolved on-chain venue context is authoritative over Binance discovery
         # fields.  This accessor is cache-only, so it cannot introduce quote
         # RPC traffic for every raw signal.
         cached_context = None
@@ -762,7 +762,10 @@ class BinanceRealtimeFeatureProvider:
             elif not cached_context.migrated:
                 pair_address = None
                 bonding_curve_address = cached_context.launchpad
-                protocol = 2002
+                # Flap and Four both appear as protocol=2002 in some Binance
+                # records.  Do not turn a Flap Portal into Four's manager: the
+                # resolver must only apply Four's event ABI to a Four context.
+                protocol = 2002 if cached_context.__class__.__name__ == "FourMemeContext" else None
                 migrate_status = 0
         return self.bsc_pool_resolver.resolve(
             mint,

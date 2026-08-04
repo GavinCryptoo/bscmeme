@@ -173,9 +173,20 @@ class BaselineStrategy:
                     "Binance 当前价格缺失或无效，拒绝开仓",
                 )
             )
+        elif features.pricing_mode == "bsc_executable_quote" and not bool(
+            (features.soft_features or {}).get("quote_requested", True)
+        ):
+            # Realtime defers BSC chain quotes until the local gates pass.
+            # A candidate which was never quoted must not be displayed as a
+            # buy/sell quote failure.
+            pass
         elif features.pricing_error in {
+            "venue_unrecognized",
             "fourmeme_context_unavailable",
             "unsupported_fundraising_asset",
+            "flap_context_unavailable",
+            "flap_buy_quote_unavailable",
+            "flap_sell_quote_unavailable",
             "bonding_curve_buy_quote_unavailable",
             "bonding_curve_sell_quote_unavailable",
             "pancakeswap_quote_unavailable",
