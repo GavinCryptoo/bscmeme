@@ -108,7 +108,12 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(config.min_liquidity_usd, Decimal("100"))
         self.assertEqual(config.large_loss_threshold_pct, Decimal("-0.40"))
         self.assertEqual(config.daily_full_loss_sol_limit, Decimal("0.01"))
-        self.assertTrue(config.require_holders_non_decreasing_after_observation)
+        self.assertFalse(config.enforce_holders)
+        self.assertFalse(config.enforce_market_cap)
+        self.assertFalse(config.enforce_liquidity)
+        self.assertFalse(config.require_observation_price)
+        self.assertFalse(config.require_observation_liquidity)
+        self.assertFalse(config.require_holders_non_decreasing_after_observation)
 
     def test_daily_full_loss_limit_is_measured_in_sol_and_resets_by_utc_date(self) -> None:
         ledger = SimulationLedger("paper")
@@ -179,7 +184,7 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertIn("token_age_unavailable", result.candidate.filter_reason)
 
-    def test_market_cap_is_a_hard_entry_filter(self) -> None:
+    def test_solana_market_cap_and_liquidity_are_record_only(self) -> None:
         engine = DeterministicSimulation("paper")
         missing = engine.process_entry(
             make_signal("market-cap-missing"),
@@ -187,37 +192,37 @@ class SimulationTests(unittest.TestCase):
             candidate_id="candidate-market-cap-missing",
             position_id="position-market-cap-missing",
         )
-        self.assertFalse(missing.decision.accepted)
-        self.assertIn("market_cap_unavailable", missing.decision.failed_reason_codes)
+        self.assertTrue(missing.decision.accepted)
+        self.assertNotIn("market_cap_unavailable", missing.decision.failed_reason_codes)
 
-        below_min = engine.process_entry(
+        below_min = DeterministicSimulation("paper").process_entry(
             make_signal("market-cap-low", "MintB"),
-            replace(make_entry_features(), market_cap_usd=Decimal("999.99")),
+            replace(make_entry_features(buy_quote=make_buy_quote("MintB"), sell_quote=make_sell_quote("0.001", mint="MintB")), market_cap_usd=Decimal("999.99")),
             candidate_id="candidate-market-cap-low",
             position_id="position-market-cap-low",
         )
-        self.assertFalse(below_min.decision.accepted)
-        self.assertIn("market_cap_below_min", below_min.decision.failed_reason_codes)
+        self.assertTrue(below_min.decision.accepted)
+        self.assertNotIn("market_cap_below_min", below_min.decision.failed_reason_codes)
 
-        missing = engine.process_entry(
+        missing = DeterministicSimulation("paper").process_entry(
             make_signal("liquidity-missing", "MintC"),
-            replace(make_entry_features(), liquidity_usd=None),
+            replace(make_entry_features(buy_quote=make_buy_quote("MintC"), sell_quote=make_sell_quote("0.001", mint="MintC")), liquidity_usd=None),
             candidate_id="candidate-liquidity-missing",
             position_id="position-liquidity-missing",
         )
-        self.assertFalse(missing.decision.accepted)
-        self.assertIn("liquidity_unavailable", missing.decision.failed_reason_codes)
+        self.assertTrue(missing.decision.accepted)
+        self.assertNotIn("liquidity_unavailable", missing.decision.failed_reason_codes)
 
-        below_min_liquidity = engine.process_entry(
+        below_min_liquidity = DeterministicSimulation("paper").process_entry(
             make_signal("liquidity-low", "MintD"),
-            replace(make_entry_features(), liquidity_usd=Decimal("99.99")),
+            replace(make_entry_features(buy_quote=make_buy_quote("MintD"), sell_quote=make_sell_quote("0.001", mint="MintD")), liquidity_usd=Decimal("99.99")),
             candidate_id="candidate-liquidity-low",
             position_id="position-liquidity-low",
         )
-        self.assertFalse(below_min_liquidity.decision.accepted)
-        self.assertIn("liquidity_below_min", below_min_liquidity.decision.failed_reason_codes)
+        self.assertTrue(below_min_liquidity.decision.accepted)
+        self.assertNotIn("liquidity_below_min", below_min_liquidity.decision.failed_reason_codes)
 
-    def test_shadow_liquidity_threshold_is_5000_without_changing_paper_default(self) -> None:
+    def test_solana_shadow_liquidity_value_is_record_only(self) -> None:
         paper = DeterministicSimulation("paper")
         shadow = DeterministicSimulation(
             "shadow",
@@ -243,10 +248,15 @@ class SimulationTests(unittest.TestCase):
             candidate_id="candidate-shadow-liquidity-4999",
             position_id="position-shadow-liquidity-4999",
         )
-        self.assertFalse(rejected.decision.accepted)
-        self.assertIn("liquidity_below_min", rejected.decision.failed_reason_codes)
+        self.assertTrue(rejected.decision.accepted)
+        self.assertNotIn("liquidity_below_min", rejected.decision.failed_reason_codes)
 
-        accepted = shadow.process_entry(
+        accepted = DeterministicSimulation(
+            "shadow",
+            strategy=BaselineStrategy(
+                replace(paper.strategy.config, min_liquidity_usd=SOLANA_SHADOW_MIN_LIQUIDITY_USD)
+            ),
+        ).process_entry(
             make_signal("shadow-liquidity-5000", "MintShadow5000"),
             replace(
                 make_entry_features(
@@ -260,7 +270,7 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertTrue(accepted.decision.accepted)
 
-    def test_holders_is_a_hard_entry_filter(self) -> None:
+    def test_solana_holders_is_record_only_and_bsc_remains_hard(self) -> None:
         engine = DeterministicSimulation("paper")
         missing = engine.process_entry(
             make_signal("holders-missing"),
@@ -268,25 +278,48 @@ class SimulationTests(unittest.TestCase):
             candidate_id="candidate-holders-missing",
             position_id="position-holders-missing",
         )
-        self.assertFalse(missing.decision.accepted)
-        self.assertIn("holders_unavailable", missing.decision.failed_reason_codes)
+        self.assertTrue(missing.decision.accepted)
+        self.assertNotIn("holders_unavailable", missing.decision.failed_reason_codes)
 
-        below_min = engine.process_entry(
+        below_min = DeterministicSimulation("paper").process_entry(
             make_signal("holders-low", "MintB"),
-            replace(make_entry_features(), holders=20),
+            replace(make_entry_features(buy_quote=make_buy_quote("MintB"), sell_quote=make_sell_quote("0.001", mint="MintB")), holders=20),
             candidate_id="candidate-holders-low",
             position_id="position-holders-low",
         )
-        self.assertFalse(below_min.decision.accepted)
-        self.assertIn("holders_below_min", below_min.decision.failed_reason_codes)
+        self.assertTrue(below_min.decision.accepted)
+        self.assertNotIn("holders_below_min", below_min.decision.failed_reason_codes)
 
-        accepted = engine.process_entry(
+        accepted = DeterministicSimulation("paper").process_entry(
             make_signal("holders-min", "MintA"),
             replace(make_entry_features(), holders=21),
             candidate_id="candidate-holders-min",
             position_id="position-holders-min",
         )
         self.assertTrue(accepted.decision.accepted)
+
+        bsc = DeterministicSimulation("paper", strategy=BaselineStrategy(bsc_baseline_config()))
+        bsc_rejected = bsc.process_entry(
+            make_signal("bsc-holders-low", "BscMint"),
+            replace(make_entry_features(), holders=99, pricing_mode="binance_indicative", executable_quote=False),
+            candidate_id="bsc-holders-low-candidate",
+            position_id="bsc-holders-low-position",
+        )
+        self.assertFalse(bsc_rejected.decision.accepted)
+        self.assertIn("holders_below_min", bsc_rejected.decision.failed_reason_codes)
+
+    def test_runtime_pause_is_a_control_skip_not_a_strategy_rejection(self) -> None:
+        engine = DeterministicSimulation("paper")
+        result = engine.process_entry(
+            make_signal("paused"),
+            make_entry_features(),
+            candidate_id="paused-candidate",
+            position_id="paused-position",
+            block_reason="runtime_paused",
+        )
+        self.assertFalse(result.decision.accepted)
+        self.assertEqual(result.candidate.status, "SKIPPED")
+        self.assertIn("runtime_paused", result.candidate.filter_reason)
 
     def test_solana_holder_threshold_can_be_inclusive(self) -> None:
         strategy = BaselineStrategy(BaselineConfig(min_holders=5, min_holders_inclusive=True))

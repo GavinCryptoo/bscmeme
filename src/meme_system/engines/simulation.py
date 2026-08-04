@@ -122,7 +122,9 @@ class DeterministicSimulation:
             signal_id=signal.signal_id,
             mint=signal.mint,
             identity=final_decision.identity,
-            status="ACCEPTED" if accepted else "REJECTED",
+            # A runtime pause is an operator control skip, not a strategy
+            # rejection.  Keep it separate from rejection-rate analytics.
+            status="ACCEPTED" if accepted else ("SKIPPED" if block_reason == "runtime_paused" else "REJECTED"),
             chain=signal.chain,
             filter_reason=",".join(recorded_reasons) if recorded_reasons else None,
             checks=final_decision.checks,
@@ -319,9 +321,11 @@ class DeterministicSimulation:
         exit_holders: int | None = None,
         exit_holders_loader: Callable[[], int | None] | None = None,
         price_snapshot: PriceSnapshot | None = None,
+        pricing_mode: str | None = None,
     ) -> ExitResult:
         if self.mode != "paper":
             raise ValueError("process_paper_exit requires paper mode")
+        resolved_pricing_mode = pricing_mode or self.pricing_mode
         position = self.ledger.positions[position_id]
         self.ledger.record_observation(position_id, now, sell_quote)
         position = self.ledger.positions[position_id]
@@ -353,10 +357,10 @@ class DeterministicSimulation:
                     cost=None,
                 )
         if not decision.triggered:
-            self._record_exit_attempt(position, decision, now)
+            self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             return ExitResult(position, decision, None)
         if decision.cost is None:
-            self._record_exit_attempt(position, decision, now)
+            self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             if self._is_bsc_executable_mode():
                 return self.process_bsc_unavailable_exit(
                     position_id,
@@ -379,7 +383,7 @@ class DeterministicSimulation:
         snapshot = price_snapshot or self.build_price_snapshot(
             decision.quote,
             native_symbol=self._native_symbol(),
-            pricing_mode=self.pricing_mode,
+            pricing_mode=resolved_pricing_mode,
             executable_quote=self.executable_quote,
             now=close_time,
         )
@@ -388,6 +392,7 @@ class DeterministicSimulation:
             decision,
             now,
             price_snapshot=snapshot if self._native_symbol() == "SOL" else None,
+            pricing_mode=resolved_pricing_mode,
         )
         self.ledger.transition_position(
             position_id,
@@ -581,6 +586,7 @@ class DeterministicSimulation:
         exit_holders: int | None = None,
         price_snapshot: PriceSnapshot | None = None,
         fallback_price_snapshot: PriceSnapshot | None = None,
+        pricing_mode: str | None = None,
     ) -> ExitResult:
         """Close a Solana Paper/Shadow position on the hard max-hold deadline.
 
@@ -623,7 +629,7 @@ class DeterministicSimulation:
             return ExitResult(position, decision, None)
 
         quote = jupiter_quote
-        pricing_mode = self.pricing_mode
+        pricing_mode = pricing_mode or self.pricing_mode
         executable_quote = self.executable_quote
         exit_status = "closed"
         pnl_status = "estimated"
@@ -886,9 +892,11 @@ class DeterministicSimulation:
         exit_holders: int | None = None,
         exit_holders_loader: Callable[[], int | None] | None = None,
         price_snapshot: PriceSnapshot | None = None,
+        pricing_mode: str | None = None,
     ) -> ExitResult:
         if self.mode != "shadow":
             raise ValueError("process_shadow_exit requires shadow mode")
+        resolved_pricing_mode = pricing_mode or self.pricing_mode
         position = self.ledger.positions[position_id]
         self.ledger.record_observation(position_id, now, sell_quote)
         position = self.ledger.positions[position_id]
@@ -916,10 +924,10 @@ class DeterministicSimulation:
                 cost=None,
             )
         if not decision.triggered:
-            self._record_exit_attempt(position, decision, now)
+            self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             return ExitResult(position, decision, None)
         if decision.cost is None:
-            self._record_exit_attempt(position, decision, now)
+            self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             if self._is_bsc_executable_mode() and decision.reason not in {
                 "sell_quote_unavailable",
                 "quote_expired",
@@ -954,7 +962,7 @@ class DeterministicSimulation:
         snapshot = price_snapshot or self.build_price_snapshot(
             decision.quote,
             native_symbol=self._native_symbol(),
-            pricing_mode=self.pricing_mode,
+            pricing_mode=resolved_pricing_mode,
             executable_quote=self.executable_quote,
             now=close_time,
         )
@@ -963,6 +971,7 @@ class DeterministicSimulation:
             decision,
             now,
             price_snapshot=snapshot if self._native_symbol() == "SOL" else None,
+            pricing_mode=resolved_pricing_mode,
         )
         closed = self.ledger.close_position(
             position_id,
@@ -1145,6 +1154,7 @@ class DeterministicSimulation:
         decision: ExitDecision,
         recorded_at: datetime,
         price_snapshot: PriceSnapshot | None = None,
+        pricing_mode: str | None = None,
     ) -> None:
         if decision.reason is None:
             return
@@ -1170,7 +1180,7 @@ class DeterministicSimulation:
                 quote_source=(quote.quote_source or quote.provider) if quote is not None else None,
                 quote_route=quote.route if quote is not None else (),
                 recorded_at=recorded_at,
-                pricing_mode=self.pricing_mode,
+                pricing_mode=pricing_mode or self.pricing_mode,
                 executable_quote=self.executable_quote,
                 price_snapshot=price_snapshot,
             )

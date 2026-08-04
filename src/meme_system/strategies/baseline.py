@@ -33,7 +33,14 @@ SOLANA_SHADOW_MIN_LIQUIDITY_USD = Decimal("5000")
 class BaselineConfig:
     identity: StrategyIdentity = BASELINE_IDENTITY
     observation_delay_sec: int = 15
-    require_holders_non_decreasing_after_observation: bool = True
+    # Solana records these fields but does not reject on them.  BSC explicitly
+    # enables its existing enforcement in bsc_baseline_config().
+    enforce_holders: bool = False
+    enforce_market_cap: bool = False
+    enforce_liquidity: bool = False
+    require_observation_price: bool = False
+    require_observation_liquidity: bool = False
+    require_holders_non_decreasing_after_observation: bool = False
     token_age_min_sec: int = 5
     token_age_max_sec: int = 120
     unique_buyers_15s_min: int = 6
@@ -66,6 +73,21 @@ class BaselineConfig:
     shadow_liquidity_drop_pct: Decimal = Decimal("0.15")
 
 
+def solana_baseline_config() -> BaselineConfig:
+    """Return the single Solana Paper/Shadow entry configuration.
+
+    These are the existing runner values, centralized so the runner and
+    Dashboard cannot silently advertise different controls.  Record-only
+    fields deliberately retain their historical values but have no reject
+    effect unless an explicit enforcement flag is enabled.
+    """
+    return BaselineConfig(
+        min_holders=5,
+        min_holders_inclusive=True,
+        pause_new_entries_after_large_losses=1000,
+    )
+
+
 def bsc_baseline_config() -> BaselineConfig:
     """Return the data-backed BSC Paper/Shadow overlay.
 
@@ -77,6 +99,11 @@ def bsc_baseline_config() -> BaselineConfig:
     return BaselineConfig(
         identity=BSC_BASELINE_IDENTITY,
         observation_delay_sec=60,
+        enforce_holders=True,
+        enforce_market_cap=True,
+        enforce_liquidity=True,
+        require_observation_price=True,
+        require_observation_liquidity=True,
         require_holders_non_decreasing_after_observation=True,
         min_holders=100,
         min_holders_inclusive=True,
@@ -233,6 +260,15 @@ class BaselineStrategy:
         )
 
     def _holders_check(self, holders: int | None) -> RuleCheck:
+        if not self.config.enforce_holders:
+            return RuleCheck(
+                name="holders",
+                passed=True,
+                actual=holders,
+                threshold=f"record_only ({self._holders_threshold()})",
+                reason_code=None,
+                reason_zh="持币地址数仅记录，不阻断入场",
+            )
         if holders is None:
             return RuleCheck(
                 name="holders",
@@ -257,6 +293,15 @@ class BaselineStrategy:
         return f"{operator} {self.config.min_holders}"
 
     def _market_cap_check(self, market_cap_usd: Decimal | None) -> RuleCheck:
+        if not self.config.enforce_market_cap:
+            return RuleCheck(
+                name="market_cap_usd",
+                passed=True,
+                actual=market_cap_usd,
+                threshold=f"record_only (>= {self.config.min_market_cap_usd} USD)",
+                reason_code=None,
+                reason_zh="市值仅记录，不阻断入场",
+            )
         if market_cap_usd is None:
             return RuleCheck(
                 name="market_cap_usd",
@@ -284,6 +329,15 @@ class BaselineStrategy:
         )
 
     def _liquidity_check(self, liquidity_usd: Decimal | None) -> RuleCheck:
+        if not self.config.enforce_liquidity:
+            return RuleCheck(
+                name="liquidity_usd",
+                passed=True,
+                actual=liquidity_usd,
+                threshold=f"record_only (>= {self.config.min_liquidity_usd} USD)",
+                reason_code=None,
+                reason_zh="流动性仅记录，不阻断入场",
+            )
         if liquidity_usd is None:
             return RuleCheck(
                 name="liquidity_usd",

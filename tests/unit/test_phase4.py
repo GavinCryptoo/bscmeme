@@ -886,6 +886,20 @@ class Phase4Tests(unittest.TestCase):
             for connection in connections.values():
                 connection.close()
 
+    def test_runtime_control_reloads_changes_and_retains_last_valid_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.json"
+            writer = RuntimeControl(path)
+            reader = RuntimeControl(path)
+            writer.set_paused("paper", True)
+            self.assertTrue(reader.paused("paper"))
+
+            path.write_text("{not-json", encoding="utf-8")
+            self.assertTrue(reader.paused("paper"))
+
+            writer.set_paused("paper", False)
+            self.assertFalse(reader.paused("paper"))
+
     def test_live_never_reenters_a_token_seen_in_startup_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -984,6 +998,14 @@ class Phase4Tests(unittest.TestCase):
             self.assertEqual(sol_display["display_name"], "Solana 超早期基线策略")
             self.assertEqual(sol_display["pricing"]["pricing_mode"], "jupiter_quote")
             self.assertEqual(sol_display["ruleset_version"], "0.1.1")
+            sol_entry = sol_display["strategy_config"]["entry"]
+            self.assertEqual(sol_entry["holders_policy"], "record_only")
+            self.assertEqual(sol_entry["market_cap_policy"], "record_only")
+            self.assertEqual(sol_entry["liquidity_policy"], "record_only")
+            self.assertEqual(sol_entry["observation_price_policy"], "record_only")
+            self.assertEqual(sol_entry["observation_liquidity_policy"], "record_only")
+            self.assertEqual(sol_entry["min_holders"], 5)
+            self.assertTrue(sol_entry["min_holders_inclusive"])
             self.assertIn(
                 "paper_take_profit",
                 sol_display["strategy_config"]["shadow_exit"]["rules"],

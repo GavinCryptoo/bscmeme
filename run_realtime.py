@@ -42,10 +42,10 @@ from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, LatencyRec
 from meme_system.storage.database import initialize_database
 from meme_system.storage.runtime_store import RuntimeStore
 from meme_system.strategies.baseline import (
-    BaselineConfig,
     BaselineStrategy,
     SOLANA_SHADOW_MIN_LIQUIDITY_USD,
     bsc_baseline_config,
+    solana_baseline_config,
 )
 from meme_system.telegram_control import TelegramConfig, TelegramControl
 
@@ -127,17 +127,14 @@ def main(argv: list[str] | None = None) -> int:
     strategy_config = (
         bsc_baseline_config()
         if strategy_identity is not None
-        else BaselineConfig(
-            min_holders=5,
-            min_holders_inclusive=True,
-            pause_new_entries_after_large_losses=1000,
-        )
+        else solana_baseline_config()
     )
     live_config: BscLiveConfig | None = None
     live_executor: BscLiveExecutor | None = None
     wss_monitor: SolanaWssMonitor | None = None
     wss_thread: Thread | None = None
     position_thread: Thread | None = None
+    control_thread: Thread | None = None
     wss_loop: asyncio.AbstractEventLoop | None = None
     wss_async_stop: asyncio.Event | None = None
     bsc_wss_monitor: BscPairWssMonitor | None = None
@@ -188,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                     if mode == "live"
                     else "bsc_executable_quote"
                     if bsc_executable_quote_enabled
-                    else "binance_indicative" if args.chain == "bsc" else "executable_quote"
+                    else "binance_indicative" if args.chain == "bsc" else "jupiter_quote"
                 ),
                 executable_quote=(
                     mode == "live" or args.chain != "bsc" or bsc_executable_quote_enabled
@@ -407,6 +404,13 @@ def main(argv: list[str] | None = None) -> int:
             # refresh, with account WSS able to trigger earlier processing.
             position_poll_sec = 2.0
 
+            def run_solana_control_heartbeat() -> None:
+                # Control changes must remain observable even if a bounded
+                # source/Quote request is still completing on the main loop.
+                while not stop_event.is_set():
+                    coordinator.publish_runtime_control_state()
+                    stop_event.wait(1.0)
+
             def run_solana_position_scheduler() -> None:
                 next_position_at = time.monotonic()
                 while not stop_event.is_set() and (args.duration <= 0 or time.monotonic() - started < args.duration):
@@ -426,6 +430,8 @@ def main(argv: list[str] | None = None) -> int:
 
             position_thread = Thread(target=run_solana_position_scheduler, name="solana-position-scheduler", daemon=True)
             position_thread.start()
+            control_thread = Thread(target=run_solana_control_heartbeat, name="solana-control-heartbeat", daemon=True)
+            control_thread.start()
             while not stop_event.is_set() and (args.duration <= 0 or time.monotonic() - started < args.duration):
                 coordinator.run_cycle()
                 refresh_wss_subscriptions()
@@ -450,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
             wss_thread.join(timeout=5.0)
         if position_thread is not None:
             position_thread.join(timeout=5.0)
+        if control_thread is not None:
+            control_thread.join(timeout=5.0)
         for connection in connections.values():
             connection.close()
 

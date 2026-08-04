@@ -125,25 +125,42 @@ class RuntimeControl:
             "live_new_entries_paused": False,
             "updated_at": None,
         }
+        self._last_mtime_ns: int | None = None
         self._load()
 
-    def _load(self) -> None:
+    def _load(self) -> bool:
+        """Load a complete control snapshot, retaining the last valid state on error."""
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(loaded, Mapping):
-                for key in (
-                    "paper_new_entries_paused",
-                    "shadow_new_entries_paused",
-                    "live_new_entries_paused",
-                ):
-                    if isinstance(loaded.get(key), bool):
-                        self._state[key] = loaded[key]
-                self._state["updated_at"] = loaded.get("updated_at")
+            if not isinstance(loaded, Mapping):
+                return False
+            for key in (
+                "paper_new_entries_paused",
+                "shadow_new_entries_paused",
+                "live_new_entries_paused",
+            ):
+                if isinstance(loaded.get(key), bool):
+                    self._state[key] = loaded[key]
+            self._state["updated_at"] = loaded.get("updated_at")
+            self._last_mtime_ns = self.path.stat().st_mtime_ns
+            return True
         except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return False
+
+    def _reload_if_changed_locked(self) -> None:
+        try:
+            mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
             return
+        if mtime_ns == self._last_mtime_ns:
+            return
+        # Atomic dashboard writes can briefly expose an incomplete file.  _load
+        # intentionally leaves the prior valid snapshot intact in that case.
+        self._load()
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            self._reload_if_changed_locked()
             return dict(self._state)
 
     def set_paused(self, mode: str, paused: bool) -> dict[str, object]:
@@ -156,6 +173,10 @@ class RuntimeControl:
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
             temporary.write_text(json.dumps(self._state, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
             temporary.replace(self.path)
+            try:
+                self._last_mtime_ns = self.path.stat().st_mtime_ns
+            except OSError:
+                self._last_mtime_ns = None
             return dict(self._state)
 
     def paused(self, mode: str) -> bool:

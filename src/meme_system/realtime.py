@@ -279,6 +279,11 @@ def _positive_decimal(value: object | None) -> Decimal | None:
     return parsed
 
 
+def _sol_usd_from_fields(fields: Mapping[str, object]) -> Decimal | None:
+    """Return Binance Dynamic's confirmed SOL/USD field without inversion."""
+    return _positive_decimal(_field_value(fields, "native_token_price"))
+
+
 def _non_negative_int(value: object | None) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -481,23 +486,11 @@ class BinanceRealtimeFeatureProvider:
             pump_state = self._solana_market_state(normalized.signal.mint)
             if pump_state is not None:
                 soft["trading_stage"] = pump_state.state
-            if (
-                pump_state is not None
-                and pump_state.state == "PUMP_BONDING_CURVE"
-                and self.pump_quote_provider is not None
-            ):
-                pricing_mode = "pump_bonding_curve_quote"
-                buy_quote = self.pump_quote_provider.quote_state(
-                    pump_state, "buy", self.position_size_sol
-                )
-                if buy_quote.output_quantity > 0:
-                    sell_quote = self.pump_quote_provider.quote_state(
-                        pump_state, "sell", buy_quote.output_quantity
-                    )
-                for quote in (buy_quote, sell_quote):
-                    if quote is not None and quote.error_class:
-                        quote_errors.append(quote.error_class)
-            elif self.quote_provider is not None:
+            # Pump state is read-only observation data.  Solana Paper/Shadow
+            # entries must settle from Jupiter Quote regardless of whether a
+            # mint is still on a Pump bonding curve, so the displayed price,
+            # stored execution and PnL always share one executable venue.
+            if self.quote_provider is not None:
                 pricing_mode = "jupiter_quote"
                 buy_quote = self._quote(normalized.signal.mint, "buy", self.position_size_sol, quote_errors)
                 if buy_quote is not None and buy_quote.output_quantity > 0:
@@ -509,12 +502,7 @@ class BinanceRealtimeFeatureProvider:
         # 5..120s age, 15s buyer ratio/net-buy windows, or a confident creator
         # sell boolean. They remain unavailable instead of being synthesized
         # from 5m/24h fields or timestamp units that are not frozen.
-        native_usd: Decimal | None = None
-        if not self.is_bsc:
-            token_usd = _positive_decimal(_field_value(fields, "price_usd"))
-            token_native = _positive_decimal(_field_value(fields, "native_token_price"))
-            if token_usd is not None and token_native is not None:
-                native_usd = token_usd / token_native
+        native_usd = _sol_usd_from_fields(fields) if not self.is_bsc else None
         return EntryFeatures(
             token_age_sec=None,
             unique_buyers_15s=None,
@@ -615,15 +603,15 @@ class BinanceRealtimeFeatureProvider:
             )
         if position.active_quantity_token <= 0:
             return None
-        pump_state = self._solana_market_state(position.mint)
-        if (
-            pump_state is not None
-            and pump_state.state == "PUMP_BONDING_CURVE"
-            and self.pump_quote_provider is not None
-        ):
-            return self.pump_quote_provider.quote_state(
-                pump_state, "sell", position.active_quantity_token
-            )
+        # Positions opened before the Jupiter-only cutover must close against
+        # their recorded Pump venue.  This branch is deliberately limited to
+        # an existing Pump entry id; it cannot create a new Pump-based entry.
+        if self._is_legacy_pump_position(position) and self.pump_quote_provider is not None:
+            pump_state = self._solana_market_state(position.mint)
+            if pump_state is not None and pump_state.state == "PUMP_BONDING_CURVE":
+                return self.pump_quote_provider.quote_state(
+                    pump_state, "sell", position.active_quantity_token
+                )
         if self.quote_provider is None:
             return None
         try:
@@ -722,10 +710,7 @@ class BinanceRealtimeFeatureProvider:
             except (TypeError, ValueError):
                 age_sec = float("inf")
             if age_sec <= 10:
-                token_usd = _positive_decimal(_field_value(market.fields, "price_usd"))
-                token_native = _positive_decimal(_field_value(market.fields, "native_token_price"))
-                if token_usd is not None and token_native is not None:
-                    native_usd = token_usd / token_native
+                native_usd = _sol_usd_from_fields(market.fields)
         return DeterministicSimulation.build_price_snapshot(
             quote,
             native_symbol="SOL",
@@ -1092,6 +1077,16 @@ class BinanceRealtimeFeatureProvider:
         except Exception:
             return None
 
+    @staticmethod
+    def _is_legacy_pump_position(position: VirtualPosition) -> bool:
+        return bool(position.entry_quote_id and position.entry_quote_id.startswith("pump:"))
+
+    @staticmethod
+    def solana_pricing_mode_for_quote(quote: ExecutableQuote | None) -> str:
+        if quote is not None and (quote.quote_source or quote.provider) == "pump_bonding_curve_quote":
+            return "pump_bonding_curve_quote"
+        return "jupiter_quote"
+
 
 @dataclass(frozen=True)
 class CycleResult:
@@ -1361,7 +1356,11 @@ class RealtimeCoordinator:
                         and jupiter_quote.unusable_reason(self.clock()) is None
                     )
                     settlement = jupiter_quote if usable_jupiter else local_quote
-                    pricing_mode = "jupiter_quote" if usable_jupiter else "pool_wss_indicative"
+                    pricing_mode = (
+                        self.features.solana_pricing_mode_for_quote(settlement)
+                        if usable_jupiter
+                        else "pool_wss_indicative"
+                    )
                     self._audit(mode, "SOLANA_TRIGGERED_EXIT_QUOTE", {
                         "position_id": position.position_id,
                         "mint": position.mint,
@@ -1429,6 +1428,7 @@ class RealtimeCoordinator:
 
     def run_cycle(self, *, process_exits: bool = True) -> CycleResult:
         started = self.clock()
+        self.publish_runtime_control_state()
         if self.telegram is not None:
             try:
                 actions = self.telegram.poll_once()
@@ -1569,6 +1569,25 @@ class RealtimeCoordinator:
                 })
             self._set_health(mode, "coordinator", "HEALTHY")
         return CycleResult(started, finished, fetched, bootstrap_skipped, duplicate_skipped, candidates, accepted, exits, source_error)
+
+    def publish_runtime_control_state(self) -> None:
+        """Publish the runner-applied control state without touching SQLite.
+
+        This is safe to call from the lightweight control heartbeat while a
+        slow source or candidate Quote is in flight.  RuntimeStore writes stay
+        on the coordinator cycle thread.
+        """
+        control_state = self.controls.snapshot()
+        for mode in self.engines:
+            self.health[mode].set(
+                "runtime_control",
+                "HEALTHY",
+                details={
+                    "new_entries_paused": bool(control_state[f"{mode}_new_entries_paused"]),
+                    "control_updated_at": control_state.get("updated_at"),
+                    "control_path": str(self.controls.path),
+                },
+            )
 
     def run_position_cycle(self, *, trigger: str = "poll") -> PositionCycleResult:
         """Refresh holdings and evaluate the existing exit rules.
@@ -2010,8 +2029,10 @@ class RealtimeCoordinator:
                 pending,
                 entry_features,
                 strategy_config.min_liquidity_usd,
+                require_price=strategy_config.require_observation_price,
                 price_must_rise=self.features.is_bsc,
                 holders_must_not_decrease=strategy_config.require_holders_non_decreasing_after_observation,
+                require_min_liquidity=strategy_config.require_observation_liquidity,
                 liquidity_must_not_decrease=self.features.is_bsc and mode == "shadow",
             )
             if block_reason is None and self.controls.paused(mode):
@@ -2055,33 +2076,39 @@ class RealtimeCoordinator:
         features: EntryFeatures,
         min_liquidity_usd: Decimal,
         *,
+        require_price: bool = True,
         price_must_rise: bool = True,
         holders_must_not_decrease: bool = False,
+        require_min_liquidity: bool = True,
         liquidity_must_not_decrease: bool = False,
     ) -> str | None:
-        if pending.first_price_usd is None:
-            return "observation_price_unavailable"
         soft_features = features.soft_features or {}
-        if soft_features.get("observation_snapshot_available") is not True:
-            return "observation_price_unavailable"
-        observed_price = _decimal_value(soft_features.get("price_usd"))
-        if observed_price is None:
-            return "observation_price_unavailable"
-        if price_must_rise and observed_price <= pending.first_price_usd:
-            return "price_not_up_after_observation"
-        if not price_must_rise and observed_price < pending.first_price_usd:
-            return "price_below_after_observation"
+        if require_price:
+            if pending.first_price_usd is None:
+                return "observation_price_unavailable"
+            if soft_features.get("observation_snapshot_available") is not True:
+                return "observation_price_unavailable"
+            observed_price = _decimal_value(soft_features.get("price_usd"))
+            if observed_price is None:
+                return "observation_price_unavailable"
+            if price_must_rise and observed_price <= pending.first_price_usd:
+                return "price_not_up_after_observation"
+            if not price_must_rise and observed_price < pending.first_price_usd:
+                return "price_below_after_observation"
         if holders_must_not_decrease:
             current_holders = _non_negative_int(features.holders)
             if pending.first_holders is None or current_holders is None:
                 return "holders_observation_unavailable"
             if current_holders < pending.first_holders:
                 return "holders_below_first_discovery_after_observation"
-        if features.liquidity_usd is None:
-            return "observation_liquidity_unavailable"
-        if features.liquidity_usd < min_liquidity_usd:
-            return "observation_liquidity_below_min"
+        if require_min_liquidity:
+            if features.liquidity_usd is None:
+                return "observation_liquidity_unavailable"
+            if features.liquidity_usd < min_liquidity_usd:
+                return "observation_liquidity_below_min"
         if liquidity_must_not_decrease:
+            if features.liquidity_usd is None:
+                return "observation_liquidity_unavailable"
             if pending.first_liquidity_usd is None:
                 return "observation_liquidity_unavailable"
             if features.liquidity_usd < pending.first_liquidity_usd:
@@ -2199,10 +2226,11 @@ class RealtimeCoordinator:
                     else None
                 )
                 exit_holders_snapshot = self.features.latest_holders_snapshot(position, now)
+                exit_pricing_mode = self.features.solana_pricing_mode_for_quote(quote)
                 jupiter_snapshot = self.features.price_snapshot_for_position(
                     position,
                     quote,
-                    pricing_mode="jupiter_quote",
+                    pricing_mode=exit_pricing_mode,
                     executable_quote=True,
                     now=now,
                 )
@@ -2225,6 +2253,7 @@ class RealtimeCoordinator:
                     ),
                     price_snapshot=jupiter_snapshot,
                     fallback_price_snapshot=fallback_snapshot,
+                    pricing_mode=exit_pricing_mode,
                 )
             else:
                 if not quote_already_fetched:
@@ -2244,10 +2273,14 @@ class RealtimeCoordinator:
                             self.features.price_snapshot_for_position(
                                 position,
                                 quote,
-                                pricing_mode="jupiter_quote",
+                                pricing_mode=self.features.solana_pricing_mode_for_quote(quote),
                                 executable_quote=True,
                                 now=now,
                             ) if not self.features.is_bsc else None
+                        ),
+                        pricing_mode=(
+                            self.features.solana_pricing_mode_for_quote(quote)
+                            if not self.features.is_bsc else None
                         ),
                     )
                 elif mode == "shadow":
@@ -2267,10 +2300,14 @@ class RealtimeCoordinator:
                             self.features.price_snapshot_for_position(
                                 position,
                                 quote,
-                                pricing_mode="jupiter_quote",
+                                pricing_mode=self.features.solana_pricing_mode_for_quote(quote),
                                 executable_quote=True,
                                 now=now,
                             ) if not self.features.is_bsc else None
+                        ),
+                        pricing_mode=(
+                            self.features.solana_pricing_mode_for_quote(quote)
+                            if not self.features.is_bsc else None
                         ),
                     )
                 else:

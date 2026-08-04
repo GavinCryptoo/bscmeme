@@ -21,7 +21,7 @@ from meme_system.config.runtime import RuntimePaths
 from meme_system.config.safety import SafetyConfig
 from meme_system.domain.models import BSC_BASELINE_IDENTITY, BASELINE_IDENTITY
 from meme_system.runtime_ops import RuntimeControl
-from meme_system.strategies.baseline import BaselineConfig, bsc_baseline_config
+from meme_system.strategies.baseline import bsc_baseline_config, solana_baseline_config
 from meme_system.storage.database import initialize_database
 from meme_system.storage.queries import LedgerQueries
 
@@ -527,11 +527,24 @@ class DashboardService:
                         (mode, display_since),
                     ).fetchone()[0]
                 pnl = self._pnl_summary(connection, mode, chain, display_since)
+            runner_control = self._runner_control_state(chain, mode) if chain == "solana" else None
             mode_payload: dict[str, object] = {
                 "counts": counts,
                 "pnl": pnl,
-                "new_entries_paused": control.paused(mode),
+                # Solana displays the state last applied by the actual runner,
+                # never merely the desired flag persisted by the dashboard.
+                "new_entries_paused": (
+                    runner_control["new_entries_paused"]
+                    if runner_control is not None
+                    else (None if chain == "solana" else control.paused(mode))
+                ),
             }
+            if chain == "solana":
+                mode_payload["runtime_control"] = runner_control or {
+                    "state": "UNKNOWN",
+                    "new_entries_paused": None,
+                    "requested_new_entries_paused": control.paused(mode),
+                }
             if display_since is not None:
                 mode_payload["display_since"] = display_since
             modes[mode] = mode_payload
@@ -612,8 +625,8 @@ class DashboardService:
         mode: str,
         chain: str,
     ) -> str | None:
-        """Return the optional BSC Paper/Shadow dashboard session boundary."""
-        if chain != "bsc" or mode not in {"paper", "shadow"}:
+        """Return the optional Paper/Shadow dashboard session boundary."""
+        if chain not in {"solana", "bsc"} or mode not in {"paper", "shadow"}:
             return None
         row = connection.execute(
             "SELECT value_json FROM runtime_state WHERE mode = ? AND state_key = ?",
@@ -642,9 +655,35 @@ class DashboardService:
             result["modes"][mode] = {"snapshot": snapshot, "recent_events": events}
         return result
 
+    def _runner_control_state(self, chain: str, mode: str) -> dict[str, object] | None:
+        """Return the most recent control state acknowledged by one runner."""
+        paths = self._paths(chain)
+        path = paths.paper_health_file if mode == "paper" else paths.shadow_health_file
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        items = snapshot.get("items")
+        if not isinstance(items, dict):
+            return None
+        item = items.get("runtime_control")
+        if not isinstance(item, dict) or item.get("state") != "HEALTHY":
+            return None
+        details = item.get("details")
+        if not isinstance(details, dict) or not isinstance(details.get("new_entries_paused"), bool):
+            return None
+        return {
+            "state": "APPLIED",
+            "new_entries_paused": details["new_entries_paused"],
+            "updated_at": item.get("updated_at"),
+            "control_updated_at": details.get("control_updated_at"),
+        }
+
     def config_payload(self, chain: str = "solana") -> dict[str, object]:
         is_bsc = chain == "bsc"
-        config = bsc_baseline_config() if is_bsc else BaselineConfig()
+        config = bsc_baseline_config() if is_bsc else solana_baseline_config()
         entry_config = (
             {
                 "pricing_mode": "bsc_executable_quote",
@@ -671,8 +710,10 @@ class DashboardService:
             if is_bsc
             else {
                 "observation_delay_sec": config.observation_delay_sec,
-                "observation_price_rise_required": False,
+                "observation_price_rise_required": config.require_observation_price and False,
                 "require_holders_non_decreasing_after_observation": config.require_holders_non_decreasing_after_observation,
+                "observation_price_policy": "hard" if config.require_observation_price else "record_only",
+                "observation_liquidity_policy": "hard" if config.require_observation_liquidity else "record_only",
                 "token_age_sec": [config.token_age_min_sec, config.token_age_max_sec],
                 "unique_buyers_15s_min": config.unique_buyers_15s_min,
                 "buy_sell_count_ratio_15s_min": str(config.buy_sell_count_ratio_15s_min),
@@ -683,10 +724,13 @@ class DashboardService:
                 "require_executable_sell_route": config.require_executable_sell_route,
                 "max_buy_price_impact_pct": str(config.max_buy_price_impact_pct),
                 "max_immediate_exit_impact_pct": str(config.max_immediate_exit_impact_pct),
-                "min_holders": 5,
-                "min_holders_inclusive": True,
+                "min_holders": config.min_holders,
+                "min_holders_inclusive": config.min_holders_inclusive,
+                "holders_policy": "hard" if config.enforce_holders else "record_only",
                 "min_market_cap_usd": str(config.min_market_cap_usd),
+                "market_cap_policy": "hard" if config.enforce_market_cap else "record_only",
                 "min_liquidity_usd": str(config.min_liquidity_usd),
+                "liquidity_policy": "hard" if config.enforce_liquidity else "record_only",
             }
         )
         risk_config = {
@@ -696,9 +740,7 @@ class DashboardService:
             "same_name_cooldown_sec": config.same_name_cooldown_sec,
             "one_trade_per_mint": config.one_trade_per_mint,
             "daily_full_loss_bnb" if is_bsc else "daily_full_loss_sol": str(config.daily_full_loss_sol_limit),
-            "pause_new_entries_after_large_losses": (
-                1000 if not is_bsc else config.pause_new_entries_after_large_losses
-            ),
+            "pause_new_entries_after_large_losses": config.pause_new_entries_after_large_losses,
             "large_loss_threshold_pct": str(config.large_loss_threshold_pct * 100),
         }
         return {

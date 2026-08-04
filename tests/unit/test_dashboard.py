@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,7 +23,7 @@ class DashboardConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             DashboardConfig(host="0.0.0.0").validate()
 
-    def test_bsc_display_since_applies_to_paper_and_shadow_only(self) -> None:
+    def test_display_since_applies_to_paper_and_shadow_on_both_chains(self) -> None:
         since = "2026-08-03T04:30:00+00:00"
         with tempfile.TemporaryDirectory() as directory:
             connection = initialize_database(Path(directory) / "runtime.db")
@@ -37,9 +38,43 @@ class DashboardConfigTests(unittest.TestCase):
 
             self.assertEqual(DashboardService._display_since(connection, "paper", "bsc"), since)
             self.assertEqual(DashboardService._display_since(connection, "shadow", "bsc"), since)
-            self.assertIsNone(DashboardService._display_since(connection, "paper", "solana"))
-            self.assertIsNone(DashboardService._display_since(connection, "shadow", "solana"))
+            self.assertEqual(DashboardService._display_since(connection, "paper", "solana"), since)
+            self.assertEqual(DashboardService._display_since(connection, "shadow", "solana"), since)
+            self.assertIsNone(DashboardService._display_since(connection, "paper", "unknown"))
             connection.close()
+
+    def test_solana_status_uses_runner_acknowledged_control_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = type("Paths", (), {
+                "control_file": root / "control.json",
+                "paper_health_file": root / "paper-health.json",
+                "shadow_health_file": root / "shadow-health.json",
+                "paper_db": root / "paper.db",
+                "shadow_db": root / "shadow.db",
+            })()
+            for mode in ("paper", "shadow"):
+                connection = initialize_database(getattr(paths, f"{mode}_db"))
+                connection.close()
+            paths.control_file.write_text(json.dumps({
+                "paper_new_entries_paused": False,
+                "shadow_new_entries_paused": False,
+            }), encoding="utf-8")
+            paths.paper_health_file.write_text(json.dumps({"items": {"runtime_control": {
+                "state": "HEALTHY",
+                "updated_at": "2026-08-04T00:00:00+00:00",
+                "details": {"new_entries_paused": True},
+            }}}), encoding="utf-8")
+            paths.shadow_health_file.write_text(json.dumps({"items": {"runtime_control": {
+                "state": "HEALTHY",
+                "updated_at": "2026-08-04T00:00:00+00:00",
+                "details": {"new_entries_paused": False},
+            }}}), encoding="utf-8")
+
+            status = DashboardService(paths=paths).status("solana")
+            self.assertTrue(status["modes"]["paper"]["new_entries_paused"])
+            self.assertFalse(status["modes"]["shadow"]["new_entries_paused"])
+            self.assertEqual(status["modes"]["paper"]["runtime_control"]["state"], "APPLIED")
 
     def test_analytics_keeps_strategy_pnl_independent_and_supports_filters(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
