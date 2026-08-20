@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from meme_system.config.runtime import RuntimePaths
-from meme_system.storage.database import initialize_database
+from meme_system.storage.database import SCHEMA_VERSION, initialize_database
 from meme_system.storage.exit_holders import backfill_historical_exit_holders
 from meme_system.storage.exit_market import backfill_historical_exit_market
 from meme_system.storage.queries import LedgerQueries
@@ -34,7 +34,7 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+            self.assertEqual(versions, list(range(1, SCHEMA_VERSION + 1)))
             columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(virtual_positions)")
@@ -53,6 +53,8 @@ class StorageTests(unittest.TestCase):
             self.assertIn("entry_quote_at", columns)
             self.assertIn("exit_quote_at", columns)
             self.assertIn("price_snapshot_version", columns)
+            self.assertIn("current_holders", columns)
+            self.assertIn("holders_observed_at", columns)
             execution_columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(executions)")
@@ -62,6 +64,8 @@ class StorageTests(unittest.TestCase):
             self.assertIn("quote_source", execution_columns)
             self.assertIn("quote_route", execution_columns)
             self.assertIn("legacy_valuation", execution_columns)
+            self.assertIn("live_entry_snapshots", tables)
+            self.assertIn("live_entry_outcomes", tables)
             connection.close()
 
     def test_paper_and_shadow_paths_are_distinct(self) -> None:

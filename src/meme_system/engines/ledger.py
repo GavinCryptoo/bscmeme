@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
@@ -110,6 +110,8 @@ class SimulationLedger:
             "SELECT position_id, mint, mode, strategy_name, ruleset_name, "
             "ruleset_version, config_version, quantity_sol, opened_at, status, "
             "entry_quantity_token, remaining_quantity_token, entry_quote_id, token_name, "
+            "realized_proceeds_sol, realized_route_fee_sol, realized_network_fee_sol, "
+            "realized_priority_fee_sol, tp1_executed_at, tp2_executed_at, "
             "entry_holders, entry_liquidity_usd, exit_holders, exit_holders_observed_at, "
             "exit_holders_source, exit_holders_status, exit_market_cap_usd, exit_liquidity_usd, "
             "exit_market_observed_at, exit_market_source, exit_market_status, "
@@ -123,6 +125,7 @@ class SimulationLedger:
             (mode,),
         )
         backfills: list[tuple[int | None, str | None, str]] = []
+        active_identity_updates: list[tuple[str, str, str, str, str]] = []
         for row in rows:
             row_identity = StrategyIdentity(
                 strategy_name=row["strategy_name"],
@@ -130,10 +133,23 @@ class SimulationLedger:
                 ruleset_version=row["ruleset_version"],
                 config_version=row["config_version"],
             )
-            if identity is not None and row_identity.strategy_name in {
-                "sol_ultra_early_baseline",
-                identity.strategy_name,
-            }:
+            # Closed rows keep the version that actually governed them. An
+            # active baseline position adopts an explicitly restarted runner's
+            # current configuration and the change is persisted before new
+            # decisions are recorded.
+            if (
+                identity is not None
+                and row["status"] != "CLOSED"
+                and row_identity.strategy_name == identity.strategy_name
+                and row_identity != identity
+            ):
+                active_identity_updates.append((
+                    identity.strategy_name,
+                    identity.ruleset_name,
+                    identity.ruleset_version,
+                    identity.config_version,
+                    row["position_id"],
+                ))
                 row_identity = identity
             entry_holders = int(row["entry_holders"]) if row["entry_holders"] is not None else None
             entry_liquidity_usd = (
@@ -194,6 +210,12 @@ class SimulationLedger:
                 opened_at=datetime.fromisoformat(row["opened_at"]),
                 entry_quantity_token=Decimal(row["entry_quantity_token"]),
                 remaining_quantity_token=Decimal(row["remaining_quantity_token"]),
+                realized_proceeds_sol=Decimal(row["realized_proceeds_sol"] or "0"),
+                realized_route_fee_sol=Decimal(row["realized_route_fee_sol"] or "0"),
+                realized_network_fee_sol=Decimal(row["realized_network_fee_sol"] or "0"),
+                realized_priority_fee_sol=Decimal(row["realized_priority_fee_sol"] or "0"),
+                tp1_executed_at=_parse_datetime(row["tp1_executed_at"]),
+                tp2_executed_at=_parse_datetime(row["tp2_executed_at"]),
                 entry_quote_id=row["entry_quote_id"],
                 token_name=row["token_name"],
                 entry_holders=entry_holders,
@@ -255,7 +277,13 @@ class SimulationLedger:
                 "WHERE position_id = ?",
                 (entry_holders, entry_liquidity_usd, position_id),
             )
-        if backfills:
+        for strategy_name, ruleset_name, ruleset_version, config_version, position_id in active_identity_updates:
+            connection.execute(
+                "UPDATE virtual_positions SET strategy_name = ?, ruleset_name = ?, "
+                "ruleset_version = ?, config_version = ? WHERE position_id = ?",
+                (strategy_name, ruleset_name, ruleset_version, config_version, position_id),
+            )
+        if backfills or active_identity_updates:
             connection.commit()
         loss_rows = connection.execute(
             "SELECT e.gross_pnl_pct, e.recorded_at, p.quantity_sol "
@@ -308,8 +336,22 @@ class SimulationLedger:
             return
         signal_key = f"{candidate.chain}:{candidate.signal_id}"
         failed = [check.reason_code for check in candidate.checks if check.reason_code]
+        # Candidate rows arrive continuously. Keep the machine-readable
+        # decision facts required by the Dashboard and analytics, but do not
+        # repeat every long Chinese explanation for every raw signal; those
+        # explanations are stable strategy metadata and are rendered from the
+        # shared rule configuration.
         checks_json = json.dumps(
-            [asdict(check) for check in candidate.checks],
+            [
+                {
+                    "name": check.name,
+                    "passed": check.passed,
+                    "actual": check.actual,
+                    "threshold": check.threshold,
+                    **({"reason_code": check.reason_code} if check.reason_code is not None else {}),
+                }
+                for check in candidate.checks
+            ],
             default=_json_default,
         )
         soft_json = json.dumps(candidate.soft_features or {}, default=_json_default)
@@ -466,6 +508,8 @@ class SimulationLedger:
         position_id: str,
         observed_at: datetime,
         sell_quote: ExecutableQuote | None,
+        *,
+        record_event: bool = True,
     ) -> PositionObservation:
         position = self.positions[position_id]
         if sell_quote is None:
@@ -502,9 +546,12 @@ class SimulationLedger:
                 False,
                 "sell_quote_quantity_mismatch",
             )
-        return_pct = (
-            sell_quote.output_quantity - position.quantity_sol
-        ) / position.quantity_sol
+        marked_value = (
+            sell_quote.output_quantity
+            * position.entry_quantity_token
+            / sell_quote.input_quantity
+        )
+        return_pct = (marked_value - position.quantity_sol) / position.quantity_sol
         jupiter_price = (
             sell_quote.output_quantity / sell_quote.input_quantity
             if sell_quote.input_quantity > 0
@@ -541,17 +588,18 @@ class SimulationLedger:
                 ),
             )
             self.connection.commit()
-        self.record_event(
-            position_id,
-            "MARK_OBSERVED",
-            observed_at,
-            {
-                "quote_id": sell_quote.quote_id,
-                "return_pct": return_pct,
-                "mfe_pct": updated.mfe_pct,
-                "mae_pct": updated.mae_pct,
-            },
-        )
+        if record_event:
+            self.record_event(
+                position_id,
+                "MARK_OBSERVED",
+                observed_at,
+                {
+                    "quote_id": sell_quote.quote_id,
+                    "return_pct": return_pct,
+                    "mfe_pct": updated.mfe_pct,
+                    "mae_pct": updated.mae_pct,
+                },
+            )
         return PositionObservation(
             position_id,
             observed_at,
@@ -562,6 +610,72 @@ class SimulationLedger:
             True,
         )
 
+    def record_partial_take_profit(
+        self,
+        position_id: str,
+        sell_quote: ExecutableQuote,
+        occurred_at: datetime,
+        *,
+        stage: int,
+        estimated_network_fee_sol: Decimal | None = None,
+        estimated_priority_fee_sol: Decimal | None = None,
+    ) -> VirtualPosition:
+        """Persist an executable Solana TP fill while keeping the lifecycle open."""
+        if stage not in {1, 2}:
+            raise ValueError("partial take-profit stage must be 1 or 2")
+        position = self.positions[position_id]
+        if sell_quote.mint != position.mint or sell_quote.side != "sell" or sell_quote.output_quantity <= 0:
+            raise ValueError("partial take-profit quote must be a usable sell quote for this position")
+        if sell_quote.input_quantity <= 0 or sell_quote.input_quantity >= position.active_quantity_token:
+            raise ValueError("partial take-profit quantity must be positive and below the active balance")
+        if sell_quote.input_quantity != position.active_quantity_token * Decimal("0.5"):
+            raise ValueError("partial take-profit must sell exactly half of the active balance")
+        if stage == 1 and position.tp1_executed_at is not None:
+            raise ValueError("TP1 was already executed")
+        if stage == 2 and (position.tp1_executed_at is None or position.tp2_executed_at is not None):
+            raise ValueError("TP2 requires a completed TP1 and no earlier TP2")
+        updated = replace(
+            position,
+            remaining_quantity_token=position.active_quantity_token - sell_quote.input_quantity,
+            realized_proceeds_sol=position.realized_proceeds_sol + sell_quote.output_quantity,
+            realized_route_fee_sol=position.realized_route_fee_sol + (sell_quote.route_fee or Decimal("0")),
+            realized_network_fee_sol=position.realized_network_fee_sol + (estimated_network_fee_sol or Decimal("0")),
+            realized_priority_fee_sol=position.realized_priority_fee_sol + (estimated_priority_fee_sol or Decimal("0")),
+            tp1_executed_at=occurred_at if stage == 1 else position.tp1_executed_at,
+            tp2_executed_at=occurred_at if stage == 2 else position.tp2_executed_at,
+        )
+        self.positions[position_id] = updated
+        if self.connection is not None:
+            self.connection.execute(
+                "UPDATE virtual_positions SET remaining_quantity_token = ?, realized_proceeds_sol = ?, "
+                "realized_route_fee_sol = ?, realized_network_fee_sol = ?, "
+                "realized_priority_fee_sol = ?, tp1_executed_at = ?, tp2_executed_at = ? "
+                "WHERE position_id = ?",
+                (
+                    str(updated.remaining_quantity_token),
+                    str(updated.realized_proceeds_sol),
+                    str(updated.realized_route_fee_sol),
+                    str(updated.realized_network_fee_sol),
+                    str(updated.realized_priority_fee_sol),
+                    updated.tp1_executed_at.isoformat() if updated.tp1_executed_at else None,
+                    updated.tp2_executed_at.isoformat() if updated.tp2_executed_at else None,
+                    position_id,
+                ),
+            )
+            self.connection.commit()
+        self.record_event(
+            position_id,
+            f"TAKE_PROFIT_{stage}_PARTIAL",
+            occurred_at,
+            {
+                "sell_quantity_token": sell_quote.input_quantity,
+                "remaining_quantity_token": updated.remaining_quantity_token,
+                "proceeds_sol": sell_quote.output_quantity,
+                "quote_id": sell_quote.quote_id,
+            },
+        )
+        return updated
+
     def record_local_observation(
         self,
         position_id: str,
@@ -571,12 +685,13 @@ class SimulationLedger:
         source: str = "pool_wss_indicative",
         account_address: str | None = None,
         observed_slot: int | None = None,
+        record_event: bool = True,
     ) -> PositionObservation:
         """Persist a local pool/curve observation without replacing Jupiter state."""
         position = self.positions[position_id]
         if price_sol_per_token <= 0 or position.active_quantity_token <= 0:
             return PositionObservation(position_id, observed_at, None, None, position.mfe_pct, position.mae_pct, False, "local_price_unavailable")
-        return_pct = (price_sol_per_token * position.active_quantity_token - position.quantity_sol) / position.quantity_sol
+        return_pct = (price_sol_per_token * position.entry_quantity_token - position.quantity_sol) / position.quantity_sol
         updated = replace(
             position,
             mfe_pct=max(position.mfe_pct, return_pct),
@@ -594,16 +709,30 @@ class SimulationLedger:
                 (str(updated.mfe_pct), str(updated.mae_pct), str(price_sol_per_token), observed_at.isoformat(), source, str(return_pct), position_id),
             )
             self.connection.commit()
-        self.record_event(position_id, "LOCAL_PRICE_OBSERVED", observed_at, {
-            "price_sol_per_token": price_sol_per_token,
-            "price_source": source,
-            "return_pct": return_pct,
-            "mfe_pct": updated.mfe_pct,
-            "mae_pct": updated.mae_pct,
-            "account_address": account_address,
-            "observed_slot": observed_slot,
-        })
+        if record_event:
+            self.record_event(position_id, "LOCAL_PRICE_OBSERVED", observed_at, {
+                "price_sol_per_token": price_sol_per_token,
+                "price_source": source,
+                "return_pct": return_pct,
+                "mfe_pct": updated.mfe_pct,
+                "mae_pct": updated.mae_pct,
+                "account_address": account_address,
+                "observed_slot": observed_slot,
+            })
         return PositionObservation(position_id, observed_at, None, return_pct, updated.mfe_pct, updated.mae_pct, True)
+
+    def record_holder_observation(self, position_id: str, holders: int, observed_at: datetime, source: str) -> VirtualPosition:
+        """Persist a chain holder count; collection failure never affects exits."""
+        if holders < 0:
+            raise ValueError("holders must be non-negative")
+        position = self.positions[position_id]
+        updated = replace(position, entry_holders=position.entry_holders if position.entry_holders is not None else holders, current_holders=holders, holders_observed_at=observed_at, holders_source=source)
+        self.positions[position_id] = updated
+        if self.connection is not None:
+            self.connection.execute("UPDATE virtual_positions SET entry_holders = COALESCE(entry_holders, ?), current_holders = ?, holders_observed_at = ?, holders_source = ? WHERE position_id = ?", (holders, holders, observed_at.isoformat(), source, position_id))
+            self.connection.commit()
+        self.record_event(position_id, "HOLDERS_OBSERVED", observed_at, {"holders": holders, "source": source, "entry_holders": updated.entry_holders})
+        return updated
 
     def set_exit_holders_snapshot(
         self,
@@ -911,17 +1040,10 @@ class SimulationLedger:
         payload: Mapping[str, object],
     ) -> LifecycleEvent:
         sequence = len(self.lifecycle_events)
-        if self.connection is not None:
-            row = self.connection.execute(
-                "SELECT COUNT(*) AS event_count FROM lifecycle_events WHERE mode = ?",
-                (self.mode,),
-            ).fetchone()
-            if row is not None:
-                sequence = max(sequence, int(row["event_count"]))
         # Polling and WSS price refreshes may record lifecycle events at the
-        # same time.  A count-derived suffix alone races in that case, which
-        # must never take down a Paper/Shadow runner.  Keep the readable
-        # prefix and add a process-independent unique suffix.
+        # same time.  The UUID makes the ID process-independent, so querying
+        # a growing event table for a count on every quote tick is both
+        # unnecessary and capable of starving the candidate loop.
         event_id = f"{position_id}:{event_type}:{sequence}:{uuid.uuid4().hex}"
         event = LifecycleEvent(
             event_id=event_id,

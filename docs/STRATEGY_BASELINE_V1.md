@@ -5,7 +5,7 @@
 ```text
 strategy_name: sol_ultra_early_baseline
 ruleset_name: ultra_early_minimal
-ruleset_version: 0.1.1
+ruleset_version: 0.1.2
 ```
 
 本阶段只建立一个新基线，不恢复历史 V2、V2.1、V2.2、V4。

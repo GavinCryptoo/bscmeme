@@ -63,6 +63,41 @@ class TelegramLiveControlTests(unittest.TestCase):
             self.assertNotIn("must-not-appear", json.dumps(params, ensure_ascii=False))
             markup = params["reply_markup"]
             self.assertEqual(markup["inline_keyboard"][0][0]["copy_text"]["text"], "0xToken")
+            self.assertEqual(markup["inline_keyboard"][0][1]["callback_data"], "live_pause")
+
+    def test_live_trade_notifications_include_persisted_trade_fields_and_stateful_entry_button(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            calls: list[tuple[str, dict[str, object]]] = []
+            control = RuntimeControl(Path(directory) / "live-control.json")
+            bot = self._bot(calls, control)
+            control.set_paused("live", True)
+            self.assertTrue(bot.notify_event(
+                "LIVE_ENTRY_CONFIRMED",
+                {
+                    "mint": "0xToken", "token_name": "TEST", "strategy_name": "Balanced",
+                    "occurred_at": "2026-08-15T00:00:00+00:00", "entry_price_native": "0.00001",
+                    "entry_holders": 123, "input_quantity": "0.001", "entry_liquidity_usd": "5000",
+                    "actual_received": "100", "settlement_verified": True,
+                },
+            ))
+            sent = [params for method, params in calls if method == "sendMessage"][-1]
+            text = str(sent["text"])
+            for expected in ("买入价格：0.00001", "买入持币地址：123", "买入金额：0.001", "买入流动性：5000"):
+                self.assertIn(expected, text)
+            self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][1]["callback_data"], "live_resume")
+
+            self.assertTrue(bot.notify_event(
+                "LIVE_EXIT_CONFIRMED",
+                {
+                    "mint": "0xToken", "token_name": "TEST", "strategy_name": "Balanced",
+                    "occurred_at": "2026-08-15T00:01:00+00:00", "exit_price_native": "0.00002",
+                    "exit_holders": 150, "exit_liquidity_usd": "6000", "actual_received": "0.002",
+                    "return_pct": "100", "reason": "TP", "settlement_verified": True,
+                },
+            ))
+            text = str([params for method, params in calls if method == "sendMessage"][-1]["text"])
+            for expected in ("卖出价格：0.00002", "卖出持币地址：150", "卖出流动性：6000"):
+                self.assertIn(expected, text)
 
     def test_callback_query_is_allowlisted_chat_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

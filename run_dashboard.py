@@ -28,6 +28,9 @@ def _load_env(path: Path = Path(".env")) -> None:
 
 def main() -> int:
     _load_env()
+    strategy_env = os.environ.get("DASHBOARD_STRATEGY_ENV_FILE", "").strip()
+    if strategy_env:
+        _load_env(Path(strategy_env))
     try:
         safety = SafetyConfig.from_env()
         config = DashboardConfig(
@@ -45,4 +48,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

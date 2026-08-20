@@ -18,7 +18,7 @@
 - Telegram 默认关闭；开启后可用于 Paper/Shadow 通知与暂停/恢复新入场；BSC Live 仅允许通知、状态和暂停/恢复新入场
 - Solana Live、Solana 钱包、Solana 私钥读取、Solana 签名、Solana 广播和 Solana 链上写入：不实现
 - BSC Live 允许，但必须使用独立 Live 进程、数据库、审计日志、锁和配置；不得复用 Paper/Shadow 状态
-- BSC Live 只允许通过当前官方 PancakeSwap Smart Router SDK 生成实时报价和 calldata；不得使用 Binance indicative price 作为成交价
+- BSC Balanced Live 执行层采用 Capability Router：已验证且未迁移的 Flap 走 `FLAP_DIRECT`；FourMeme 只有官方 ABI、双向链上预览与 calldata 均验证后才允许 `FOURMEME_DIRECT`，否则 fail closed；迁移后/DEX Token 并行竞价 Bitget、Velora、KyberSwap、LI.FI 和已配置的 0x，按双向 Roundtrip 与扣除明确 Gas/Provider Fee 后的净到账选择；所有路径共用同一本地 BSC EOA、Nonce Manager、Receipt Reconciliation、EXIT_INTENT 和防重复机制。Binance Agentic Wallet 仅保留为 LEGACY 资产边界，不进入新交易路径；不得使用 Binance indicative price 作为成交价。Universal Benchmark 验收前真实交易保持停止
 - BSC Live 启动时只允许启动后复合策略产生的新代币入场；启动首轮现有列表及 Live 数据库已见代币只观察、不买入，且不改变既有策略参数
 - BSC Live 的交易执行必须 fail-closed：chainId=56、余额、nonce、decimals、allowance、实时报价、estimateGas、非零最低到账和 deadline 任一检查失败即拒绝发送
 - 当前工作区按全新项目重建
@@ -30,7 +30,7 @@
 
 strategy_name: sol_ultra_early_baseline
 ruleset_name: ultra_early_minimal
-ruleset_version: 0.1.1
+ruleset_version: 0.1.2
 
 每个候选、持仓、退出和影子结果必须记录：
 
@@ -60,16 +60,19 @@ max_open_positions: 2
 
 以下指标当前只记录、分组和影子评估，不得拒绝 Paper 交易：holders、市值、Token 单价、固定美元流动性、Bundler 比例、Top holders 集中度、创建者历史、钱包资金来源、社交数据、最大钱包潜在抛压、同名代币历史表现。
 
-## Paper 退出规则
+## Solana Paper/Shadow 退出规则
 
-take_profit_pct: 10
-take_profit_sell_pct: 100
-stop_loss_trigger_pct: -20
+take_profit_1_pct: 20
+take_profit_1_sell_pct: 50（卖出当时剩余仓位的一半）
+take_profit_2_pct: 30
+take_profit_2_sell_pct: 50（再次卖出当时剩余仓位的一半）
+tp2_breakeven_exit_enabled: true（TP2 后价格回到买入价即清仓）
+stop_loss_trigger_pct: -30
 stop_loss_sell_pct: 100
 max_hold_sec: 600
-moving_stop_enabled: false
+moving_stop_enabled: true（仅 TP2 后成本价保护）
 cliff_guard_enabled: false
-partial_take_profit_enabled: false
+partial_take_profit_enabled: true
 weak_demand_exit_enabled: false
 
 ## Shadow 规则
@@ -79,9 +82,10 @@ Shadow 建立独立虚拟生命周期和持仓，不修改 Paper 仓位、PnL、
 - shadow_defense_v1：收益率 <= -8%、最近短窗口净流量为负、独立买家增长停止时触发。
 - shadow_creator_sell：高置信识别创建者或明确关联地址卖出时触发。
 - shadow_time_exit：持仓 >=120s、MFE <5%、买家增长和净流量同时放缓时触发。
-- BSC Shadow 另外继承 BSC Paper 的 `take_profit`、`stop_loss` 和
-  `max_hold_timeout` 退出规则，使用同一组阈值和全部退出比例；Solana Shadow
-  保持本节原有规则，不继承 BSC 规则。
+- Solana Shadow 与 Solana Paper 使用本节同一组 TP1、TP2、TP2 后成本价保护、
+  止损和最长持仓规则，同时保留以下结构性提前退出规则。
+- BSC Shadow 继续继承 BSC Paper 的独立 `take_profit`、`stop_loss` 和
+  `max_hold_timeout` 规则；不使用 Solana 的分批止盈配置。
 - 触发后记录 5s、15s、30s、60s、120s 收益、是否达到 Paper TP、避免损失和错过利润。
 
 ## Paper 参数
@@ -185,7 +189,7 @@ Paper/Shadow 代码中不得存在可到达的签名和广播实现。BSC Live �
 
 ## 当前授权范围
 
-允许：实现已审计的 Binance Web3（Solana 与 BSC Meme Rush）、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 只读适配；实现实时 Paper/Shadow 协调器、BSC Live 独立持仓生命周期、重启恢复、Dashboard、健康、锁、导出、Telegram 通知和仅新开仓暂停/恢复控制；执行有限、可终止的只读探测。BSC Live 代码必须先完成测试，不自动启动真实交易。
+允许：实现已审计的 Binance Web3（Solana 与 BSC Meme Rush）、Solana RPC/WSS、Pump/PumpSwap 和 Jupiter Quote 只读适配；实现实时 Paper/Shadow 协调器、Bitget Wallet Order Mode BSC Live 独立持仓生命周期、重启恢复、Dashboard、健康、锁、导出、Telegram 通知和仅新开仓暂停/恢复控制；执行有限、可终止的只读探测。BSC Live 代码必须先完成测试，并且仅在用户明确授权后启动。
 
 禁止：Solana 写链、Jupiter 执行接口、Solana 交易构建、Solana 钱包/私钥/签名/广播、BSC 未确认字段或 endpoint、Paper/Shadow 触发 Live、Live 无限重试、`amountOutMin=0`、绕过 chainId/余额/报价/到账核对。
 
@@ -238,7 +242,7 @@ BSC Shadow 观察期新增流动性门槛：
 - 历史 SQLite 账本保留，不删除、不重算、不篡改；历史记录仍可通过原始数据库审计。
 - 本次资本统计会话只作用于 BSC Paper/Shadow；Solana 继续使用 `1 SOL` 初始虚拟资金与 `0.001 SOL` 单笔仓位。
 
-该调整只用于 Paper/Shadow 验证；不改变 BSC Live 使用独立 Smart Router
+该调整只用于 Paper/Shadow 验证；不改变 BSC Live 使用独立 Bitget Wallet Order Mode 执行层
 报价、独立状态和显式小额配置的边界。
 
 ## 历史阶段记录（不覆盖当前 BSC Live 授权）

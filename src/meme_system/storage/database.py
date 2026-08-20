@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 41
 
 MIGRATIONS = (
     (1, "001_initial.sql"),
@@ -24,6 +24,32 @@ MIGRATIONS = (
     (13, "013_price_snapshots_and_token_names.sql"),
     (14, "014_bsc_quote_metadata.sql"),
     (15, "015_solana_price_snapshot_semantics.sql"),
+    (16, "016_realtime_position_monitoring.sql"),
+    (17, "017_solana_staged_take_profit.sql"),
+    (18, "018_survivor_reversal.sql"),
+    (19, "019_survivor_no_trade_exit.sql"),
+    (20, "020_survivor_v1_runtime_alignment.sql"),
+    (21, "021_survivor_price_coverage.sql"),
+    (22, "022_survivor_lifecycle_snapshots.sql"),
+    (23, "023_survivor_data_quality_v22.sql"),
+    (24, "024_survivor_exclusions.sql"),
+    (25, "025_sol_survivor_v1.sql"),
+    (26, "026_sol_survivor_smart_money.sql"),
+    (27, "027_sol_survivor_swap_flow.sql"),
+    (28, "028_sol_survivor_rpc_metrics.sql"),
+    (29, "029_survivor_price_history_quality.sql"),
+    (30, "030_bsc_pool_registry.sql"),
+    (31, "031_bsc_pool_scan_checkpoint.sql"),
+    (32, "032_bsc_venue_registry.sql"),
+    (33, "033_survivor_realized_pnl.sql"),
+    (34, "034_sol_survivor_trade_snapshots.sql"),
+    (35, "035_survivor_exit_trigger_audit.sql"),
+    (36, "036_survivor_live_execution.sql"),
+    (37, "037_survivor_position_marks_and_wallet_reconciliation.sql"),
+    (38, "038_survivor_no_trade_profit_partial.sql"),
+    (39, "039_survivor_tp_ladder_state.sql"),
+    (40, "040_survivor_tp1_trailing_high.sql"),
+    (41, "041_live_entry_outcome_tracking.sql"),
 )
 
 

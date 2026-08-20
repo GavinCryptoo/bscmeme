@@ -1,0 +1,10 @@
+ALTER TABLE survivor_candidates ADD COLUMN pre_candidate_watch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE survivor_candidates ADD COLUMN pre_candidate_rank INTEGER;
+ALTER TABLE survivor_candidates ADD COLUMN candidate_distance_score TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_price_at TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_price_delay_seconds TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN price_samples_before_candidate INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE survivor_candidates ADD COLUMN price_coverage_before_candidate_seconds TEXT NOT NULL DEFAULT '0';
+ALTER TABLE survivor_candidates ADD COLUMN ath_before_candidate INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE survivor_candidates ADD COLUMN candidate_at TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN price_history_status TEXT NOT NULL DEFAULT 'PENDING';

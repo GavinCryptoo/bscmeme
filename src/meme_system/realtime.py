@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Lock, RLock
 from typing import Callable, Mapping, Sequence
 
@@ -35,15 +35,12 @@ from meme_system.adapters.binance_web3.models import BinanceMarketSnapshot, Bina
 from meme_system.adapters.binance_web3.signal_source import BinanceWeb3SignalSource
 from meme_system.adapters.protocols import ExecutableQuote, QuoteProvider
 from meme_system.adapters.solana_price import SolanaObservedPrice, SolanaPriceMonitor
-from meme_system.domain.models import EntryFeatures, PriceSnapshot, ShadowExitFeatures, ShadowOutcome, Signal, VirtualPosition
+from meme_system.adapters.holder_monitor import BscHolderMonitor, HolderObservation, SolanaHolderMonitor
+from meme_system.domain.models import EntryFeatures, PriceSnapshot, ShadowExitFeatures, ShadowOutcome, Signal, VirtualPosition, SURVIVOR_REVERSAL_IDENTITY
 from meme_system.domain.naming import clean_token_name
 from meme_system.engines.simulation import DeterministicSimulation, EntryResult, ExitResult
 from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, LatencyRecorder, RuntimeControl, utc_now
-from meme_system.storage.exit_holders import (
-    database_path,
-    persist_exit_holders_update,
-)
-from meme_system.storage.exit_market import persist_exit_market_update
+from meme_system.strategies.survivor_reversal import SurvivorReversalEngine
 from meme_system.storage.runtime_store import RuntimeStore
 from meme_system.telegram_control import TelegramControl
 
@@ -66,49 +63,74 @@ class ExitMarketSnapshot:
     source: str = "binance_dynamic"
 
 
+@dataclass(frozen=True)
+class ExitBackfillResult:
+    """Network-only exit enrichment returned to the owning runtime loop.
+
+    A worker may only put this immutable payload into a ``queue.Queue``.  The
+    coordinator that owns the runtime's ledger connection performs the update
+    and commit after verifying the closed-position version.
+    """
+
+    kind: str
+    mode: str
+    position_id: str
+    mint: str
+    expected_closed_at: datetime | None
+    holders_at_exit: int | None
+    market_cap_at_exit: Decimal | None
+    liquidity_at_exit: Decimal | None
+    source: str | None
+    requested_at: datetime
+    completed_at: datetime
+    success: bool
+    error_class: str | None = None
+
+
 class ExitHoldersBackfill:
     """Bounded, non-blocking Binance Dynamic backfill after a close."""
 
     def __init__(
         self,
         features: "BinanceRealtimeFeatureProvider",
-        db_paths: Mapping[str, Path | None],
+        result_queues: Mapping[str, Queue[ExitBackfillResult]],
         *,
         max_workers: int = 2,
         retry_count: int = 3,
         retry_delay_sec: float = 2.0,
     ) -> None:
         self.features = features
-        self.db_paths = dict(db_paths)
+        self.result_queues = dict(result_queues)
         self.retry_count = max(1, min(3, int(retry_count)))
         self.retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._stop = Event()
         self._lock = Lock()
         self._pending: set[tuple[str, str]] = set()
+        self._completed: set[tuple[str, str]] = set()
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="exit-holders-backfill",
         )
 
     def submit(self, mode: str, position: VirtualPosition) -> bool:
-        path = self.db_paths.get(mode)
-        if mode not in {"paper", "shadow"} or path is None:
+        if mode not in {"paper", "shadow"} or self.result_queues.get(mode) is None:
             return False
         key = (mode, position.position_id)
         with self._lock:
-            if key in self._pending:
+            if key in self._pending or key in self._completed:
                 return False
             self._pending.add(key)
-        self._executor.submit(self._run, mode, position, path, key)
+        self._executor.submit(self._run, mode, position, key)
         return True
 
     def _run(
         self,
         mode: str,
         position: VirtualPosition,
-        path: Path,
         key: tuple[str, str],
     ) -> None:
+        requested_at = utc_now()
+        last_error_class: str | None = None
         try:
             for attempt in range(self.retry_count):
                 if self._stop.is_set():
@@ -121,34 +143,42 @@ class ExitHoldersBackfill:
                         else None
                     )
                     if snapshot is not None and holders is not None:
-                        persist_exit_holders_update(
-                            path,
-                            mode=mode,
-                            position_id=position.position_id,
-                            holders=holders,
-                            observed_at=snapshot.observed_at,
-                            source="binance_dynamic",
-                            status="completed",
-                        )
+                        self.result_queues[mode].put(ExitBackfillResult(
+                            kind="holders", mode=mode, position_id=position.position_id,
+                            mint=position.mint, expected_closed_at=position.closed_at,
+                            holders_at_exit=holders, market_cap_at_exit=None,
+                            liquidity_at_exit=None, source="binance_dynamic",
+                            requested_at=requested_at, completed_at=utc_now(), success=True,
+                        ))
                         return
-                except Exception:
+                except Exception as exc:
                     # The next bounded attempt is the only retry path. The
                     # error itself is intentionally not exposed with secrets.
-                    pass
+                    last_error_class = type(exc).__name__
                 if attempt + 1 < self.retry_count and self._stop.wait(self.retry_delay_sec):
                     return
-            persist_exit_holders_update(
-                path,
-                mode=mode,
-                position_id=position.position_id,
-                holders=None,
-                observed_at=None,
-                source=None,
-                status="unavailable",
-            )
+            self.result_queues[mode].put(ExitBackfillResult(
+                kind="holders", mode=mode, position_id=position.position_id,
+                mint=position.mint, expected_closed_at=position.closed_at,
+                holders_at_exit=None, market_cap_at_exit=None, liquidity_at_exit=None,
+                source=None, requested_at=requested_at, completed_at=utc_now(),
+                success=False, error_class=last_error_class or "exit_holders_unavailable",
+            ))
         finally:
-            with self._lock:
-                self._pending.discard(key)
+            pass
+
+    def complete(self, result: ExitBackfillResult) -> None:
+        key = (result.mode, result.position_id)
+        with self._lock:
+            self._pending.discard(key)
+            self._completed.add(key)
+
+    def metrics(self, mode: str) -> tuple[int, int]:
+        with self._lock:
+            return (
+                sum(1 for pending_mode, _ in self._pending if pending_mode == mode),
+                sum(1 for completed_mode, _ in self._completed if completed_mode == mode),
+            )
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -161,43 +191,44 @@ class ExitMarketBackfill:
     def __init__(
         self,
         features: "BinanceRealtimeFeatureProvider",
-        db_paths: Mapping[str, Path | None],
+        result_queues: Mapping[str, Queue[ExitBackfillResult]],
         *,
         max_workers: int = 2,
         retry_count: int = 3,
         retry_delay_sec: float = 2.0,
     ) -> None:
         self.features = features
-        self.db_paths = dict(db_paths)
+        self.result_queues = dict(result_queues)
         self.retry_count = max(1, min(3, int(retry_count)))
         self.retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._stop = Event()
         self._lock = Lock()
         self._pending: set[tuple[str, str]] = set()
+        self._completed: set[tuple[str, str]] = set()
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="exit-market-backfill",
         )
 
     def submit(self, mode: str, position: VirtualPosition) -> bool:
-        path = self.db_paths.get(mode)
-        if mode not in {"paper", "shadow"} or path is None:
+        if mode not in {"paper", "shadow"} or self.result_queues.get(mode) is None:
             return False
         key = (mode, position.position_id)
         with self._lock:
-            if key in self._pending:
+            if key in self._pending or key in self._completed:
                 return False
             self._pending.add(key)
-        self._executor.submit(self._run, mode, position, path, key)
+        self._executor.submit(self._run, mode, position, key)
         return True
 
     def _run(
         self,
         mode: str,
         position: VirtualPosition,
-        path: Path,
         key: tuple[str, str],
     ) -> None:
+        requested_at = utc_now()
+        last_error_class: str | None = None
         try:
             for attempt in range(self.retry_count):
                 if self._stop.is_set():
@@ -219,36 +250,42 @@ class ExitMarketBackfill:
                     if liquidity is not None and (not liquidity.is_finite() or liquidity < 0):
                         liquidity = None
                     if snapshot is not None and (market_cap is not None or liquidity is not None):
-                        persist_exit_market_update(
-                            path,
-                            mode=mode,
-                            position_id=position.position_id,
-                            market_cap_usd=market_cap,
-                            liquidity_usd=liquidity,
-                            observed_at=snapshot.observed_at,
-                            source="binance_dynamic",
-                            status="completed",
-                        )
+                        self.result_queues[mode].put(ExitBackfillResult(
+                            kind="market", mode=mode, position_id=position.position_id,
+                            mint=position.mint, expected_closed_at=position.closed_at,
+                            holders_at_exit=None, market_cap_at_exit=market_cap,
+                            liquidity_at_exit=liquidity, source="binance_dynamic",
+                            requested_at=requested_at, completed_at=utc_now(), success=True,
+                        ))
                         return
-                except Exception:
+                except Exception as exc:
                     # Only the bounded attempts below are allowed. Secrets or
                     # provider response bodies never enter the audit output.
-                    pass
+                    last_error_class = type(exc).__name__
                 if attempt + 1 < self.retry_count and self._stop.wait(self.retry_delay_sec):
                     return
-            persist_exit_market_update(
-                path,
-                mode=mode,
-                position_id=position.position_id,
-                market_cap_usd=None,
-                liquidity_usd=None,
-                observed_at=None,
-                source=None,
-                status="unavailable",
-            )
+            self.result_queues[mode].put(ExitBackfillResult(
+                kind="market", mode=mode, position_id=position.position_id,
+                mint=position.mint, expected_closed_at=position.closed_at,
+                holders_at_exit=None, market_cap_at_exit=None, liquidity_at_exit=None,
+                source=None, requested_at=requested_at, completed_at=utc_now(),
+                success=False, error_class=last_error_class or "exit_market_unavailable",
+            ))
         finally:
-            with self._lock:
-                self._pending.discard(key)
+            pass
+
+    def complete(self, result: ExitBackfillResult) -> None:
+        key = (result.mode, result.position_id)
+        with self._lock:
+            self._pending.discard(key)
+            self._completed.add(key)
+
+    def metrics(self, mode: str) -> tuple[int, int]:
+        with self._lock:
+            return (
+                sum(1 for pending_mode, _ in self._pending if pending_mode == mode),
+                sum(1 for completed_mode, _ in self._completed if completed_mode == mode),
+            )
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -341,13 +378,17 @@ class BinanceRealtimeFeatureProvider:
         evaluated_at: datetime | None = None,
         *,
         include_bsc_quote: bool = True,
+        include_solana_quote: bool = True,
     ) -> EntryFeatures:
         evaluated_at = evaluated_at or utc_now()
         fields = dict(normalized.fields)
         dynamic: BinanceMarketSnapshot | None = None
         dynamic_error: str | None = None
         dynamic_available = False
-        if self.market_data is not None:
+        # Live mirrors the Paper candidate stream after Paper has completed
+        # its Binance observation.  Re-fetching Dynamic here would turn one
+        # canonical candidate into two different filter inputs.
+        if self.market_data is not None and normalized.endpoint_type != "paper_candidate_mirror":
             try:
                 dynamic = self.market_data.snapshot(normalized.signal.mint)
                 if self.is_bsc:
@@ -420,32 +461,7 @@ class BinanceRealtimeFeatureProvider:
         )
         executable_quote = not self.is_bsc or self.bsc_executable_quote_enabled
         pricing_error: str | None = None
-        if self.is_bsc and self.live_executor is not None:
-            try:
-                buy_quote = self.live_executor.quote(normalized.signal.mint, "buy", self.position_size_sol)
-                if buy_quote is not None and buy_quote.output_quantity > 0:
-                    sell_quote = self.live_executor.quote(
-                        normalized.signal.mint,
-                        "sell",
-                        buy_quote.output_quantity,
-                    )
-                if buy_quote is None or sell_quote is None:
-                    pricing_error = "pancakeswap_quote_unavailable"
-            except Exception as exc:
-                pricing_error = type(exc).__name__
-            pricing_mode = "pancakeswap_smart_router"
-            executable_quote = True
-            soft.update(
-                {
-                    "pricing_mode": pricing_mode,
-                    "executable_quote": executable_quote,
-                    "net_pnl_is_estimated": True,
-                    "live_quote_source": "pancakeswap_smart_router",
-                }
-            )
-            if pricing_error is not None:
-                soft["pricing_error"] = pricing_error
-        elif self.is_bsc and self.bsc_executable_quote_enabled:
+        if self.is_bsc and self.bsc_executable_quote_enabled:
             soft.update(
                 {
                     "pricing_mode": pricing_mode,
@@ -466,6 +482,30 @@ class BinanceRealtimeFeatureProvider:
                 # The candidate must first survive purely local gates. This
                 # avoids one RPC/router request for every raw Meme Rush row.
                 soft["quote_requested"] = False
+        elif self.is_bsc and self.live_executor is not None:
+            try:
+                buy_quote = self.live_executor.quote(normalized.signal.mint, "buy", self.position_size_sol)
+                if buy_quote is not None and buy_quote.output_quantity > 0:
+                    sell_quote = self.live_executor.quote(
+                        normalized.signal.mint,
+                        "sell",
+                        buy_quote.output_quantity,
+                    )
+                if buy_quote is None or sell_quote is None:
+                    pricing_error = "bsc_executable_quote_unavailable"
+            except Exception as exc:
+                pricing_error = type(exc).__name__
+            pricing_mode = "bsc_venue_aware_executable"
+            executable_quote = True
+            soft.update(
+                {
+                    "pricing_mode": pricing_mode,
+                    "executable_quote": executable_quote,
+                    "net_pnl_is_estimated": False,
+                }
+            )
+            if pricing_error is not None:
+                soft["pricing_error"] = pricing_error
         elif self.is_bsc:
             buy_quote, sell_quote, pricing_error = self._indicative_entry_quotes(
                 normalized.signal.mint,
@@ -490,11 +530,17 @@ class BinanceRealtimeFeatureProvider:
             # entries must settle from Jupiter Quote regardless of whether a
             # mint is still on a Pump bonding curve, so the displayed price,
             # stored execution and PnL always share one executable venue.
-            if self.quote_provider is not None:
+            if include_solana_quote and self.quote_provider is not None:
                 pricing_mode = "jupiter_quote"
                 buy_quote = self._quote(normalized.signal.mint, "buy", self.position_size_sol, quote_errors)
                 if buy_quote is not None and buy_quote.output_quantity > 0:
                     sell_quote = self._quote(normalized.signal.mint, "sell", buy_quote.output_quantity, quote_errors)
+                soft["quote_requested"] = True
+            elif not include_solana_quote:
+                # Solana local gates deliberately run before Jupiter.  This
+                # keeps a raw signal from occupying the protected candidate
+                # slot when it already fails a local policy.
+                soft["quote_requested"] = False
         if quote_errors:
             soft["quote_error_classes"] = tuple(sorted(set(quote_errors)))
 
@@ -548,6 +594,51 @@ class BinanceRealtimeFeatureProvider:
             buy_quote=buy_quote,
             sell_quote=sell_quote,
             pricing_error=pricing_error,
+            soft_features=soft,
+        )
+
+    def solana_entry_features_with_quote(
+        self,
+        normalized: BinanceNormalizedSignal,
+        features: EntryFeatures,
+        *,
+        quote_queue_wait_ms: int,
+    ) -> EntryFeatures:
+        """Attach Jupiter entry quotes after Solana-only local filtering."""
+
+        if self.is_bsc:
+            return features
+        soft = dict(features.soft_features or {})
+        soft.update({
+            "quote_requested": True,
+            "quote_queue_wait_ms": max(0, quote_queue_wait_ms),
+        })
+        quote_errors: list[str] = []
+        buy_quote: ExecutableQuote | None = None
+        sell_quote: ExecutableQuote | None = None
+        if self.quote_provider is not None:
+            buy_quote = self._quote(
+                normalized.signal.mint,
+                "buy",
+                self.position_size_sol,
+                quote_errors,
+            )
+            if buy_quote is not None and buy_quote.output_quantity > 0:
+                sell_quote = self._quote(
+                    normalized.signal.mint,
+                    "sell",
+                    buy_quote.output_quantity,
+                    quote_errors,
+                )
+        if quote_errors:
+            soft["quote_error_classes"] = tuple(sorted(set(quote_errors)))
+        else:
+            soft.pop("quote_error_classes", None)
+        return replace(
+            features,
+            buy_quote=buy_quote,
+            sell_quote=sell_quote,
+            pricing_mode="jupiter_quote",
             soft_features=soft,
         )
 
@@ -1146,8 +1237,9 @@ class RealtimeCoordinator:
         telegram: TelegramControl | None = None,
         clock: Callable[[], datetime] = utc_now,
         observation_delay_sec: int = 15,
+        survivor_engine: SurvivorReversalEngine | None = None,
     ) -> None:
-        if not engines or any(mode not in {"paper", "shadow", "live"} for mode in engines):
+        if (not engines and survivor_engine is None) or any(mode not in {"paper", "shadow", "live"} for mode in engines):
             raise ValueError("engines must contain paper, shadow and/or live")
         self.source = source
         self.features = features
@@ -1158,6 +1250,8 @@ class RealtimeCoordinator:
         self.stores = dict(stores)
         self.audits = dict(audits)
         self.telegram = telegram
+        self.survivor_engine = survivor_engine
+        self.survivor_mode = getattr(survivor_engine, "mode", None) if survivor_engine is not None else None
         self.clock = clock
         if observation_delay_sec < 1:
             raise ValueError("observation_delay_sec must be positive")
@@ -1175,28 +1269,45 @@ class RealtimeCoordinator:
         self._bsc_wss_status_key: tuple[object, ...] | None = None
         self._bsc_quote_local_conditions_passed = 0
         self._bsc_quote_final_entries = 0
+        self._solana_quote_queue_count = 0
+        self._solana_quote_queue_total_ms = 0
+        self._solana_quote_queue_max_ms = 0
         self._db_lock = RLock()
+        # One thread-safe result queue per runtime mode.  Exit worker threads
+        # only enqueue network results; the coordinator loop below is the
+        # sole logical SQLite writer for its corresponding RuntimeStore.
+        self._exit_backfill_results: dict[str, Queue[ExitBackfillResult]] = {
+            mode: Queue() for mode in self.engines if mode in {"paper", "shadow"}
+        }
+        self._exit_backfill_metrics: dict[str, dict[str, object]] = {
+            mode: {
+                "exit_backfill_completed": 0,
+                "exit_backfill_failed": 0,
+                "exit_backfill_duplicate_write": 0,
+                "db_commit_error_count": 0,
+                "db_locked_error_count": 0,
+                "db_write_error_count": 0,
+                "last_db_write_at": None,
+            }
+            for mode in self._exit_backfill_results
+        }
         self._position_quote_lock = Lock()
         self._position_quotes: dict[tuple[str, str], ExecutableQuote | None] = {}
         self.solana_price_monitor = getattr(features, "solana_price_monitor", None)
+        solana_rpc = getattr(getattr(self.solana_price_monitor, "pump_adapter", None), "rpc", None)
+        self.solana_holder_monitor = SolanaHolderMonitor(solana_rpc) if solana_rpc is not None else None
+        bsc_rpc = getattr(getattr(features, "bsc_quote_provider", None), "rpc", None)
+        self.bsc_holder_monitor = BscHolderMonitor(bsc_rpc) if self.features.is_bsc and bsc_rpc is not None else None
         self._solana_event_lock = Lock()
-        self._solana_events: deque[Mapping[str, object]] = deque()
+        self._solana_events: deque[Mapping[str, object]] = deque(maxlen=4096)
         self._shadow_followups: dict[str, PendingShadowFollowUp] = {}
         self._exit_holders_backfill = ExitHoldersBackfill(
             self.features,
-            {
-                mode: database_path(store.connection)
-                for mode, store in self.stores.items()
-                if mode in {"paper", "shadow"}
-            },
+            self._exit_backfill_results,
         )
         self._exit_market_backfill = ExitMarketBackfill(
             self.features,
-            {
-                mode: database_path(store.connection)
-                for mode, store in self.stores.items()
-                if mode in {"paper", "shadow"}
-            },
+            self._exit_backfill_results,
         )
         self._live_startup_snapshot_complete = "live" not in self.engines
         self._live_startup_excluded_mints: set[str] = set()
@@ -1227,6 +1338,112 @@ class RealtimeCoordinator:
 
         self._exit_holders_backfill.shutdown()
         self._exit_market_backfill.shutdown()
+
+    def _publish_exit_backfill_metrics(self, mode: str) -> None:
+        if mode not in self._exit_backfill_results:
+            return
+        holders_pending, holders_completed = self._exit_holders_backfill.metrics(mode)
+        market_pending, market_completed = self._exit_market_backfill.metrics(mode)
+        details = dict(self._exit_backfill_metrics[mode])
+        details.update({
+            "exit_backfill_queue_size": self._exit_backfill_results[mode].qsize(),
+            "exit_backfill_pending": holders_pending + market_pending,
+            "exit_backfill_completed": holders_completed + market_completed,
+        })
+        self._set_health(mode, "exit_backfill", "HEALTHY", details=details)
+
+    def _drain_exit_backfill_results(self) -> None:
+        """Apply queued exit enrichment on the coordinator's owner thread."""
+
+        for mode, result_queue in self._exit_backfill_results.items():
+            engine = self.engines.get(mode)
+            if engine is None:
+                continue
+            while True:
+                try:
+                    result = result_queue.get_nowait()
+                except Empty:
+                    break
+                worker = (
+                    self._exit_holders_backfill
+                    if result.kind == "holders"
+                    else self._exit_market_backfill
+                )
+                try:
+                    current = engine.ledger.closed_positions.get(result.position_id)
+                    if (
+                        current is None
+                        or current.mint != result.mint
+                        or current.closed_at != result.expected_closed_at
+                    ):
+                        self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"] = (
+                            int(self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"]) + 1
+                        )
+                        continue
+                    if result.kind == "holders":
+                        if current.exit_holders_status != "pending":
+                            self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"] = (
+                                int(self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"]) + 1
+                            )
+                            continue
+                        engine.ledger.set_exit_holders_snapshot(
+                            result.position_id,
+                            result.holders_at_exit if result.success else None,
+                            observed_at=result.completed_at if result.success else None,
+                            source=result.source if result.success else None,
+                            status="completed" if result.success else "unavailable",
+                        )
+                    elif result.kind == "market":
+                        if current.exit_market_status != "pending":
+                            self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"] = (
+                                int(self._exit_backfill_metrics[mode]["exit_backfill_duplicate_write"]) + 1
+                            )
+                            continue
+                        engine.ledger.set_exit_market_snapshot(
+                            result.position_id,
+                            result.market_cap_at_exit if result.success else None,
+                            result.liquidity_at_exit if result.success else None,
+                            observed_at=result.completed_at if result.success else None,
+                            source=result.source if result.success else None,
+                            status="completed" if result.success else "unavailable",
+                        )
+                    else:
+                        raise ValueError("unknown exit backfill result kind")
+                    self._exit_backfill_metrics[mode]["exit_backfill_completed"] = (
+                        int(self._exit_backfill_metrics[mode]["exit_backfill_completed"]) + 1
+                    )
+                    if not result.success:
+                        self._exit_backfill_metrics[mode]["exit_backfill_failed"] = (
+                            int(self._exit_backfill_metrics[mode]["exit_backfill_failed"]) + 1
+                        )
+                    self._exit_backfill_metrics[mode]["last_db_write_at"] = self.clock().isoformat()
+                    self._audit(mode, "EXIT_BACKFILL_APPLIED", {
+                        "kind": result.kind, "position_id": result.position_id,
+                        "mint": result.mint, "success": result.success,
+                        "error_class": result.error_class,
+                        "requested_at": result.requested_at.isoformat(),
+                        "completed_at": result.completed_at.isoformat(),
+                    })
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    self._exit_backfill_metrics[mode]["db_write_error_count"] = (
+                        int(self._exit_backfill_metrics[mode]["db_write_error_count"]) + 1
+                    )
+                    if "commit" in message:
+                        self._exit_backfill_metrics[mode]["db_commit_error_count"] = (
+                            int(self._exit_backfill_metrics[mode]["db_commit_error_count"]) + 1
+                        )
+                    if "locked" in message or "busy" in message:
+                        self._exit_backfill_metrics[mode]["db_locked_error_count"] = (
+                            int(self._exit_backfill_metrics[mode]["db_locked_error_count"]) + 1
+                        )
+                except Exception:
+                    self._exit_backfill_metrics[mode]["db_write_error_count"] = (
+                        int(self._exit_backfill_metrics[mode]["db_write_error_count"]) + 1
+                    )
+                finally:
+                    worker.complete(result)
+            self._publish_exit_backfill_metrics(mode)
 
     def refresh_position_quotes(self, *, trigger: str = "poll") -> int:
         """Fetch active-position sell Quotes without touching SQLite state."""
@@ -1270,6 +1487,9 @@ class RealtimeCoordinator:
         """Bind active Solana positions to their Pump curve or PumpSwap accounts."""
         if self.features.is_bsc or self.solana_price_monitor is None:
             return
+        if self.survivor_engine is not None and hasattr(self.survivor_engine, "_sync_bindings"):
+            self.survivor_engine._sync_bindings()
+            return
         mints = {
             position.mint
             for engine in self.engines.values()
@@ -1280,17 +1500,23 @@ class RealtimeCoordinator:
                 self.solana_price_monitor.register_position(mint)
             except Exception:
                 continue
+            if self.solana_holder_monitor is not None and not self.solana_holder_monitor.registered(mint):
+                observed = self.solana_holder_monitor.register(mint)
+                if observed is not None:
+                    self._apply_holder_observation(observed)
         self.solana_price_monitor.unregister_missing(mints)
+        if self.solana_holder_monitor is not None:
+            self.solana_holder_monitor.unregister_missing(mints)
 
     def solana_price_subscriptions(self) -> tuple[tuple[str, list[object]], ...]:
         if self.features.is_bsc or self.solana_price_monitor is None:
             return ()
-        return self.solana_price_monitor.subscriptions()
+        return self.solana_price_monitor.subscriptions() + (self.solana_holder_monitor.subscriptions() if self.solana_holder_monitor is not None else ())
 
     def notify_solana_wss_event(self, event: object) -> None:
         if not isinstance(event, Mapping):
             return
-        if event.get("method") != "accountNotification":
+        if event.get("method") not in {"accountNotification", "programNotification"}:
             return
         with self._solana_event_lock:
             self._solana_events.append(dict(event))
@@ -1302,8 +1528,24 @@ class RealtimeCoordinator:
         with self._solana_event_lock:
             events = tuple(self._solana_events)
             self._solana_events.clear()
+        if self.survivor_engine is not None and not self.engines and events:
+            latest_by_account: dict[str, Mapping[str, object]] = {}
+            passthrough: list[Mapping[str, object]] = []
+            for event in events:
+                metadata = event.get("_subscription_params")
+                if isinstance(metadata, list) and metadata and isinstance(metadata[0], str):
+                    latest_by_account[metadata[0]] = event
+                else:
+                    passthrough.append(event)
+            events = tuple(passthrough) + tuple(latest_by_account.values())
         processed = 0
         for event in events:
+            if self.survivor_engine is not None and hasattr(self.survivor_engine, "on_solana_account_event"):
+                self.survivor_engine.on_solana_account_event(event)
+            if self.solana_holder_monitor is not None:
+                holder = self.solana_holder_monitor.process_wss_event(event)
+                if holder is not None:
+                    self._apply_holder_observation(holder)
             try:
                 observed = self.solana_price_monitor.process_wss_event(event)
             except Exception:
@@ -1311,6 +1553,8 @@ class RealtimeCoordinator:
             if observed is None:
                 continue
             processed += 1
+            if self.survivor_engine is not None and hasattr(self.survivor_engine, "on_solana_price"):
+                self.survivor_engine.on_solana_price(observed)
             for mode, engine in self.engines.items():
                 if mode not in {"paper", "shadow"}:
                     continue
@@ -1327,6 +1571,10 @@ class RealtimeCoordinator:
                             observed.price_sol_per_token,
                             account_address=observed.account_address,
                             observed_slot=observed.observed_slot,
+                            # The mutable position snapshot is enough for a
+                            # non-triggering WSS tick. A triggered exit still
+                            # writes its transition and execution facts.
+                            record_event=False,
                         )
                         current = engine.ledger.positions.get(position.position_id)
                         if current is None:
@@ -1344,7 +1592,13 @@ class RealtimeCoordinator:
                         "mfe_pct": observation.mfe_pct,
                         "mae_pct": observation.mae_pct,
                     })
-                    if not decision.triggered or decision.reason not in {"take_profit", "stop_loss"}:
+                    if not decision.triggered or decision.reason not in {
+                        "take_profit",
+                        "take_profit_1",
+                        "take_profit_2",
+                        "stop_loss",
+                        "tp2_breakeven_exit",
+                    }:
                         continue
                     jupiter_quote = self.features.quote_for_position(current)
                     usable_jupiter = (
@@ -1355,7 +1609,20 @@ class RealtimeCoordinator:
                         and jupiter_quote.output_quantity > 0
                         and jupiter_quote.unusable_reason(self.clock()) is None
                     )
-                    settlement = jupiter_quote if usable_jupiter else local_quote
+                    if not usable_jupiter:
+                        self._audit(mode, "SOLANA_TRIGGERED_EXIT_QUOTE", {"position_id": position.position_id, "mint": position.mint, "reason": decision.reason, "executable_quote": False, "quote_error_class": jupiter_quote.error_class if jupiter_quote else "quote_unavailable"})
+                        continue
+                    settlement = jupiter_quote
+                    partial_sell_quote = None
+                    if decision.reason in {"take_profit_1", "take_profit_2"}:
+                        partial_position = replace(
+                            current,
+                            remaining_quantity_token=(
+                                current.active_quantity_token
+                                * engine.strategy.config.partial_take_profit_sell_pct
+                            ),
+                        )
+                        partial_sell_quote = self.features.quote_for_position(partial_position)
                     pricing_mode = (
                         self.features.solana_pricing_mode_for_quote(settlement)
                         if usable_jupiter
@@ -1386,7 +1653,10 @@ class RealtimeCoordinator:
                                 executable_quote=bool(usable_jupiter),
                                 now=observed.observed_at,
                             ),
+                            partial_sell_quote=partial_sell_quote,
                         )
+        if self.survivor_engine is not None and hasattr(self.survivor_engine, "drain_swap_results"):
+            self.survivor_engine.drain_swap_results()
         return processed
 
     def _take_position_quote(self, mode: str, position_id: str) -> ExecutableQuote | None | object:
@@ -1428,6 +1698,8 @@ class RealtimeCoordinator:
 
     def run_cycle(self, *, process_exits: bool = True) -> CycleResult:
         started = self.clock()
+        with self._db_lock:
+            self._drain_exit_backfill_results()
         self.publish_runtime_control_state()
         if self.telegram is not None:
             try:
@@ -1442,23 +1714,67 @@ class RealtimeCoordinator:
         accepted = {mode: 0 for mode in self.engines}
         exits = {mode: 0 for mode in self.engines}
         source_error: str | None = None
+        source_stats: Mapping[str, object] = {}
         source_started = time.monotonic()
         try:
             records = tuple(self.source.fetch_once())
+            stats = getattr(self.source, "stats", None)
+            if callable(stats):
+                candidate_stats = stats()
+                if isinstance(candidate_stats, Mapping):
+                    source_stats = candidate_stats
             elapsed = (time.monotonic() - source_started) * 1000
             self.latency.record("binance_signal_poll", elapsed)
-            for mode in self.engines:
+            health_modes = self.engines or ({self.survivor_mode or "paper": self.survivor_engine} if self.survivor_engine is not None else {})
+            for mode in health_modes:
                 with self._db_lock:
-                    self.stores[mode].record_latency("binance_signal_poll", elapsed)
+                    if mode in self.stores:
+                        self.stores[mode].record_latency("binance_signal_poll", elapsed)
                 self._set_health(mode, "binance_web3", "HEALTHY", latency_ms=int(elapsed))
+                okx_stats = source_stats.get("okx_signal")
+                if isinstance(okx_stats, Mapping):
+                    okx_state = str(okx_stats.get("state") or "DEGRADED")
+                    self._set_health(
+                        mode,
+                        "okx_signal",
+                        "HEALTHY" if okx_state == "HEALTHY" else "DEGRADED",
+                        error_class=str(okx_stats.get("last_error_class") or "") or None,
+                        details=dict(okx_stats),
+                    )
         except BinanceWeb3Error as exc:
             source_error = exc.context.error_class
-            for mode in self.engines:
+            health_modes = self.engines or ({self.survivor_mode or "paper": self.survivor_engine} if self.survivor_engine is not None else {})
+            for mode in health_modes:
                 self._set_health(mode, "binance_web3", "UNAVAILABLE", error_class=source_error)
                 self._audit(mode, "SOURCE_ERROR", {"error_class": source_error})
             return CycleResult(started, self.clock(), 0, 0, 0, 0, accepted, exits, source_error)
 
         fetched = len(records)
+        if self.survivor_engine is not None:
+            latest_records = getattr(self.source, "latest_records", None)
+            snapshot = latest_records() if callable(latest_records) else records
+            self.survivor_engine.on_records(snapshot, self.clock())
+            if not self.engines:
+                self.survivor_engine.evaluate(self.clock())
+                finished = self.clock()
+                with self._db_lock:
+                    self.stores[self.survivor_mode or "paper"].set_state("last_cycle", {
+                        "started_at": started.isoformat(),
+                        "finished_at": finished.isoformat(),
+                        "fetched": fetched,
+                        "bootstrap_skipped": 0,
+                        "pending_observations": 0,
+                        "candidates": fetched,
+                        "accepted": 0,
+                        "exits": 0,
+                        "source_error_class": None,
+                        "signal_source": source_stats.get("source", "binance_web3:meme_rush"),
+                        "source_candidate_count": source_stats.get("last_fetched", fetched),
+                        "source_stats": dict(source_stats),
+                        "strategy": SURVIVOR_REVERSAL_IDENTITY.strategy_name,
+                    })
+                self._set_health(self.survivor_mode or "paper", "coordinator", "HEALTHY")
+                return CycleResult(started, finished, fetched, 0, 0, fetched, accepted, exits, None)
         if "live" in self.engines and not self._live_startup_snapshot_complete:
             self._live_startup_excluded_mints.update(record.signal.mint for record in records)
             self._live_startup_snapshot_complete = True
@@ -1515,6 +1831,12 @@ class RealtimeCoordinator:
                     self._audit(mode, "DUPLICATE_SIGNAL_SKIPPED", {"signal_id": signal.signal_id, "candidate_id": candidate_id})
                 continue
             discovered_at = self.clock()
+            # Paper has already completed this strategy's configured
+            # observation window before a mirror row exists.  Start the Live
+            # audit immediately so it follows the same candidate cadence
+            # rather than delaying the identical signal a second time.
+            if record.endpoint_type == "paper_candidate_mirror":
+                discovered_at -= self.observation_delay
             pending = PendingSignalObservation(
                 record=record,
                 first_price_usd=_decimal_value(_field_value(record.fields, "price_usd")),
@@ -1566,6 +1888,8 @@ class RealtimeCoordinator:
                 "accepted": accepted[mode],
                 "exits": exits[mode],
                 "source_error_class": source_error,
+                "signal_source": source_stats.get("source", "binance_web3:meme_rush"),
+                "source_candidate_count": source_stats.get("last_fetched"),
                 })
             self._set_health(mode, "coordinator", "HEALTHY")
         return CycleResult(started, finished, fetched, bootstrap_skipped, duplicate_skipped, candidates, accepted, exits, source_error)
@@ -1598,7 +1922,11 @@ class RealtimeCoordinator:
         """
 
         started = self.clock()
+        with self._db_lock:
+            self._drain_exit_backfill_results()
         events = self._consume_bsc_pair_events()
+        if self.survivor_engine is not None:
+            self.survivor_engine.evaluate(started)
         if events:
             trigger = "wss"
             for event in events:
@@ -1824,14 +2152,69 @@ class RealtimeCoordinator:
             key=lambda descriptor: descriptor.address,
         ))
 
+    def bsc_subscription_details(self) -> tuple[dict[str, object], ...]:
+        """Return current WSS contracts with an explicit allowed reason."""
+
+        if self.survivor_engine is not None:
+            return self.survivor_engine.subscription_details()
+        return tuple(
+            {
+                "contract": descriptor.mint,
+                "symbol": None,
+                "reason": "OPEN_POSITION",
+                "pool_address": descriptor.address,
+            }
+            for descriptor in self.bsc_position_pool_descriptors()
+        )
+
+    def bsc_subscription_descriptors(self) -> tuple[BscPoolDescriptor, ...]:
+        """Return only pools justified by ACTIVE, POSITION or GRACE state."""
+
+        if self.survivor_engine is not None:
+            return self.survivor_engine.subscription_descriptors()
+        return self.bsc_position_pool_descriptors()
+
     def notify_bsc_pair_event(self, event: BscPairEvent) -> None:
         if not self.features.is_bsc:
             return
+        if self.survivor_engine is not None:
+            self.survivor_engine.on_wss_event(event)
         with self._bsc_event_lock:
+            active_mints = {position.mint.lower() for engine in self.engines.values() for position in engine.ledger.active_positions}
+            if event.event_type == "transfer" and event.pair_address in active_mints:
+                if self.bsc_holder_monitor is not None:
+                    observed = self.bsc_holder_monitor.ingest(event)
+                    if observed is not None:
+                        self._apply_holder_observation(observed)
+                self._bsc_refresh_event.set()
+                return
             if event.pair_address not in self._bsc_mints_by_pool:
                 return
             self._bsc_pair_events.append(event)
             self._bsc_refresh_event.set()
+
+    def bsc_holder_token_addresses(self) -> tuple[str, ...]:
+        if not self.features.is_bsc:
+            return ()
+        return tuple(sorted({position.mint.lower() for engine in self.engines.values() for position in engine.ledger.active_positions if normalize_bsc_address(position.mint)}))
+
+    def sync_bsc_holder_baselines(self) -> None:
+        if self.bsc_holder_monitor is None:
+            return
+        for mint in self.bsc_holder_token_addresses():
+            if self.bsc_holder_monitor.registered(mint):
+                continue
+            observed = self.bsc_holder_monitor.bootstrap(mint)
+            if observed is not None:
+                self._apply_holder_observation(observed)
+
+    def _apply_holder_observation(self, observed: HolderObservation) -> None:
+        for engine in self.engines.values():
+            for position in tuple(engine.ledger.active_positions):
+                if position.mint.lower() != observed.mint.lower():
+                    continue
+                with self._db_lock:
+                    engine.ledger.record_holder_observation(position.position_id, observed.holders, observed.observed_at, observed.source)
 
     def position_refresh_requested(self) -> bool:
         return self._bsc_refresh_event.is_set()
@@ -1850,31 +2233,88 @@ class RealtimeCoordinator:
     def update_bsc_wss_status(self, status: Mapping[str, object]) -> None:
         if not self.features.is_bsc:
             return
+        state = str(status.get("state") or "UNAVAILABLE")
+        pool_addresses = int(status.get("pool_addresses") or 0)
+        pool_address_list = tuple(str(value) for value in (status.get("pool_address_list") or ()) if value)
+        actual_subscribed_addresses = pool_address_list if pool_address_list else ()
+        if self.survivor_engine is not None:
+            self.survivor_engine.update_wss_status(state, actual_subscribed_addresses)
+        survivor_coverage = (
+            self.survivor_engine.active_candidate_wss_status()
+            if self.survivor_engine is not None
+            else ()
+        )
         key = (
             status.get("state"),
             status.get("last_error_class"),
+            status.get("pool_addresses"),
+            status.get("endpoint_configured"),
+            status.get("disabled_after_failure"),
             status.get("connection_count"),
             status.get("disconnect_count"),
+            tuple((str(item.get("contract")), str(item.get("reason"))) for item in self.bsc_subscription_details()),
+            tuple((str(item.get("contract_address")), str(item.get("wss_subscription_status")), str(item.get("failure_reason"))) for item in survivor_coverage),
         )
         if key == self._bsc_wss_status_key:
             return
         self._bsc_wss_status_key = key
-        state = str(status.get("state") or "UNAVAILABLE")
         self._bsc_wss_healthy = state == "HEALTHY"
-        health_state = "HEALTHY" if state == "HEALTHY" else "UNAVAILABLE" if state == "UNAVAILABLE" else "DEGRADED"
+        endpoint_configured = bool(status.get("endpoint_configured"))
+        disabled_after_failure = bool(status.get("disabled_after_failure"))
+        initial_connecting = state == "DISCONNECTED" and not status.get("last_error_class") and not int(status.get("connection_count") or 0)
+        active_candidate_count = len(survivor_coverage)
+        unresolved_candidates = tuple(
+            item for item in survivor_coverage
+            if str(item.get("wss_subscription_status")) not in {"SUBSCRIBED", "READY"}
+        )
+        idle_without_candidates = (
+            active_candidate_count == 0
+            and endpoint_configured
+            and not disabled_after_failure
+            and state in {"NO_POOL_ADDRESS", "HEALTHY", "READY", "IDLE"}
+        )
+        health_state = (
+            "IDLE" if idle_without_candidates else
+            "HEALTHY" if state == "HEALTHY" and pool_addresses > 0 else
+            "READY" if active_candidate_count > 0 and endpoint_configured and not disabled_after_failure and (state in {"NO_POOL_ADDRESS", "HEALTHY", "READY", "IDLE", "CONNECTING"} or initial_connecting) else
+            "UNAVAILABLE" if state == "UNAVAILABLE" else
+            "DEGRADED"
+        )
         error_class = status.get("last_error_class")
         error_value = str(error_class) if error_class else None
-        for mode in self.engines:
+        health_modes = self.engines or ({self.survivor_mode or "paper": self.survivor_engine} if self.survivor_engine is not None else {})
+        for mode in health_modes:
             self._set_health(
                 mode,
                 "bsc_pair_wss",
                 health_state,
                 error_class=error_value,
                 details={
-                    "pool_addresses": status.get("pool_addresses", 0),
+                    "pool_addresses": pool_addresses,
+                    "active_subscriptions": pool_addresses,
+                    "active_candidate_count": active_candidate_count,
+                    "subscribed_count": pool_addresses,
+                    "unresolved_count": len(unresolved_candidates),
+                    "unresolved_candidates": list(unresolved_candidates),
+                    "idle_reason": "no_candidate" if idle_without_candidates else None,
                     "pool_types": status.get("pool_types", ()),
                     "topics": status.get("topics", ()),
                     "fallback_poll_sec": status.get("fallback_poll_sec", 2.0),
+                    "configured_endpoints": status.get("configured_endpoints", 0),
+                    "connection_count": status.get("connection_count", 0),
+                    "disconnect_count": status.get("disconnect_count", 0),
+                    "retry_count": status.get("retry_count", 0),
+                    "last_successful_message": status.get("last_message_at"),
+                    "last_block": status.get("last_block_number"),
+                    "last_subscription_request": status.get("last_subscription_request"),
+                    "last_subscription_response": status.get("last_subscription_response"),
+                    "subscription_error_code": status.get("last_subscription_error_code"),
+                    "subscription_error_message": status.get("last_subscription_error_message"),
+                    "provider_state": state,
+                    "subscriptions": [
+                        {key: value for key, value in item.items() if key != "descriptor"}
+                        for item in self.bsc_subscription_details()
+                    ],
                 },
             )
             self._audit(mode, "BSC_WSS_STATUS", dict(status))
@@ -1967,8 +2407,18 @@ class RealtimeCoordinator:
         pending: PendingSignalObservation,
         evaluated_at: datetime,
     ) -> tuple[int, dict[str, int], int]:
+        if not self.features.is_bsc:
+            # Do not reuse the cycle's batch timestamp.  A pending signal can
+            # wait behind earlier candidates, so evaluation begins only when
+            # this particular candidate starts its local work.
+            return self._evaluate_solana_observation(pending)
+
         record = pending.record
         signal = record.signal
+        paper_candidate_mirror = record.endpoint_type == "paper_candidate_mirror"
+        paper_candidate_status = _first_string(
+            _field_value(record.fields, "paper_candidate_status")
+        )
         feature_started = time.monotonic()
         defer_bsc_quote = self.features.is_bsc and self.features.bsc_executable_quote_enabled
         entry_features = self.features.entry_features(
@@ -1993,6 +2443,16 @@ class RealtimeCoordinator:
                 candidate_id = f"{mode}:{signal.signal_id}:{engine.strategy.config.identity.ruleset_version}"
                 if engine.ledger.candidate_exists(candidate_id):
                     continue
+                # Paper is the canonical evaluator for the mirrored live
+                # stream.  Rejected Paper candidates still get a Live audit
+                # record, but must never consume a route quote.  Accepted
+                # candidates require one fresh venue quote before Live can
+                # enter, so quote/execution safety remains local to Live.
+                if paper_candidate_mirror:
+                    if paper_candidate_status != "ACCEPTED" or self.controls.paused(mode):
+                        continue
+                    quote_needed = True
+                    break
                 block_reason = self._observation_gate(
                     pending,
                     entry_features,
@@ -2025,16 +2485,26 @@ class RealtimeCoordinator:
                 self.stores[mode].record_latency("feature_and_quote_build", feature_elapsed)
             candidate_id = f"{mode}:{signal.signal_id}:{engine.strategy.config.identity.ruleset_version}"
             position_id = f"{candidate_id}:position"
-            block_reason = self._observation_gate(
-                pending,
-                entry_features,
-                strategy_config.min_liquidity_usd,
-                require_price=strategy_config.require_observation_price,
-                price_must_rise=self.features.is_bsc,
-                holders_must_not_decrease=strategy_config.require_holders_non_decreasing_after_observation,
-                require_min_liquidity=strategy_config.require_observation_liquidity,
-                liquidity_must_not_decrease=self.features.is_bsc and mode == "shadow",
-            )
+            if paper_candidate_mirror:
+                # The candidate fields and decision originate from Paper's
+                # completed observation using this same strategy config.  Do
+                # not independently re-evaluate a later Binance snapshot.
+                block_reason = (
+                    None
+                    if paper_candidate_status == "ACCEPTED"
+                    else "paper_candidate_not_accepted"
+                )
+            else:
+                block_reason = self._observation_gate(
+                    pending,
+                    entry_features,
+                    strategy_config.min_liquidity_usd,
+                    require_price=strategy_config.require_observation_price,
+                    price_must_rise=self.features.is_bsc,
+                    holders_must_not_decrease=strategy_config.require_holders_non_decreasing_after_observation,
+                    require_min_liquidity=strategy_config.require_observation_liquidity,
+                    liquidity_must_not_decrease=self.features.is_bsc and mode == "shadow",
+                )
             if block_reason is None and self.controls.paused(mode):
                 block_reason = "runtime_paused"
             with self._db_lock:
@@ -2069,6 +2539,149 @@ class RealtimeCoordinator:
                 with self._db_lock:
                     self.stores[mode].set_state("bsc_quote_metrics", metrics)
         return candidates, accepted, duplicate_skipped
+
+    def _evaluate_solana_observation(
+        self,
+        pending: PendingSignalObservation,
+    ) -> tuple[int, dict[str, int], int]:
+        """Run local Solana checks before requesting the bounded Jupiter slot."""
+
+        record = pending.record
+        signal = record.signal
+        evaluated_at = self.clock()
+        feature_started = time.monotonic()
+        entry_features = self.features.entry_features(
+            record,
+            evaluated_at,
+            include_solana_quote=False,
+        )
+        entry_features = replace(
+            entry_features,
+            soft_features={
+                **(entry_features.soft_features or {}),
+                "first_discovered_holders": pending.first_holders,
+                "observation_holders": entry_features.holders,
+                "first_discovered_liquidity_usd": pending.first_liquidity_usd,
+                "observation_liquidity_usd": entry_features.liquidity_usd,
+            },
+        )
+        strategy_config = next(iter(self.engines.values())).strategy.config
+        accepted = {mode: 0 for mode in self.engines}
+        candidates = 0
+        duplicate_skipped = 0
+        quote_plans: list[tuple[str, DeterministicSimulation, str, str]] = []
+
+        for mode, engine in self.engines.items():
+            candidate_id = f"{mode}:{signal.signal_id}:{engine.strategy.config.identity.ruleset_version}"
+            position_id = f"{candidate_id}:position"
+            block_reason = self._observation_gate(
+                pending,
+                entry_features,
+                strategy_config.min_liquidity_usd,
+                require_price=strategy_config.require_observation_price,
+                price_must_rise=False,
+                holders_must_not_decrease=strategy_config.require_holders_non_decreasing_after_observation,
+                require_min_liquidity=strategy_config.require_observation_liquidity,
+                liquidity_must_not_decrease=False,
+            )
+            if block_reason is None and self.controls.paused(mode):
+                block_reason = "runtime_paused"
+            with self._db_lock:
+                if engine.ledger.candidate_exists(candidate_id):
+                    duplicate_skipped += 1
+                    self._audit(mode, "DUPLICATE_SIGNAL_SKIPPED", {"signal_id": signal.signal_id, "candidate_id": candidate_id})
+                    continue
+                candidates += 1
+                if block_reason is not None or not engine.strategy.local_entry_eligible(entry_features):
+                    event_start = len(engine.ledger.lifecycle_events)
+                    result = engine.process_entry(
+                        signal,
+                        entry_features,
+                        candidate_id=candidate_id,
+                        position_id=position_id,
+                        block_reason=block_reason,
+                        local_only=True,
+                    )
+                else:
+                    result = None
+                    event_start = 0
+            if result is not None:
+                self._notify_live_events(mode, engine, event_start)
+                self._audit_candidate(mode, signal, result, entry_features)
+            else:
+                quote_plans.append((mode, engine, candidate_id, position_id))
+
+        if not quote_plans:
+            feature_elapsed = (time.monotonic() - feature_started) * 1000
+            self.latency.record("feature_and_quote_build", feature_elapsed)
+            for mode in self.engines:
+                with self._db_lock:
+                    self.stores[mode].record_latency("feature_and_quote_build", feature_elapsed)
+            return candidates, accepted, duplicate_skipped
+
+        quote_started_at = self.clock()
+        quote_queue_wait_ms = max(
+            0,
+            int((quote_started_at - evaluated_at).total_seconds() * 1000),
+        )
+        entry_features = replace(
+            entry_features,
+            soft_features={
+                **(entry_features.soft_features or {}),
+                "quote_queue_wait_ms": quote_queue_wait_ms,
+                "quote_queue_started_at": quote_started_at.isoformat(),
+            },
+        )
+        self._record_solana_quote_queue_wait(quote_queue_wait_ms)
+
+        # The frozen token-age maximum is also the existing new-signal
+        # freshness limit.  Never spend a Jupiter request, or open a Paper /
+        # Shadow position, once a queued signal has exceeded it.
+        quote_queue_expired = (
+            quote_started_at - signal.observed_at
+            > timedelta(seconds=strategy_config.token_age_max_sec)
+        )
+        if quote_queue_expired:
+            quoted_features = entry_features
+        else:
+            quoted_features = self.features.solana_entry_features_with_quote(
+                record,
+                entry_features,
+                quote_queue_wait_ms=quote_queue_wait_ms,
+            )
+
+        feature_elapsed = (time.monotonic() - feature_started) * 1000
+        self.latency.record("feature_and_quote_build", feature_elapsed)
+        for mode, engine, candidate_id, position_id in quote_plans:
+            with self._db_lock:
+                self.stores[mode].record_latency("feature_and_quote_build", feature_elapsed)
+                event_start = len(engine.ledger.lifecycle_events)
+                result = engine.process_entry(
+                    signal,
+                    quoted_features,
+                    candidate_id=candidate_id,
+                    position_id=position_id,
+                    block_reason="quote_queue_expired" if quote_queue_expired else None,
+                    local_only=quote_queue_expired,
+                )
+            self._notify_live_events(mode, engine, event_start)
+            if result.position is not None:
+                accepted[mode] += 1
+            self._audit_candidate(mode, signal, result, quoted_features)
+        return candidates, accepted, duplicate_skipped
+
+    def _record_solana_quote_queue_wait(self, wait_ms: int) -> None:
+        self._solana_quote_queue_count += 1
+        self._solana_quote_queue_total_ms += wait_ms
+        self._solana_quote_queue_max_ms = max(self._solana_quote_queue_max_ms, wait_ms)
+        metrics = {
+            "count": self._solana_quote_queue_count,
+            "average_ms": self._solana_quote_queue_total_ms / self._solana_quote_queue_count,
+            "max_ms": self._solana_quote_queue_max_ms,
+        }
+        for mode in self.engines:
+            with self._db_lock:
+                self.stores[mode].set_state("solana_quote_queue_metrics", metrics)
 
     @staticmethod
     def _observation_gate(
@@ -2193,6 +2806,33 @@ class RealtimeCoordinator:
             return "unavailable"
         return "pending"
 
+    def _solana_partial_take_profit_quote(
+        self,
+        engine: DeterministicSimulation,
+        position: VirtualPosition,
+        now: datetime,
+        full_sell_quote: ExecutableQuote | None,
+        shadow_features: ShadowExitFeatures | None = None,
+    ) -> ExecutableQuote | None:
+        """Quote only a triggered TP half; normal monitoring keeps one quote per position."""
+        if self.features.is_bsc or not engine.strategy.config.partial_take_profit_enabled:
+            return None
+        decision = (
+            engine.strategy.evaluate_shadow_exit(position, shadow_features, now, full_sell_quote)
+            if shadow_features is not None
+            else engine.strategy.evaluate_paper_exit(position, now, full_sell_quote)
+        )
+        if decision.reason not in {"take_profit_1", "take_profit_2"}:
+            return None
+        target = replace(
+            position,
+            remaining_quantity_token=(
+                position.active_quantity_token
+                * engine.strategy.config.partial_take_profit_sell_pct
+            ),
+        )
+        return self.features.quote_for_position(target)
+
     def _process_exit(
         self,
         mode: str,
@@ -2259,6 +2899,9 @@ class RealtimeCoordinator:
                 if not quote_already_fetched:
                     quote = self.features.quote_for_position(position)
                 if mode == "paper":
+                    partial_sell_quote = self._solana_partial_take_profit_quote(
+                        engine, position, now, quote
+                    )
                     exit_holders_snapshot = self.features.latest_holders_snapshot(position, now)
                     result = engine.process_paper_exit(
                         position.position_id,
@@ -2282,9 +2925,13 @@ class RealtimeCoordinator:
                             self.features.solana_pricing_mode_for_quote(quote)
                             if not self.features.is_bsc else None
                         ),
+                        partial_sell_quote=partial_sell_quote,
                     )
                 elif mode == "shadow":
                     shadow_features = self.features.shadow_exit_features(position, quote, now)
+                    partial_sell_quote = self._solana_partial_take_profit_quote(
+                        engine, position, now, quote, shadow_features
+                    )
                     exit_holders_snapshot = self.features.latest_holders_snapshot(position, now)
                     result = engine.process_shadow_exit(
                         position.position_id,
@@ -2309,6 +2956,7 @@ class RealtimeCoordinator:
                             self.features.solana_pricing_mode_for_quote(quote)
                             if not self.features.is_bsc else None
                         ),
+                        partial_sell_quote=partial_sell_quote,
                     )
                 else:
                     result = engine.process_live_exit(

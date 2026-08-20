@@ -114,6 +114,7 @@ class JupiterReadOnlyQuoteProvider:
         max_retries: int = 1,
         error_cache_ttl_ms: int = 1_000,
         decimals_resolver: Callable[[str], int] | None = None,
+        swap_v2_price_impact: bool = False,
         transport: Callable[[str, Mapping[str, str], float], tuple[int, bytes, Mapping[str, str]]] | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.environ.get("JUPITER_API_KEY", "").strip()
@@ -134,6 +135,7 @@ class JupiterReadOnlyQuoteProvider:
         self.max_retries = max(0, min(2, int(max_retries)))
         self.error_cache_ttl_ms = max(100, min(5_000, int(error_cache_ttl_ms)))
         self.decimals_resolver = decimals_resolver
+        self.swap_v2_price_impact = bool(swap_v2_price_impact)
         self.transport = transport or self._transport
         self.requests = 0
         self.last_error_class: str | None = None
@@ -151,6 +153,7 @@ class JupiterReadOnlyQuoteProvider:
         *,
         token_decimals: Mapping[str, int] | None = None,
         decimals_resolver: Callable[[str], int] | None = None,
+        swap_v2_price_impact: bool = False,
     ) -> "JupiterReadOnlyQuoteProvider":
         return cls(
             token_decimals=token_decimals,
@@ -161,6 +164,7 @@ class JupiterReadOnlyQuoteProvider:
             max_retries=_env_int("JUPITER_MAX_RETRIES", 1, 0, 2),
             error_cache_ttl_ms=_env_int("JUPITER_ERROR_CACHE_TTL_MS", 1_000, 100, 5_000),
             decimals_resolver=decimals_resolver,
+            swap_v2_price_impact=swap_v2_price_impact,
         )
 
     def safe_status(self) -> dict[str, object]:
@@ -319,7 +323,14 @@ class JupiterReadOnlyQuoteProvider:
                 input_quantity=actual_input,
                 output_quantity=output_quantity,
                 route_fee=None,
-                price_impact_pct=_price_impact_pct(parsed.get("priceImpactPct"), self.price_impact_unit),
+                # Swap V2 documents ``priceImpact`` in percentage points
+                # (for example -0.1 means -0.1%). ``priceImpactPct`` is the
+                # deprecated decimal ratio and remains a fixture fallback.
+                price_impact_pct=(
+                    Decimal(str(parsed["priceImpact"]))
+                    if self.swap_v2_price_impact and parsed.get("priceImpact") is not None
+                    else _price_impact_pct(parsed.get("priceImpactPct"), self.price_impact_unit)
+                ),
                 quoted_at=received_at,
                 age_ms=0,
                 expires_at=received_at + timedelta(milliseconds=self.quote_ttl_ms),

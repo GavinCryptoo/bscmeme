@@ -94,7 +94,14 @@ class TelegramControl:
         text = _format_event(event_type, payload, chain=chain)
         if text is None:
             return False
-        return self.send_message(text, reply_markup=_event_markup(payload, live=mode == "live"))
+        return self.send_message(
+            text,
+            reply_markup=_event_markup(
+                payload,
+                live=mode == "live",
+                live_entries_paused=self.control.paused("live") if mode == "live" else None,
+            ),
+        )
 
     def poll_once(self) -> tuple[str, ...]:
         if not self.config.enabled:
@@ -150,7 +157,10 @@ class TelegramControl:
                 "/bsc_live_resume": ("live", False),
             })
         if parts[0] in {"/start", "/help"}:
-            self.send_message(_help_text(self.allowed_modes), reply_markup=_control_markup(self.allowed_modes))
+            self.send_message(
+                _help_text(self.allowed_modes),
+                reply_markup=_control_markup(self.allowed_modes, live_entries_paused=self.control.paused("live")),
+            )
             return "help"
         if parts[0] == "/status":
             self.send_message(json.dumps(self.status_provider(), ensure_ascii=False, default=str)[:3500])
@@ -162,7 +172,7 @@ class TelegramControl:
         self.control.set_paused(mode, paused)
         self.send_message(
             f"{_mode_label(mode)}新开仓已{'暂停' if paused else '恢复'}。\n已有持仓继续按原策略监控和退出。",
-            reply_markup=_control_markup(self.allowed_modes),
+            reply_markup=_control_markup(self.allowed_modes, live_entries_paused=self.control.paused("live")),
         )
         return f"{mode}_{'pause' if paused else 'resume'}"
 
@@ -237,28 +247,33 @@ def _help_text(modes: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def _control_markup(modes: Sequence[str]) -> dict[str, object]:
-    buttons: list[dict[str, str]] = [{"text": "状态", "callback_data": "status"}]
+def _control_markup(modes: Sequence[str], *, live_entries_paused: bool = False) -> dict[str, object]:
+    buttons: list[dict[str, str]] = []
     if "live" in modes:
-        buttons.extend([
-            {"text": "暂停新开仓", "callback_data": "live_pause"},
-            {"text": "恢复新开仓", "callback_data": "live_resume"},
-        ])
-    return {"inline_keyboard": [buttons]}
+        buttons.append({
+            "text": "启动新开仓" if live_entries_paused else "暂停新开仓",
+            "callback_data": "live_resume" if live_entries_paused else "live_pause",
+        })
+    return {"inline_keyboard": [buttons]} if buttons else None
 
 
-def _event_markup(payload: Mapping[str, object], *, live: bool) -> dict[str, object] | None:
-    rows: list[list[dict[str, str]]] = []
+def _event_markup(
+    payload: Mapping[str, object],
+    *,
+    live: bool,
+    live_entries_paused: bool | None = None,
+) -> dict[str, object] | None:
+    buttons: list[dict[str, object]] = []
     mint = str(payload.get("mint") or "").strip()
     if mint:
-        rows.append([{"text": "复制合约", "copy_text": {"text": mint}}])
+        buttons.append({"text": "复制合约", "copy_text": {"text": mint}})
     if live:
-        rows.append([
-            {"text": "状态", "callback_data": "status"},
-            {"text": "暂停新开仓", "callback_data": "live_pause"},
-            {"text": "恢复新开仓", "callback_data": "live_resume"},
-        ])
-    return {"inline_keyboard": rows} if rows else None
+        paused = bool(live_entries_paused)
+        buttons.append({
+            "text": "启动新开仓" if paused else "暂停新开仓",
+            "callback_data": "live_resume" if paused else "live_pause",
+        })
+    return {"inline_keyboard": [buttons]} if buttons else None
 
 
 def _format_event(event_type: str, payload: Mapping[str, object], *, chain: str) -> str | None:
@@ -271,24 +286,32 @@ def _format_event(event_type: str, payload: Mapping[str, object], *, chain: str)
         return (
             f"🟢 {chain} Live 买入成功\n"
             f"策略：{strategy}\n代币：{symbol}\n合约：{mint}\n时间：{occurred_at}\n"
-            f"投入：{payload.get('input_quantity', '—')} BNB\n"
+            f"买入价格：{payload.get('entry_price_native', '—')} BNB / Token\n"
+            f"买入持币地址：{payload.get('entry_holders', '—')}\n"
+            f"买入金额：{payload.get('input_quantity', '—')} BNB\n"
+            f"买入流动性：{payload.get('entry_liquidity_usd', '—')} USD\n"
             f"实际到账：{payload.get('actual_received', '—')}\n交易哈希：{tx_hash}\n"
             f"到账核对：{'✅' if payload.get('settlement_verified') else '❌'}"
         )
-    if event_type == "LIVE_EXIT_CONFIRMED":
+    if event_type in {"LIVE_EXIT_CONFIRMED", "LIVE_EXTERNAL_EXIT_DETECTED"}:
+        external = event_type == "LIVE_EXTERNAL_EXIT_DETECTED"
         return (
-            f"🔴 {chain} Live 卖出成功\n"
+            f"{'🟠' if external else '🔴'} {chain} Live {'检测到外部卖出' if external else '卖出成功'}\n"
             f"策略：{strategy}\n代币：{symbol}\n合约：{mint}\n时间：{occurred_at}\n"
+            f"卖出价格：{payload.get('exit_price_native', '外部成交价未取得')} BNB / Token\n"
+            f"卖出持币地址：{payload.get('exit_holders', '—')}\n"
+            f"卖出流动性：{payload.get('exit_liquidity_usd', '—')} USD\n"
             f"原因：{payload.get('reason', '—')}\n实际到账：{payload.get('actual_received', '—')} BNB\n"
             f"收益率：{payload.get('return_pct', '—')}\n交易哈希：{tx_hash}\n"
-            f"到账核对：{'✅' if payload.get('settlement_verified') else '❌'}"
+            f"到账核对：{'⚠️ 外部余额对账' if external else ('✅' if payload.get('settlement_verified') else '❌')}"
         )
     if event_type in {"LIVE_ENTRY_FAILED", "LIVE_EXIT_FAILED"}:
         action = "买入" if event_type == "LIVE_ENTRY_FAILED" else "卖出"
         return (
             f"⚠️ {chain} Live {action}失败\n"
             f"策略：{strategy}\n代币：{symbol}\n合约：{mint}\n时间：{occurred_at}\n"
-            f"原因分类：{payload.get('error_class', '—')}\n自动重试：否"
+            f"原因分类：{payload.get('error_class', '—')}\n"
+            f"失败码：{payload.get('error_code', '—')}\n自动重试：否"
         )
     if event_type == "LIVE_ENTRY_LIMIT_REACHED":
         return (

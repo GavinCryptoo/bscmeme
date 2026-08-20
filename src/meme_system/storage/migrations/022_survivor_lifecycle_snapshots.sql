@@ -1,0 +1,15 @@
+ALTER TABLE survivor_candidates ADD COLUMN token_created_at TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN discovery_delay_seconds TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_snapshot_at TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_lifecycle TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_rank_type INTEGER;
+ALTER TABLE survivor_candidates ADD COLUMN first_market_cap_usd TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_liquidity_usd TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_holders INTEGER;
+ALTER TABLE survivor_candidates ADD COLUMN first_price_usd TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN first_progress_pct TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN latest_lifecycle TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN latest_rank_type INTEGER;
+ALTER TABLE survivor_candidates ADD COLUMN latest_progress_pct TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN latest_migrate_status INTEGER;
+ALTER TABLE survivor_candidates ADD COLUMN emit_count INTEGER NOT NULL DEFAULT 0;

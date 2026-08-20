@@ -441,7 +441,7 @@ class SolanaWssMonitor:
                             result_id = event.get("result")
                             if isinstance(request_id, int) and isinstance(result_id, int) and request_id in request_params:
                                 subscription_params[result_id] = request_params[request_id]
-                            if event.get("method") == "accountNotification":
+                            if event.get("method") in {"accountNotification", "programNotification"}:
                                 params = event.get("params")
                                 if isinstance(params, Mapping) and isinstance(params.get("subscription"), int):
                                     binding = subscription_params.get(params["subscription"])

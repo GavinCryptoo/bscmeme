@@ -12,13 +12,13 @@ class DomainIdentityTests(unittest.TestCase):
     def test_frozen_baseline_identity(self) -> None:
         self.assertEqual(BASELINE_IDENTITY.strategy_name, "sol_ultra_early_baseline")
         self.assertEqual(BASELINE_IDENTITY.ruleset_name, "ultra_early_minimal")
-        self.assertEqual(BASELINE_IDENTITY.ruleset_version, "0.1.1")
-        self.assertEqual(BASELINE_IDENTITY.config_version, "0.1.1")
+        self.assertEqual(BASELINE_IDENTITY.ruleset_version, "0.1.2")
+        self.assertEqual(BASELINE_IDENTITY.config_version, "0.1.2")
 
     def test_lifecycle_key_excludes_mode_and_includes_strategy_version(self) -> None:
         self.assertEqual(
             BASELINE_IDENTITY.lifecycle_key("MintCaseSensitive"),
-            ("MintCaseSensitive", "sol_ultra_early_baseline", "0.1.1"),
+            ("MintCaseSensitive", "sol_ultra_early_baseline", "0.1.2"),
         )
 
     def test_bsc_strategy_overlay_is_versioned_and_does_not_change_solana_defaults(self) -> None:
@@ -32,7 +32,7 @@ class DomainIdentityTests(unittest.TestCase):
         self.assertEqual(config.shadow_holders_drop_pct, Decimal("0.10"))
         self.assertEqual(config.shadow_liquidity_drop_pct, Decimal("0.15"))
         self.assertEqual(config.stop_loss_trigger_pct, Decimal("-0.10"))
-        self.assertEqual(BASELINE_IDENTITY.ruleset_version, "0.1.1")
+        self.assertEqual(BASELINE_IDENTITY.ruleset_version, "0.1.2")
 
     def test_display_name_strips_unicode_direction_controls_without_changing_raw_value(self) -> None:
         raw_name = "Alpha\u202eSOL\u2066Token\u2069"

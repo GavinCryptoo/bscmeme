@@ -151,12 +151,77 @@ def _field(
     )
 
 
+def _timestamp_field(
+    row: Mapping[str, Any],
+    *,
+    source_field: str,
+    observed_at: datetime,
+    endpoint_type: str,
+) -> ObservedField:
+    """Normalize documented millisecond timestamps without guessing units."""
+
+    if source_field not in row or row[source_field] in (None, ""):
+        return ObservedField(
+            value=None,
+            source="binance_web3",
+            source_field=source_field,
+            observed_at=observed_at,
+            source_timestamp=None,
+            age_ms=None,
+            available=False,
+            parse_error="missing_field",
+            adapter_version=ADAPTER_VERSION,
+        )
+    try:
+        parsed = parse_millisecond_timestamp(row[source_field], endpoint_type=endpoint_type, field_name=source_field)
+    except BinanceWeb3Error as exc:
+        return ObservedField(
+            value=None,
+            source="binance_web3",
+            source_field=source_field,
+            observed_at=observed_at,
+            source_timestamp=None,
+            age_ms=None,
+            available=False,
+            parse_error=exc.context.error_class,
+            adapter_version=ADAPTER_VERSION,
+        )
+    return ObservedField(
+        value=parsed,
+        source="binance_web3",
+        source_field=source_field,
+        observed_at=observed_at,
+        source_timestamp=parsed,
+        age_ms=max(0, int((observed_at - parsed).total_seconds() * 1000)),
+        available=True,
+        adapter_version=ADAPTER_VERSION,
+    )
+
+
+def _derived_field(value: Any, *, source_field: str, observed_at: datetime) -> ObservedField:
+    """Record request-context metadata without presenting it as an upstream field."""
+
+    return ObservedField(
+        value=value,
+        source="binance_web3:meme_rush",
+        source_field=source_field,
+        observed_at=observed_at,
+        source_timestamp=None,
+        age_ms=0,
+        available=value is not None,
+        parse_error=None if value is not None else "not_provided",
+        adapter_version=ADAPTER_VERSION,
+    )
+
+
 def normalize_meme_row(
     row: Mapping[str, Any],
     *,
     fetched_at: datetime,
     historical_bootstrap: bool,
     chain_id: str = "CT_501",
+    rank_type: int | None = None,
+    lifecycle: str | None = None,
 ) -> BinanceNormalizedSignal:
     mint = row.get("contractAddress")
     if not isinstance(mint, str) or not mint:
@@ -166,15 +231,20 @@ def normalize_meme_row(
         )
     source_id = row.get("signalId") or row.get("id")
     source_signal_id = str(source_id) if source_id is not None else None
-    stable_id = source_signal_id or f"meme-rush:{_hash_row(row)[:24]}"
-    # The official Meme Rush reference documents createTime as long, but not its
-    # unit. It is intentionally not used as signal time until a live sample proves it.
+    # A changed snapshot must produce a new event even when upstream reuses an
+    # id. Include rankType so the same contract can move through all three
+    # lifecycle feeds without one feed suppressing another.
+    stable_id = f"meme-rush:{rank_type or 'unknown'}:{_hash_row(row)[:24]}"
     fields = {
         "mint": _field(row, normalized_name="mint", source_field="contractAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
-        # On BSC the live Meme Rush response exposes the corresponding Pair
-        # as pairAnchorAddress. Solana keeps this field as raw/unavailable for
-        # pool monitoring because its value is not an EVM Pair address.
-        "pair_address": _field(row, normalized_name="pair_address", source_field="pairAnchorAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        # pairAnchorAddress is the launchpad's quote/anchor asset (the live
+        # BSC values are stablecoin/WBNB-style token addresses), not an AMM
+        # Pair contract. Keep it explicit and never feed it to WSS as a pool.
+        "pair_anchor_address": _field(row, normalized_name="pair_anchor_address", source_field="pairAnchorAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        "pair_address": _field(row, normalized_name="pair_address", source_field="pairAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        # poolAddress is a separate upstream hint.  Like pairAddress it must
+        # be chain-validated before it can ever become a WSS subscription.
+        "pool_address": _field(row, normalized_name="pool_address", source_field="poolAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
         # A bonding-curve contract is only usable when Binance explicitly
         # identifies it.  Do not derive it from the token or marker address.
         "bonding_curve_address": _field(row, normalized_name="bonding_curve_address", source_field="bondingCurveAddress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
@@ -194,12 +264,30 @@ def normalize_meme_row(
         "count_buy_24h": _field(row, normalized_name="count_buy_24h", source_field="countBuy", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
         "count_sell_24h": _field(row, normalized_name="count_sell_24h", source_field="countSell", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
         "progress_pct": _field(row, normalized_name="progress_pct", source_field="progress", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
-        "token_created_at": _field(row, normalized_name="token_created_at", source_field="createTime", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", unavailable_error="timestamp_unit_unknown"),
-        "migrate_time": _field(row, normalized_name="migrate_time", source_field="migrateTime", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", unavailable_error="timestamp_unit_unknown"),
+        "token_created_at": _timestamp_field(row, source_field="createTime", observed_at=fetched_at, endpoint_type="meme_rush"),
+        "migrate_time": _timestamp_field(row, source_field="migrateTime", observed_at=fetched_at, endpoint_type="meme_rush"),
         "dev_sold_percent": _field(row, normalized_name="dev_sold_percent", source_field="devSellPercent", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
         "dev_position": _field(row, normalized_name="dev_position", source_field="devPosition", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
         "migrate_status": _field(row, normalized_name="migrate_status", source_field="migrateStatus", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", integer_value=True),
+        # These are raw audit/risk observations when Meme Rush supplies them.
+        # Missing values stay unavailable; the strategy never infers them from
+        # volume, price, or holder counts.
+        "audit_info_json": _field(row, normalized_name="audit_info_json", source_field="auditInfoJson", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        "tax_rate_buy": _field(row, normalized_name="tax_rate_buy", source_field="taxRateBuy", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
+        "tax_rate_sell": _field(row, normalized_name="tax_rate_sell", source_field="taxRateSell", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
+        "risk_level": _field(row, normalized_name="risk_level", source_field="riskLevel", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        "honeypot": _field(row, normalized_name="honeypot", source_field="honeypot", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush"),
+        "dev_percent": _field(row, normalized_name="dev_percent", source_field="devPercent", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
+        "insider_percent": _field(row, normalized_name="insider_percent", source_field="insiderPercent", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
+        "sniper_percent": _field(row, normalized_name="sniper_percent", source_field="sniperPercent", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
+        "top10_percent": _field(row, normalized_name="top10_percent", source_field="top10Percent", observed_at=fetched_at, source_timestamp=None, endpoint_type="meme_rush", decimal_value=True),
     }
+    if rank_type is not None:
+        fields["rank_type"] = _derived_field(rank_type, source_field="request.rankType", observed_at=fetched_at)
+        fields["lifecycle"] = _derived_field(lifecycle, source_field="request.lifecycle", observed_at=fetched_at)
+    dev_position = fields["dev_position"].value if fields["dev_position"].available else None
+    creator_sold = None if dev_position is None else int(dev_position) == 2
+    fields["creator_sold"] = _derived_field(creator_sold, source_field="derived.devPosition", observed_at=fetched_at)
     chain = "bsc" if chain_id == "56" else "solana" if chain_id == "CT_501" else chain_id
     signal = Signal(
         signal_id=stable_id,

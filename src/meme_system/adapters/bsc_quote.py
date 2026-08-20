@@ -54,6 +54,7 @@ _GET_PANCAKE_PAIR_SELECTOR = "0x" + keccak(text="getPancakePair(address)")[:4].h
 _TRY_BUY_SELECTOR = "0x" + keccak(text="tryBuy(address,uint256,uint256)")[:4].hex()
 _TRY_SELL_SELECTOR = "0x" + keccak(text="trySell(address,uint256)")[:4].hex()
 _GET_FLAP_TOKEN_V6_SELECTOR = "0x" + keccak(text="getTokenV6(address)")[:4].hex()
+_GET_FLAP_TOKEN_V7_SELECTOR = "0x" + keccak(text="getTokenV7(address)")[:4].hex()
 _FLAP_QUOTE_EXACT_INPUT_SELECTOR = "0x" + keccak(text="quoteExactInput((address,address,uint256))")[:4].hex()
 _FOUR_INFO_TYPES = (
     "uint256", "address", "address", "uint256", "uint256", "uint256",
@@ -66,6 +67,10 @@ _FLAP_TOKEN_V6_TYPES = (
     "uint256", "uint256", "uint256", "address", "bool", "bytes32",
     "uint256", "address", "uint256",
 )
+# V7 extends V6 with the selected LP fee profile and DEX id. BSC currently
+# exposes V6 on some deployments, so the reader attempts V7 first and falls
+# back to the compatible V6 reconciliation response.
+_FLAP_TOKEN_V7_TYPES = _FLAP_TOKEN_V6_TYPES + ("uint8", "uint8")
 _FLAP_STATUS_TRADABLE = 1
 _FLAP_STATUS_DEX = 4
 
@@ -129,6 +134,12 @@ class FlapContext:
     native_to_quote_swap_enabled: bool
     tax_rate_bps: int
     progress: int
+    # Quote-side bonding-curve reserve returned by Flap Portal getTokenV6.
+    # It is kept as raw units so the strategy can value it only when a current
+    # native-token USD price is available; no indicative price is fabricated.
+    curve_reserve_raw: int | None = None
+    reconciliation_source: str = "GET_TOKEN_V6"
+    reconciliation_price_raw: int | None = None
 
     @property
     def fundraising_is_native(self) -> bool:
@@ -151,21 +162,38 @@ class _PancakeRouterClient:
         self._process: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
 
-    def health_check(self) -> bool:
+    def health_check(self, *, timeout_sec: float = 1.0) -> bool:
+        """Perform a bounded readiness probe without changing quote semantics.
+
+        Startup and periodic health probes must never hold the strategy loop
+        hostage.  Real buy/sell quote requests retain their longer timeout and
+        retry policy in :meth:`request`.
+        """
         try:
-            result = self.request({"operation": "health"})
+            result = self.request(
+                {"operation": "health"},
+                max_attempts=1,
+                response_timeout_sec=timeout_sec,
+            )
         except BscQuoteUnavailable:
             return False
         return result.get("ready") is True
 
-    def request(self, payload: Mapping[str, object]) -> Mapping[str, object]:
+    def request(
+        self,
+        payload: Mapping[str, object],
+        *,
+        max_attempts: int = 2,
+        response_timeout_sec: float = 25.0,
+    ) -> Mapping[str, object]:
         with self._lock:
-            for attempt in range(2):
+            attempts = max(1, int(max_attempts))
+            for attempt in range(attempts):
                 try:
-                    return self._request_once(payload)
+                    return self._request_once(payload, response_timeout_sec=response_timeout_sec)
                 except BscQuoteUnavailable:
                     self._stop_locked()
-                    if attempt:
+                    if attempt + 1 >= attempts:
                         raise
             raise BscQuoteUnavailable("pancakeswap_quote_unavailable")
 
@@ -190,7 +218,7 @@ class _PancakeRouterClient:
         self._process = process
         return process
 
-    def _request_once(self, payload: Mapping[str, object]) -> Mapping[str, object]:
+    def _request_once(self, payload: Mapping[str, object], *, response_timeout_sec: float = 25.0) -> Mapping[str, object]:
         process = self._process
         if process is None or process.poll() is not None:
             process = self._start_locked()
@@ -199,7 +227,7 @@ class _PancakeRouterClient:
         try:
             process.stdin.write(json.dumps(dict(payload), separators=(",", ":")) + "\n")
             process.stdin.flush()
-            ready, _, _ = select.select([process.stdout], [], [], 25)
+            ready, _, _ = select.select([process.stdout], [], [], max(0.05, float(response_timeout_sec)))
             if not ready:
                 raise BscQuoteUnavailable("pancakeswap_quote_unavailable")
             line = process.stdout.readline()
@@ -284,8 +312,8 @@ class BscReadOnlyQuoteProvider:
     def configured(self) -> bool:
         return self.rpc.configured and self.helper_path.is_file()
 
-    def router_health_check(self) -> bool:
-        return self._router.health_check()
+    def router_health_check(self, *, timeout_sec: float = 1.0) -> bool:
+        return self._router.health_check(timeout_sec=timeout_sec)
 
     def close(self) -> None:
         self._router.close()
@@ -307,6 +335,11 @@ class BscReadOnlyQuoteProvider:
         with self._context_lock:
             cached = self._contexts.get(token)
         return cached if isinstance(cached, (FourMemeContext, FlapContext)) else None
+
+    def resolve_venue(self, mint: str) -> BscVenueContext:
+        """Resolve authoritative launchpad/DEX venue metadata without quoting."""
+
+        return self._context_for(mint)
 
     def quote_candidate(
         self,
@@ -371,6 +404,25 @@ class BscReadOnlyQuoteProvider:
             return self._quote_with_context(self._context_for(mint), side, input_quantity)
         except BscQuoteUnavailable:
             return None
+
+    def quote_with_venue(
+        self,
+        mint: str,
+        side: str,
+        input_quantity: Decimal,
+    ) -> tuple[ExecutableQuote, BscVenueContext]:
+        """Return one current quote together with its authoritative venue.
+
+        Live execution uses this boundary to keep the read-only quote source
+        and the eventual transaction target on the same on-chain venue.
+        """
+
+        if side not in {"buy", "sell"} or input_quantity <= 0:
+            raise BscQuoteUnavailable("invalid_quote_request")
+        context = self._context_for(mint)
+        quote = self._quote_with_context(context, side, input_quantity)
+        refreshed = self.cached_context(mint)
+        return quote, refreshed or context
 
     def _quote_with_context(self, context: BscVenueContext, side: str, input_quantity: Decimal) -> ExecutableQuote:
         if isinstance(context, FlapContext):
@@ -472,32 +524,54 @@ class BscReadOnlyQuoteProvider:
         Binance field is accepted as a venue or funding-asset hint.
         """
 
-        raw = self.rpc.call_hex(
-            self.flap_portal_address,
-            _GET_FLAP_TOKEN_V6_SELECTOR + abi_encode(["address"], [token]).hex(),
-        )
+        query = abi_encode(["address"], [token]).hex()
+        reconciliation_source = "GET_TOKEN_V7"
+        raw = self.rpc.call_hex(self.flap_portal_address, _GET_FLAP_TOKEN_V7_SELECTOR + query)
+        response_types = _FLAP_TOKEN_V7_TYPES
+        if raw in {None, "0x"}:
+            reconciliation_source = "GET_TOKEN_V6_FALLBACK"
+            raw = self.rpc.call_hex(
+                self.flap_portal_address,
+                _GET_FLAP_TOKEN_V6_SELECTOR + query,
+            )
+            response_types = _FLAP_TOKEN_V6_TYPES
         if raw in {None, "0x"}:
             raise BscQuoteUnavailable("flap_context_unavailable")
         try:
-            (
-                status,
-                _reserve,
-                _circulating_supply,
-                _price,
-                _version,
-                _r,
-                _h,
-                _k,
-                _dex_supply_thresh,
-                quote_token,
-                native_to_quote_swap_enabled,
-                _extension_id,
-                tax_rate_bps,
-                pool,
-                progress,
-            ) = abi_decode(list(_FLAP_TOKEN_V6_TYPES), bytes.fromhex(raw[2:]))
+            decoded = abi_decode(list(response_types), bytes.fromhex(raw[2:]))
         except Exception as exc:
-            raise BscQuoteUnavailable("flap_context_unavailable") from exc
+            # Some Portal deployments return non-empty revert/legacy data for
+            # an unknown V7 selector.  Treat that as a V7 miss and retry the
+            # documented BSC V6 shape before failing closed.
+            if response_types != _FLAP_TOKEN_V7_TYPES:
+                raise BscQuoteUnavailable("flap_context_unavailable") from exc
+            reconciliation_source = "GET_TOKEN_V6_FALLBACK"
+            raw = self.rpc.call_hex(self.flap_portal_address, _GET_FLAP_TOKEN_V6_SELECTOR + query)
+            if raw in {None, "0x"}:
+                raise BscQuoteUnavailable("flap_context_unavailable") from exc
+            try:
+                response_types = _FLAP_TOKEN_V6_TYPES
+                decoded = abi_decode(list(response_types), bytes.fromhex(raw[2:]))
+            except Exception as fallback_exc:
+                raise BscQuoteUnavailable("flap_context_unavailable") from fallback_exc
+        (
+            status,
+            reserve,
+            _circulating_supply,
+            price_raw,
+            _version,
+            _r,
+            _h,
+            _k,
+            _dex_supply_thresh,
+            quote_token,
+            native_to_quote_swap_enabled,
+            _extension_id,
+            tax_rate_bps,
+            pool,
+            progress,
+            *v7_fields,
+        ) = decoded
         if int(status) not in {_FLAP_STATUS_TRADABLE, _FLAP_STATUS_DEX}:
             raise BscQuoteUnavailable("flap_context_unavailable")
         quote_address = normalize_bsc_address(quote_token)
@@ -524,6 +598,9 @@ class BscReadOnlyQuoteProvider:
             native_to_quote_swap_enabled=bool(native_to_quote_swap_enabled),
             tax_rate_bps=int(tax_rate_bps),
             progress=int(progress),
+            curve_reserve_raw=int(reserve),
+            reconciliation_source=reconciliation_source,
+            reconciliation_price_raw=int(price_raw),
         )
 
     def _flap_quote(self, context: FlapContext, side: str, quantity: Decimal) -> ExecutableQuote:
@@ -628,6 +705,26 @@ class BscReadOnlyQuoteProvider:
         if output_raw <= 0:
             raise BscQuoteUnavailable(error)
         return output_raw
+
+    def flap_quote_asset_per_bnb(self, context: FlapContext) -> Decimal | None:
+        """Return the verified Flap Portal output for one BNB in quote units.
+
+        This is a read-only ``eth_call`` used only to normalize a Flap venue
+        price into USD.  It deliberately returns no value for a venue that
+        cannot accept native BNB directly, so callers remain fail-closed.
+        """
+        if context.fundraising_is_native:
+            return Decimal("1")
+        if context.fundraising_currency is None or not context.native_to_quote_swap_enabled:
+            return None
+        raw = self._flap_quote_exact_input(
+            ZERO_ADDRESS,
+            context.fundraising_currency,
+            10**18,
+            "flap_quote_asset_conversion_unavailable",
+        )
+        value = _raw_to_decimal(raw, context.fundraising_decimals)
+        return value if value > 0 else None
 
     def _flap_route(self, context: FlapContext, asset_leg: str) -> tuple[str, ...]:
         fundraising = "native" if context.fundraising_is_native else str(context.fundraising_currency)

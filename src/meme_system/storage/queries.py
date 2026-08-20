@@ -180,7 +180,14 @@ class LedgerQueries:
             )
             soft_features = _decode_json(row.pop("position_soft_features_json", None))
             if isinstance(soft_features, dict):
-                for name in ("price_usd", "holders", "market_cap_usd", "liquidity_usd"):
+                for name in (
+                    "price_usd",
+                    "holders",
+                    "market_cap_usd",
+                    "liquidity_usd",
+                    "quote_queue_wait_ms",
+                    "quote_queue_started_at",
+                ):
                     row[name] = soft_features.get(name)
                 if row.get("entry_holders") is None:
                     row["entry_holders"] = soft_features.get("holders")
@@ -188,6 +195,13 @@ class LedgerQueries:
                 if row.get("entry_holders") is None:
                     row["entry_holders"] = None
             row["price_source"] = _price_source(row.get("last_quote_id"))
+            try:
+                entry_holders = int(row["entry_holders"]) if row.get("entry_holders") is not None else None
+                current_holders = int(row["current_holders"]) if row.get("current_holders") is not None else None
+                row["holders_change"] = current_holders - entry_holders if current_holders is not None and entry_holders is not None else None
+                row["holders_change_pct"] = (row["holders_change"] / entry_holders * 100) if entry_holders else None
+            except (TypeError, ValueError):
+                row["holders_change"] = row["holders_change_pct"] = None
             row["price_delta_pct"] = _price_delta_pct(
                 row.get("local_price_sol_per_token"),
                 row.get("jupiter_price_sol_per_token"),

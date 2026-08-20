@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,7 +9,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
-from meme_system.adapters.bsc_live import BscLiveConfig, BscLiveError
+from meme_system.adapters.bsc_live import BscLiveConfig, BscLiveError, BscLiveExecutor
+from meme_system.adapters.bsc_quote import FLAP_PORTAL, FlapContext
 from meme_system.adapters.protocols import ExecutableQuote
 from meme_system.domain.models import BSC_BASELINE_IDENTITY, EntryFeatures, Signal
 from meme_system.engines.ledger import SimulationLedger
@@ -37,13 +39,16 @@ def _quote(side: str, input_quantity: str, output_quantity: str) -> ExecutableQu
 
 
 class FakeLiveExecutor:
-    def __init__(self, *, fail_sell: bool = False) -> None:
+    def __init__(self, *, fail_buy: bool = False, fail_sell: bool = False) -> None:
         self.buy_calls = 0
         self.sell_calls = 0
+        self.fail_buy = fail_buy
         self.fail_sell = fail_sell
 
     def buy(self, mint, amount, *, expected_quote=None):
         self.buy_calls += 1
+        if self.fail_buy:
+            raise BscLiveError("transaction_broadcast_unavailable")
         return SimpleNamespace(
             quote=_quote("buy", str(amount), "5.2"),
             actual_received=Decimal("5.2"),
@@ -91,6 +96,119 @@ class BscLiveConfigTests(unittest.TestCase):
         self.assertEqual(config.slippage_bps, 50)
         self.assertEqual(config.max_entries, 1)
         self.assertEqual(config.helper_path, Path("scripts/pancakeswap_smart_router.cjs"))
+        self.assertEqual(config.broadcast_rpc_urls[0], "https://bsc.example.invalid")
+        self.assertEqual(len(config.broadcast_rpc_urls), 2)
+        self.assertEqual(config.broadcast_rpc_urls[1], "https://bsc-dataseed.bnbchain.org")
+
+    def test_flap_plan_keeps_quote_and_execution_on_official_portal(self) -> None:
+        config = BscLiveConfig.from_mapping(self._values())
+        executor = BscLiveExecutor(config)
+        context = FlapContext(
+            mint="0x1111111111111111111111111111111111111111",
+            token_proxy="0x1111111111111111111111111111111111111111",
+            token_implementation="0x29e6383f0ce68507b5a72a53c2b118a118332aa8",
+            launchpad=FLAP_PORTAL,
+            fundraising_currency=None,
+            fundraising_decimals=18,
+            token_decimals=18,
+            status=1,
+            migrated=False,
+            pancake_pair=None,
+            native_to_quote_swap_enabled=False,
+            tax_rate_bps=0,
+            progress=0,
+        )
+        quote = ExecutableQuote(
+            quote_id="flap:buy",
+            mint=context.mint,
+            side="buy",
+            input_quantity=Decimal("0.001"),
+            output_quantity=Decimal("100"),
+            route_fee=None,
+            price_impact_pct=None,
+            quoted_at=NOW,
+            age_ms=0,
+            quote_source="flap_bonding_curve_quote",
+            provider="flap_bonding_curve_quote",
+        )
+        plan = executor._flap_plan(context, "buy", 10**15, quote)
+        self.assertEqual(plan["venue"], "flap_portal")
+        self.assertEqual(plan["to"].lower(), FLAP_PORTAL)
+        self.assertEqual(plan["value"], str(10**15))
+        self.assertGreater(int(plan["minimumOutputRaw"]), 0)
+        self.assertNotEqual(plan["data"], "0x")
+        executor.close()
+
+    def test_broadcast_uses_the_same_signed_payload_on_one_fallback_only(self) -> None:
+        class _Signer:
+            calls = 0
+
+            def sign_transaction(self, _transaction):
+                self.calls += 1
+                return SimpleNamespace(raw_transaction=b"signed-raw")
+
+        class _Eth:
+            def __init__(self, response):
+                self.response = response
+                self.payloads: list[bytes] = []
+
+            def send_raw_transaction(self, raw):
+                self.payloads.append(raw)
+                if isinstance(self.response, Exception):
+                    raise self.response
+                return self.response
+
+        class _Rpc:
+            def __init__(self, response):
+                self.eth = _Eth(response)
+
+            @staticmethod
+            def keccak(_raw):
+                return b"\x11" * 32
+
+        primary = _Rpc(OSError("transport unavailable"))
+        fallback = _Rpc(b"\x11" * 32)
+        executor = BscLiveExecutor.__new__(BscLiveExecutor)
+        executor._account = _Signer()
+        executor._private_key = "not-a-real-key"
+        executor._web3 = primary
+        executor._broadcast_web3s = (primary, fallback)
+        executor._wait_for_transaction_receipt = lambda tx_hash: {"status": 1, "transactionHash": tx_hash}
+
+        receipt, tx_hash = executor._send_once({"nonce": 7}, 21_000, 50)
+
+        self.assertEqual(receipt["status"], 1)
+        self.assertEqual(tx_hash, "0x" + "11" * 32)
+        self.assertEqual(executor._account.calls, 1)
+        self.assertEqual(primary.eth.payloads, [b"signed-raw"])
+        self.assertEqual(fallback.eth.payloads, [b"signed-raw"])
+
+    def test_broadcast_rejection_is_reported_as_a_safe_reason_code(self) -> None:
+        class _Signer:
+            def sign_transaction(self, _transaction):
+                return SimpleNamespace(raw_transaction=b"signed-raw")
+
+        class _Eth:
+            @staticmethod
+            def send_raw_transaction(_raw):
+                raise ValueError("transaction rejected")
+
+        class _Rpc:
+            eth = _Eth()
+
+            @staticmethod
+            def keccak(_raw):
+                return b"\x22" * 32
+
+        rpc = _Rpc()
+        executor = BscLiveExecutor.__new__(BscLiveExecutor)
+        executor._account = _Signer()
+        executor._private_key = "not-a-real-key"
+        executor._web3 = rpc
+        executor._broadcast_web3s = (rpc, rpc)
+
+        with self.assertRaisesRegex(BscLiveError, "transaction_broadcast_rejected"):
+            executor._send_once({"nonce": 7}, 21_000, 50)
 
 
 class BscLiveEngineTests(unittest.TestCase):
@@ -155,6 +273,30 @@ class BscLiveEngineTests(unittest.TestCase):
                 ("exit_attempt", "pancakeswap_smart_router"),
                 ("exit", "pancakeswap_smart_router"),
             ])
+            connection.close()
+
+    def test_live_entry_records_safe_bsc_error_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            connection = initialize_database(Path(directory) / "runtime.db")
+            ledger = SimulationLedger.recover("live", connection, identity=BSC_BASELINE_IDENTITY)
+            engine = DeterministicSimulation(
+                "live",
+                strategy=BaselineStrategy(
+                    replace(bsc_baseline_config(), position_size_sol=Decimal("0.001"), max_open_positions=1)
+                ),
+                ledger=ledger,
+                pricing_mode="pancakeswap_smart_router",
+                live_executor=FakeLiveExecutor(fail_buy=True),
+                live_max_entries=1,
+            )
+            signal = Signal("sig-live-fail", "0x1111111111111111111111111111111111111111", NOW, "test", "bsc")
+            entry = engine.process_entry(signal, self._features(), "live:failed-candidate", "live:failed-position")
+
+            self.assertIsNone(entry.position)
+            payload_raw = connection.execute(
+                "SELECT payload_json FROM lifecycle_events WHERE event_type = 'LIVE_ENTRY_FAILED'"
+            ).fetchone()[0]
+            self.assertEqual(json.loads(payload_raw)["error_code"], "transaction_broadcast_unavailable")
             connection.close()
 
     def test_failed_live_exit_is_not_retried(self) -> None:

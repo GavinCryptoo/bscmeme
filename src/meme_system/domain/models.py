@@ -61,8 +61,8 @@ class StrategyIdentity:
 BASELINE_IDENTITY = StrategyIdentity(
     strategy_name="sol_ultra_early_baseline",
     ruleset_name="ultra_early_minimal",
-    ruleset_version="0.1.1",
-    config_version="0.1.1",
+    ruleset_version="0.1.2",
+    config_version="0.1.2",
 )
 
 
@@ -71,6 +71,29 @@ BSC_BASELINE_IDENTITY = StrategyIdentity(
     ruleset_name="ultra_early_selective_bsc",
     ruleset_version="0.1.5",
     config_version="0.1.5",
+)
+
+
+SURVIVOR_REVERSAL_IDENTITY = StrategyIdentity(
+    strategy_name="MEME_SURVIVOR_REVERSAL_V1",
+    ruleset_name="survivor_reversal",
+    ruleset_version="1.0.0",
+    config_version="1.0.0",
+)
+
+
+BALANCED_SURVIVOR_REVERSAL_IDENTITY = StrategyIdentity(
+    strategy_name="MEME_SURVIVOR_BALANCED_V1",
+    ruleset_name="survivor_balanced",
+    ruleset_version="1.0.0",
+    config_version="1.0.0",
+)
+
+SOL_SURVIVOR_REVERSAL_IDENTITY = StrategyIdentity(
+    strategy_name="MEME_SURVIVOR_REVERSAL_SOL_V1",
+    ruleset_name="survivor_reversal_sol",
+    ruleset_version="1.0.0",
+    config_version="1.0.0",
 )
 
 
@@ -106,6 +129,12 @@ class VirtualPosition:
     opened_at: datetime
     entry_quantity_token: Decimal = Decimal("0")
     remaining_quantity_token: Decimal = Decimal("0")
+    realized_proceeds_sol: Decimal = Decimal("0")
+    realized_route_fee_sol: Decimal = Decimal("0")
+    realized_network_fee_sol: Decimal = Decimal("0")
+    realized_priority_fee_sol: Decimal = Decimal("0")
+    tp1_executed_at: datetime | None = None
+    tp2_executed_at: datetime | None = None
     entry_quote_id: str | None = None
     token_name: str | None = None
     raw_name: str | None = None
@@ -116,6 +145,9 @@ class VirtualPosition:
     # 0 = historical lifecycle; 1 = Solana atomic price snapshots.
     price_snapshot_version: int = 0
     entry_holders: int | None = None
+    current_holders: int | None = None
+    holders_observed_at: datetime | None = None
+    holders_source: str | None = None
     entry_liquidity_usd: Decimal | None = None
     exit_holders: int | None = None
     exit_holders_observed_at: datetime | None = None
@@ -136,6 +168,9 @@ class VirtualPosition:
     local_price_observed_at: datetime | None = None
     local_price_source: str | None = None
     local_return_pct: Decimal | None = None
+    observed_price_native: Decimal | None = None
+    observed_price_at: datetime | None = None
+    observed_price_source: str | None = None
     jupiter_price_sol_per_token: Decimal | None = None
     jupiter_price_observed_at: datetime | None = None
     jupiter_return_pct: Decimal | None = None

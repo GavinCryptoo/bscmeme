@@ -19,9 +19,11 @@ from urllib.parse import parse_qs, urlparse
 from meme_system.config.dashboard import DashboardConfig
 from meme_system.config.runtime import RuntimePaths
 from meme_system.config.safety import SafetyConfig
-from meme_system.domain.models import BSC_BASELINE_IDENTITY, BASELINE_IDENTITY
+from meme_system.domain.models import BSC_BASELINE_IDENTITY, BASELINE_IDENTITY, SOL_SURVIVOR_REVERSAL_IDENTITY, SURVIVOR_REVERSAL_IDENTITY
 from meme_system.runtime_ops import RuntimeControl
 from meme_system.strategies.baseline import bsc_baseline_config, solana_baseline_config
+from meme_system.strategies.survivor_reversal import SurvivorReversalConfig
+from meme_system.strategies.sol_survivor_reversal import SolSurvivorReversalConfig
 from meme_system.storage.database import initialize_database
 from meme_system.storage.queries import LedgerQueries
 
@@ -62,6 +64,8 @@ class DashboardService:
             return 200, self.status(chain)
         if path == "/api/health":
             return 200, self.health(chain)
+        if path == "/api/survivor":
+            return 200, self.survivor(chain, _survivor_limit(query), _strategy(query))
         if path == "/api/control":
             return 200, self._control(chain).snapshot()
         if path == "/api/config":
@@ -507,6 +511,18 @@ class DashboardService:
                         "WHERE c.mode = ?" + candidate_where,
                         candidate_params,
                     ).fetchone()[0],
+                    "accepted_candidates": connection.execute(
+                        "SELECT COUNT(*) FROM candidates c "
+                        "JOIN signals s ON s.signal_id = c.signal_id "
+                        "WHERE c.mode = ? AND c.status = 'ACCEPTED'" + candidate_where,
+                        candidate_params,
+                    ).fetchone()[0],
+                    "rejected_candidates": connection.execute(
+                        "SELECT COUNT(*) FROM candidates c "
+                        "JOIN signals s ON s.signal_id = c.signal_id "
+                        "WHERE c.mode = ? AND c.status = 'REJECTED'" + candidate_where,
+                        candidate_params,
+                    ).fetchone()[0],
                     "open_positions": connection.execute(
                         "SELECT COUNT(*) FROM virtual_positions "
                         "WHERE mode = ? AND status != 'CLOSED'" + position_where,
@@ -539,6 +555,8 @@ class DashboardService:
                     else (None if chain == "solana" else control.paused(mode))
                 ),
             }
+            if mode == "paper":
+                mode_payload["survivor_reversal"] = self._survivor_state(connection, chain)
             if chain == "solana":
                 mode_payload["runtime_control"] = runner_control or {
                     "state": "UNKNOWN",
@@ -558,7 +576,7 @@ class DashboardService:
                 "pricing_mode": "bsc_executable_quote" if chain == "bsc" else "jupiter_quote",
                 "executable_quote": True,
                 "net_pnl_is_estimated": False if chain == "bsc" else None,
-                "reference_pricing_mode": "binance_indicative_reference" if chain == "bsc" else None,
+                "reference_pricing_mode": "binance_meme_rush_layer_a" if chain == "bsc" else None,
             },
             "safety": {
                 "paper_only": self.safety.paper_only,
@@ -570,6 +588,231 @@ class DashboardService:
             },
             "modes": modes,
         }
+
+    def survivor(self, chain: str = "bsc", limit: int = 100, strategy: str = "high") -> dict[str, object]:
+        """Expose the strategy-specific state written by the Paper runner."""
+
+        if strategy == "balanced" and chain == "bsc":
+            path = Path("data/bsc-balanced/paper/runtime.db")
+            if not path.exists():
+                return {"status": "ok", "chain": "bsc-mainnet", "mode": "paper", "strategy": strategy, "survivor_reversal": {"state": "NOT_STARTED"}, "ledger_summary": {}, "candidates": [], "positions": []}
+            connection = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection = self._connection("paper", chain)
+        with connection:
+            state = self._survivor_state(connection, chain, strategy)
+            display_since = self._display_since(connection, "paper", chain)
+            ledger_summary = self._survivor_paper_summary(
+                connection,
+                "SOL" if chain == "solana" else "BNB",
+                display_since=display_since,
+            )
+            candidate_limit = max(1, min(5000, int(limit)))
+            # The current-candidate module is a trading-facing view.  Do not
+            # mix in raw discovery history or LIGHT_TRACKING/EXPIRED rows;
+            # those records remain available through runtime diagnostics and
+            # database history, but they are not current candidates.
+            if chain == "solana":
+                # A read-only display defense: the Paper engine is the source
+                # of truth, but a stale persisted row above the SOL hard cap
+                # must never reappear as a trading-facing Candidate.
+                max_price = Decimal(os.environ.get("SOL_MAX_CANDIDATE_PRICE_USD", "0.0001"))
+                active_candidate_rows = connection.execute(
+                    "SELECT * FROM survivor_candidates "
+                    "WHERE state = 'ACTIVE_CANDIDATE' AND active_candidate=1 "
+                    "AND (current_price_usd IS NULL OR CAST(current_price_usd AS REAL) < ?) "
+                    "ORDER BY updated_at DESC, first_seen_at DESC",
+                    (float(max_price),),
+                ).fetchall()
+            else:
+                active_candidate_rows = connection.execute(
+                    "SELECT * FROM survivor_candidates "
+                    "WHERE state = 'ACTIVE_CANDIDATE' "
+                    "ORDER BY updated_at DESC, first_seen_at DESC"
+                ).fetchall()
+            candidate_rows = active_candidate_rows
+            # Balanced Paper was intentionally introduced with a narrower
+            # survivor_positions schema.  The Dashboard must remain a
+            # read-only consumer of both that runtime and the richer legacy
+            # schema; missing presentation-only snapshot fields are NULL, not
+            # an API failure.
+            position_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(survivor_positions)").fetchall()
+            }
+            optional_position_fields = (
+                "entry_price_usd", "exit_price_native", "exit_price_usd",
+                "entry_holders", "exit_holders", "entry_market_cap_usd",
+                "exit_market_cap_usd", "entry_liquidity_usd", "exit_liquidity_usd",
+                "exit_trigger_reason", "exit_trigger_pnl_pct",
+                "exit_trigger_price_native", "exit_triggered_at",
+            )
+            optional_position_select = ", ".join(
+                f"p.{field}" if field in position_columns else f"NULL AS {field}"
+                for field in optional_position_fields
+            )
+            survivor_position_rows = connection.execute(
+                "SELECT p.position_id, p.mint, p.symbol, p.opened_at, p.closed_at, p.status, "
+                "p.entry_price_native, p.current_price_native, p.quantity_token, p.last_trade_at, "
+                "p.remaining_quantity_token, p.invested_bnb, p.realized_bnb, p.pnl_pct, "
+                "p.exit_reason, p.tp1_at, p.tp2_at, p.trailing_active, p.quote_source, p.updated_at, "
+                + optional_position_select + ", "
+                "c.holders AS holders, c.market_cap_usd AS market_cap_usd, c.liquidity_usd AS liquidity_usd, "
+                "c.price_updated_at AS price_updated_at "
+                "FROM survivor_positions p "
+                "LEFT JOIN survivor_candidates c ON c.mint = p.mint "
+                "ORDER BY p.opened_at DESC LIMIT ?",
+                (max(1, min(5000, int(limit))),),
+            ).fetchall()
+            survivor_positions = []
+            for row in survivor_position_rows:
+                payload = dict(row)
+                # Survivor pnl_pct is stored in percentage points.  Expose an
+                # explicit field so the UI never treats it as a decimal ratio.
+                payload["pnl_rate_pct"] = payload.get("pnl_pct")
+                payload["pnl_basis"] = "EXECUTABLE_QUOTE" if payload.get("status") == "CLOSED" else "WSS_MARK"
+                if payload.get("status") != "CLOSED" and payload.get("price_updated_at"):
+                    try:
+                        updated_at = datetime.fromisoformat(str(payload["price_updated_at"]).replace("Z", "+00:00"))
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=timezone.utc)
+                        payload["price_is_stale"] = (datetime.now(timezone.utc) - updated_at).total_seconds() > 1800
+                    except ValueError:
+                        payload["price_is_stale"] = True
+                else:
+                    payload["price_is_stale"] = False
+                payload["source"] = "survivor_reversal"
+                survivor_positions.append(payload)
+            return {
+                "status": "ok",
+                "chain": "bsc-mainnet" if chain == "bsc" else "solana-mainnet",
+                "mode": "paper",
+                "strategy": strategy,
+                "survivor_reversal": state,
+                "ledger_summary": ledger_summary,
+                "candidates": [dict(row) | {"source": "survivor_reversal"} for row in candidate_rows],
+                "positions": survivor_positions,
+            }
+
+    @staticmethod
+    def _paper_ledger_summary(
+        connection: sqlite3.Connection,
+        display_since: str | None = None,
+    ) -> dict[str, object]:
+        """Small summary query for the dashboard; avoids the heavier analytics join."""
+
+        since_signal = " AND s.observed_at >= ?" if display_since else ""
+        since_candidate = " AND s.observed_at >= ?" if display_since else ""
+        since_position = " AND opened_at >= ?" if display_since else ""
+        since_params = (display_since,) if display_since else ()
+        signals = int(connection.execute(
+            "SELECT COUNT(*) FROM signals s "
+            "JOIN candidates c ON c.signal_id = s.signal_id AND c.mode = 'paper' "
+            "WHERE 1=1" + since_signal,
+            since_params,
+        ).fetchone()[0])
+        accepted = int(connection.execute(
+            "SELECT COUNT(*) FROM candidates c JOIN signals s ON s.signal_id = c.signal_id "
+            "WHERE c.mode = 'paper' AND c.status = 'ACCEPTED'" + since_candidate,
+            since_params,
+        ).fetchone()[0])
+        rejected = int(connection.execute(
+            "SELECT COUNT(*) FROM candidates c JOIN signals s ON s.signal_id = c.signal_id "
+            "WHERE c.mode = 'paper' AND c.status = 'REJECTED'" + since_candidate,
+            since_params,
+        ).fetchone()[0])
+        open_positions = int(connection.execute(
+            "SELECT COUNT(*) FROM virtual_positions WHERE mode = 'paper' AND status != 'CLOSED'" + since_position,
+            since_params,
+        ).fetchone()[0])
+        closed_positions = int(connection.execute(
+            "SELECT COUNT(*) FROM virtual_positions WHERE mode = 'paper' AND status = 'CLOSED'" + since_position,
+            since_params,
+        ).fetchone()[0])
+        row = connection.execute(
+            "SELECT COUNT(*) AS count, "
+            "SUM(CASE WHEN e.net_pnl_estimated_sol > 0 THEN 1 ELSE 0 END) AS wins, "
+            "SUM(CASE WHEN e.net_pnl_estimated_sol < 0 THEN 1 ELSE 0 END) AS losses, "
+            "COALESCE(SUM(e.net_pnl_estimated_sol), 0) AS pnl "
+            "FROM executions e JOIN virtual_positions p ON p.position_id = e.position_id "
+            "WHERE e.mode = 'paper' AND e.action = 'exit' "
+            "AND e.net_pnl_estimated_sol IS NOT NULL"
+            + (" AND p.opened_at >= ?" if display_since else ""),
+            since_params,
+        ).fetchone()
+        return {
+            "signals": signals,
+            "accepted_candidates": accepted,
+            "rejected_candidates": rejected,
+            "open_positions": open_positions,
+            "closed_positions": closed_positions,
+            "closed_trade_count": int(row["count"] or 0),
+            "profitable_trade_count": int(row["wins"] or 0),
+            "losing_trade_count": int(row["losses"] or 0),
+            "amount_bnb": str(row["pnl"] or "0"),
+            "amount_native": str(row["pnl"] or "0"),
+            "native_symbol": "BNB",
+            "positions_included": False,
+        }
+
+    @staticmethod
+    def _survivor_paper_summary(
+        connection: sqlite3.Connection,
+        native_symbol: str,
+        display_since: str | None = None,
+    ) -> dict[str, object]:
+        """Summarize only this Survivor strategy's positions in its native asset."""
+
+        row = connection.execute(
+            "SELECT "
+            "SUM(CASE WHEN status != 'CLOSED' THEN 1 ELSE 0 END) AS open_positions, "
+            "SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_positions, "
+            "SUM(CASE WHEN status = 'CLOSED' AND (CAST(realized_bnb AS REAL) - CAST(invested_bnb AS REAL)) > 0 THEN 1 ELSE 0 END) AS wins, "
+            "SUM(CASE WHEN status = 'CLOSED' AND (CAST(realized_bnb AS REAL) - CAST(invested_bnb AS REAL)) < 0 THEN 1 ELSE 0 END) AS losses, "
+            "COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN CAST(realized_bnb AS REAL) - CAST(invested_bnb AS REAL) ELSE 0 END), 0) AS pnl "
+            "FROM survivor_positions"
+            + (" WHERE opened_at >= ?" if display_since else ""),
+            (display_since,) if display_since else (),
+        ).fetchone()
+        closed = int(row["closed_positions"] or 0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        counted = wins + losses
+        return {
+            "signals": 0,
+            "accepted_candidates": 0,
+            "rejected_candidates": 0,
+            "open_positions": int(row["open_positions"] or 0),
+            "closed_positions": closed,
+            "closed_trade_count": closed,
+            "profitable_trade_count": wins,
+            "losing_trade_count": losses,
+            "win_rate_pct": (wins / counted * 100) if counted else None,
+            "amount_native": str(row["pnl"] or "0"),
+            "native_symbol": native_symbol,
+            "positions_included": True,
+        }
+
+    @staticmethod
+    def _survivor_state(connection: sqlite3.Connection, chain: str = "bsc", strategy: str = "high") -> dict[str, object]:
+        state_key = "survivor_balanced_v1" if chain == "bsc" and strategy == "balanced" else "survivor_reversal_v1" if chain == "bsc" else "survivor_reversal_sol_v1"
+        strategy = SURVIVOR_REVERSAL_IDENTITY.strategy_name if chain == "bsc" else SOL_SURVIVOR_REVERSAL_IDENTITY.strategy_name
+        row = connection.execute(
+            "SELECT value_json, updated_at FROM runtime_state WHERE mode = 'paper' AND state_key = ?",
+            (state_key,),
+        ).fetchone()
+        if row is None:
+            return {"state": "NOT_STARTED", "strategy": strategy}
+        try:
+            value = json.loads(row["value_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = {"state": "CORRUPT"}
+        if not isinstance(value, dict):
+            value = {"state": "CORRUPT"}
+        value.setdefault("updated_at", row["updated_at"])
+        return value
 
     @staticmethod
     def _pnl_summary(
@@ -683,6 +926,57 @@ class DashboardService:
 
     def config_payload(self, chain: str = "solana") -> dict[str, object]:
         is_bsc = chain == "bsc"
+        if is_bsc:
+            survivor_config = SurvivorReversalConfig.from_env()
+            return {
+                "chain": "bsc-mainnet",
+                "chain_key": "bsc",
+                "chain_id": "56",
+                "pricing": {
+                    "pricing_mode": "bsc_executable_quote",
+                    "executable_quote": True,
+                    "net_pnl_is_estimated": False,
+                    "reference_pricing_mode": None,
+                },
+                "strategy": SURVIVOR_REVERSAL_IDENTITY.strategy_name,
+                "ruleset_name": SURVIVOR_REVERSAL_IDENTITY.ruleset_name,
+                "ruleset_version": SURVIVOR_REVERSAL_IDENTITY.ruleset_version,
+                "display_name": "Meme Survivor Reversal V1 Paper",
+                "display_ruleset_name": SURVIVOR_REVERSAL_IDENTITY.strategy_name,
+                "live_engine": False,
+                "wallet_path": None,
+                "signing_path": None,
+                "survivor_v1": survivor_config.effective_values(),
+                "config_self_check": survivor_config.self_check(),
+                "legacy_gates_enabled": False,
+                "legacy_fields_for_gate": [],
+                "allow_live_trading": False,
+                "execution_provider": "paper",
+            }
+        sol_survivor = SolSurvivorReversalConfig.from_env()
+        if sol_survivor.enabled:
+            return {
+                "chain": "solana-mainnet",
+                "chain_key": "solana",
+                "chain_id": "CT_501",
+                "pricing": {
+                    "pricing_mode": "solana_protocol_or_jupiter_readonly_quote",
+                    "executable_quote": True,
+                    "binance_indicative_reference_only": True,
+                },
+                "strategy": SOL_SURVIVOR_REVERSAL_IDENTITY.strategy_name,
+                "ruleset_name": SOL_SURVIVOR_REVERSAL_IDENTITY.ruleset_name,
+                "ruleset_version": SOL_SURVIVOR_REVERSAL_IDENTITY.ruleset_version,
+                "display_name": "Meme Survivor Reversal SOL V1 Paper",
+                "display_ruleset_name": SOL_SURVIVOR_REVERSAL_IDENTITY.strategy_name,
+                "live_engine": False,
+                "wallet_path": None,
+                "signing_path": None,
+                "survivor_v1": sol_survivor.effective_values(),
+                "config_self_check": sol_survivor.self_check(),
+                "allow_live_trading": False,
+                "execution_provider": "paper",
+            }
         config = bsc_baseline_config() if is_bsc else solana_baseline_config()
         entry_config = (
             {
@@ -769,10 +1063,15 @@ class DashboardService:
                     "take_profit_pct": str(config.take_profit_pct * 100),
                     "stop_loss_trigger_pct": str(config.stop_loss_trigger_pct * 100),
                     "max_hold_sec": config.max_hold_sec,
-                    "take_profit_sell_pct": "100",
+                    "take_profit_sell_pct": str(config.partial_take_profit_sell_pct * 100),
                     "stop_loss_sell_pct": "100",
-                    "partial_take_profit_enabled": False,
-                    "moving_stop_enabled": False,
+                    "partial_take_profit_enabled": config.partial_take_profit_enabled,
+                    "take_profit_1_pct": str(config.take_profit_1_pct * 100),
+                    "take_profit_1_sell_pct": str(config.partial_take_profit_sell_pct * 100),
+                    "take_profit_2_pct": str(config.take_profit_2_pct * 100),
+                    "take_profit_2_sell_pct": str(config.partial_take_profit_sell_pct * 100),
+                    "tp2_breakeven_exit_enabled": config.tp2_breakeven_exit_enabled,
+                    "moving_stop_enabled": config.tp2_breakeven_exit_enabled,
                 },
                 "shadow_exit": {
                     "shadow_defense_pct": str(config.shadow_defense_pct * 100),
@@ -812,7 +1111,13 @@ class DashboardService:
     def _connection(self, mode: str, chain: str = "solana") -> sqlite3.Connection:
         paths = self._paths(chain)
         path = paths.paper_db if mode == "paper" else paths.shadow_db
-        return initialize_database(path)
+        if not path.exists():
+            return initialize_database(path)
+        connection = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA query_only=ON")
+        return connection
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -887,8 +1192,19 @@ def _chain(query: Mapping[str, list[str]]) -> str:
     return value
 
 
+def _strategy(query: Mapping[str, list[str]]) -> str:
+    return "balanced" if (_one(query, "strategy", "high") or "high").lower() == "balanced" else "high"
+
+
 def _limit(query: Mapping[str, list[str]]) -> int:
     try:
         return max(1, min(1000, int(_one(query, "limit", "100") or "100")))
+    except ValueError:
+        return 100
+
+
+def _survivor_limit(query: Mapping[str, list[str]]) -> int:
+    try:
+        return max(1, min(5000, int(_one(query, "limit", "100") or "100")))
     except ValueError:
         return 100

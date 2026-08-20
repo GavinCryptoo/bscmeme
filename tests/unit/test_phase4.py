@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from queue import Queue
 from unittest.mock import patch
 
 from meme_system.adapters.bsc_wss import (
@@ -23,15 +24,19 @@ from meme_system.adapters.bsc_wss import (
 )
 from meme_system.adapters.binance_web3.normalizer import normalize_meme_row
 from meme_system.adapters.binance_web3.normalizer import normalize_dynamic
+from meme_system.adapters.binance_web3.models import ObservedField
 from meme_system.adapters.jupiter import JupiterReadOnlyQuoteProvider
+from meme_system.adapters.protocols import ExecutableQuote
 from meme_system.adapters.pump_readonly import _b58decode, _b58encode
 from meme_system.config.service import ConfigService
 from meme_system.dashboard_server import DashboardService
 from meme_system.domain.models import BASELINE_IDENTITY, EntryFeatures, VirtualPosition
 from meme_system.engines.ledger import SimulationLedger
 from meme_system.engines.simulation import DeterministicSimulation
+from meme_system.strategies.baseline import BaselineStrategy, bsc_baseline_config, solana_baseline_config
 from meme_system.realtime import (
     BinanceRealtimeFeatureProvider,
+    ExitBackfillResult,
     ExitHoldersBackfill,
     ExitMarketBackfill,
     PendingSignalObservation,
@@ -40,7 +45,6 @@ from meme_system.realtime import (
 from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, LatencyRecorder, RuntimeControl, SingleInstanceLock
 from meme_system.config.runtime import RuntimePaths
 from meme_system.storage.database import initialize_database
-from meme_system.storage.exit_holders import database_path
 from meme_system.storage.runtime_store import RuntimeStore
 from meme_system.telegram_control import TelegramConfig, TelegramControl
 
@@ -103,26 +107,28 @@ class Phase4Tests(unittest.TestCase):
                     )
 
             features = _Features()
-            worker = ExitHoldersBackfill(
-                features,
-                {"paper": database_path(connection)},
-                retry_delay_sec=0,
-            )
+            results: Queue[ExitBackfillResult] = Queue()
+            worker = ExitHoldersBackfill(features, {"paper": results}, retry_delay_sec=0)
             started = time.monotonic()
             self.assertTrue(worker.submit("paper", position))
             self.assertLess(time.monotonic() - started, 0.5)
             deadline = time.monotonic() + 2
-            row = None
+            result = None
             while time.monotonic() < deadline:
-                row = connection.execute(
-                    "SELECT exit_holders, exit_holders_status, exit_holders_source "
-                    "FROM virtual_positions WHERE position_id = ?",
-                    (position.position_id,),
-                ).fetchone()
-                if row[1] == "completed":
+                if not results.empty():
+                    result = results.get_nowait()
                     break
                 time.sleep(0.01)
-            self.assertEqual(tuple(row), (44, "completed", "binance_dynamic"))
+            self.assertIsNotNone(result)
+            self.assertTrue(result.success)
+            self.assertEqual(result.holders_at_exit, 44)
+            self.assertEqual(
+                tuple(connection.execute(
+                    "SELECT exit_holders, exit_holders_status FROM virtual_positions WHERE position_id = ?",
+                    (position.position_id,),
+                ).fetchone()),
+                (None, "pending"),
+            )
             self.assertEqual(features.attempts, 3)
             worker.shutdown()
             connection.close()
@@ -173,27 +179,117 @@ class Phase4Tests(unittest.TestCase):
                     )
 
             features = _Features()
-            worker = ExitMarketBackfill(
-                features,
-                {"paper": database_path(connection)},
-                retry_delay_sec=0,
-            )
+            results: Queue[ExitBackfillResult] = Queue()
+            worker = ExitMarketBackfill(features, {"paper": results}, retry_delay_sec=0)
             self.assertTrue(worker.submit("paper", position))
             deadline = time.monotonic() + 2
-            row = None
+            result = None
             while time.monotonic() < deadline:
-                row = connection.execute(
-                    "SELECT exit_market_cap_usd, exit_liquidity_usd, exit_market_status, "
-                    "exit_market_source FROM virtual_positions WHERE position_id = ?",
-                    (position.position_id,),
-                ).fetchone()
-                if row[2] == "completed":
+                if not results.empty():
+                    result = results.get_nowait()
                     break
                 time.sleep(0.01)
-            self.assertEqual(tuple(row), ("1800", "210", "completed", "binance_dynamic"))
+            self.assertIsNotNone(result)
+            self.assertTrue(result.success)
+            self.assertEqual(result.market_cap_at_exit, Decimal("1800"))
+            self.assertEqual(result.liquidity_at_exit, Decimal("210"))
+            self.assertEqual(
+                tuple(connection.execute(
+                    "SELECT exit_market_cap_usd, exit_market_status FROM virtual_positions WHERE position_id = ?",
+                    (position.position_id,),
+                ).fetchone()),
+                (None, "pending"),
+            )
             self.assertEqual(features.attempts, 3)
             worker.shutdown()
             connection.close()
+
+    def _assert_exit_backfill_owner_writer_stress(self, mode: str) -> None:
+        """Exercise 1,000 holder + 1,000 market results through one owner DB."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = initialize_database(root / f"{mode}.db")
+            ledger = SimulationLedger(mode, connection=connection)
+            engine = DeterministicSimulation(mode, ledger=ledger)
+
+            class _Features:
+                is_bsc = False
+                solana_price_monitor = None
+
+                def fetch_exit_holders_snapshot(self, position):
+                    return normalize_dynamic(
+                        {"holders": "77"}, mint=position.mint, chain_id="CT_501", fetched_at=NOW,
+                    )
+
+                def fetch_exit_market_snapshot(self, position):
+                    return normalize_dynamic(
+                        {"marketCap": "1800", "liquidity": "210"},
+                        mint=position.mint, chain_id="CT_501", fetched_at=NOW,
+                    )
+
+            coordinator = RealtimeCoordinator(
+                source=_Source(None), features=_Features(), engines={mode: engine},
+                controls=RuntimeControl(root / "control.json"),
+                health={mode: HealthRegistry(root / "health.json")}, latency=LatencyRecorder(),
+                stores={mode: RuntimeStore(connection, mode)},
+                audits={mode: JsonlAuditWriter(root / "events.jsonl")}, clock=lambda: NOW,
+            )
+            positions = []
+            rows = []
+            for index in range(1000):
+                position = VirtualPosition(
+                    position_id=f"{mode}:exit-backfill:{index}", mint=f"Mint{index}", mode=mode,
+                    identity=BASELINE_IDENTITY, quantity_sol=Decimal("0.001"), opened_at=NOW,
+                    entry_quantity_token=Decimal("1000"), status="CLOSED", closed_at=NOW,
+                    exit_holders_status="pending", exit_market_status="pending",
+                )
+                positions.append(position)
+                ledger.closed_positions[position.position_id] = position
+                rows.append((
+                    position.position_id, position.mint, mode,
+                    position.identity.strategy_name, position.identity.ruleset_name,
+                    position.identity.ruleset_version, position.identity.config_version,
+                    "0.001", NOW.isoformat(), "CLOSED", "1000", "0", NOW.isoformat(),
+                    "stress", "pending", "pending",
+                ))
+            connection.executemany(
+                "INSERT INTO virtual_positions(position_id, mint, mode, strategy_name, ruleset_name, "
+                "ruleset_version, config_version, quantity_sol, opened_at, status, "
+                "entry_quantity_token, remaining_quantity_token, closed_at, closed_reason, "
+                "exit_holders_status, exit_market_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            connection.commit()
+            for position in positions:
+                self.assertTrue(coordinator._exit_holders_backfill.submit(mode, position))
+                self.assertTrue(coordinator._exit_market_backfill.submit(mode, position))
+            deadline = time.monotonic() + 15
+            while coordinator._exit_backfill_results[mode].qsize() < 2000 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(coordinator._exit_backfill_results[mode].qsize(), 2000)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM virtual_positions WHERE exit_holders_status = 'pending' OR exit_market_status = 'pending'"
+            ).fetchone()[0], 1000)
+            with coordinator._db_lock:
+                coordinator._drain_exit_backfill_results()
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM virtual_positions WHERE exit_holders_status = 'completed' AND exit_market_status = 'completed'"
+            ).fetchone()[0], 1000)
+            metrics = coordinator._exit_backfill_metrics[mode]
+            self.assertEqual(metrics["db_commit_error_count"], 0)
+            self.assertEqual(metrics["db_locked_error_count"], 0)
+            self.assertEqual(metrics["db_write_error_count"], 0)
+            self.assertEqual(metrics["exit_backfill_duplicate_write"], 0)
+            self.assertEqual(metrics["exit_backfill_completed"], 2000)
+            coordinator.shutdown()
+            connection.close()
+
+    def test_solana_exit_backfill_1000_results_have_one_owner_writer(self) -> None:
+        self._assert_exit_backfill_owner_writer_stress("paper")
+
+    def test_bsc_shadow_exit_backfill_1000_results_have_one_owner_writer(self) -> None:
+        self._assert_exit_backfill_owner_writer_stress("shadow")
 
     def test_bsc_pair_wss_filters_valid_pair_and_decodes_only_swap_sync(self) -> None:
         pair = "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8"
@@ -253,7 +349,7 @@ class Phase4Tests(unittest.TestCase):
         record = normalize_meme_row(
             {
                 "contractAddress": "BscMint",
-                "pairAnchorAddress": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
+                "pairAddress": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
                 "symbol": "躺平",
                 "name": "BSC Alpha",
                 "price": "2",
@@ -312,7 +408,7 @@ class Phase4Tests(unittest.TestCase):
         record = normalize_meme_row(
             {
                 "contractAddress": "BscMint",
-                "pairAnchorAddress": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
+                "pairAddress": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
                 "symbol": "躺平",
                 "price": "2",
                 "marketCap": "1000",
@@ -364,12 +460,17 @@ class Phase4Tests(unittest.TestCase):
         class _Rpc:
             configured = True
 
+            def get_code(self, _address):
+                return "0x01"
+
             def call_address(self, _to, selector):
                 return wbnb if selector == "0x0dfe1681" else mint
 
             def call_hex(self, _to, data):
                 if data == "0x0902f1ac":
-                    return "0x" + "0" * 64 + "0" * 64 + "0" * 64
+                    return "0x" + f"{10 ** 18:064x}" + f"{10 ** 21:064x}" + "0" * 64
+                if data.startswith("0xe6a43905"):
+                    return "0x" + "0" * 64
                 return "0x" + "0" * 63 + "12"
 
             def call_uint(self, _to, _selector):
@@ -395,7 +496,7 @@ class Phase4Tests(unittest.TestCase):
         record = normalize_meme_row(
             {
                 "contractAddress": mint,
-                "pairAnchorAddress": pair,
+                "pairAddress": pair,
                 "symbol": "WSS",
                 "price": "2",
                 "marketCap": "1000",
@@ -457,6 +558,66 @@ class Phase4Tests(unittest.TestCase):
             self.assertTrue(executions)
             self.assertTrue(executions[-1].quote_id.startswith("bsc-pool-wss:"))
             connection.close()
+
+    def test_bsc_pool_resolver_discovers_factory_pair_after_invalid_binance_address(self) -> None:
+        mint = "0x" + "1" * 40
+        invalid = "0x" + "2" * 40
+        pair = "0x" + "3" * 40
+        wbnb = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+
+        class _Rpc:
+            configured = True
+
+            def get_code(self, address):
+                return "0x" if address == invalid else "0x01"
+
+            def call_address(self, _to, selector):
+                return mint if selector == "0x0dfe1681" else wbnb
+
+            def call_hex(self, to, data):
+                if data.startswith("0xe6a43905"):
+                    return "0x" + "0" * 24 + pair[2:]
+                if to == pair and data == "0x0902f1ac":
+                    return "0x" + f"{10 ** 21:064x}" + f"{10 ** 18:064x}" + "0" * 64
+                return "0x" + "0" * 64
+
+            def call_uint(self, _to, _selector):
+                return 18
+
+        outcome = BscPoolResolver(_Rpc()).resolve_pancake_v2(
+            mint, (invalid,), quote_asset_usd={wbnb: Decimal("600")},
+        )
+        self.assertEqual(outcome.status, "VALID")
+        self.assertEqual(outcome.pool_source, "PANCAKE_V2_FACTORY")
+        self.assertEqual(outcome.descriptor.address, pair)
+        self.assertEqual(outcome.reserves, (10 ** 21, 10 ** 18))
+
+    def test_bsc_pool_resolver_keeps_unknown_quote_as_valid_pool(self) -> None:
+        mint = "0x" + "1" * 40
+        quote = "0x" + "4" * 40
+        pair = "0x" + "3" * 40
+
+        class _Rpc:
+            configured = True
+
+            def get_code(self, _address):
+                return "0x01"
+
+            def call_address(self, _to, selector):
+                return mint if selector == "0x0dfe1681" else quote
+
+            def call_hex(self, _to, data):
+                if data == "0x0902f1ac":
+                    return "0x" + f"{10 ** 21:064x}" + f"{10 ** 18:064x}" + "0" * 64
+                return None
+
+            def call_uint(self, _to, _selector):
+                return 18
+
+        outcome = BscPoolResolver(_Rpc())._validate_v2_pair(mint, pair, quote_asset_usd=None)
+        self.assertEqual(outcome.status, "VALID")
+        self.assertIsNotNone(outcome.descriptor)
+        self.assertEqual(outcome.quote_asset, quote)
 
     def test_bsc_v3_swap_price_requires_sqrt_price_and_wbnb_pair(self) -> None:
         mint = "0x" + "2" * 40
@@ -842,6 +1003,21 @@ class Phase4Tests(unittest.TestCase):
         self.assertEqual(provider.safe_status()["requests"], 2)
         self.assertEqual(provider.safe_status()["max_concurrency"], 2)
 
+    def test_jupiter_v2_documented_price_impact_is_percentage_points(self) -> None:
+        def transport(url, headers, timeout):
+            payload = {
+                "inAmount": "1000000", "outAmount": "5000000", "priceImpact": -0.125,
+                "priceImpactPct": "0.00125", "router": "metis",
+            }
+            return 200, json.dumps(payload).encode(), {}
+
+        provider = JupiterReadOnlyQuoteProvider(
+            api_key="redacted-test-key", token_decimals={"MintA": 6}, transport=transport,
+            swap_v2_price_impact=True,
+        )
+        quote = provider.quote_buy("MintA", __import__("decimal").Decimal("0.001"))
+        self.assertEqual(quote.price_impact_pct, __import__("decimal").Decimal("-0.125"))
+
     def test_realtime_bootstrap_is_skipped_and_missing_hard_fields_are_explained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -883,6 +1059,181 @@ class Phase4Tests(unittest.TestCase):
                 self.assertEqual(len(engines[mode].ledger.candidates), 1)
                 self.assertIn("token_age_unavailable", engines[mode].ledger.candidates[0].filter_reason)
                 self.assertTrue(getattr(paths, f"{mode}_health_file").exists())
+            for connection in connections.values():
+                connection.close()
+
+    def test_bsc_live_mirror_rejection_never_requests_venue_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            class _Quotes:
+                calls = 0
+
+                def quote_candidate(self, _mint, _amount):
+                    self.calls += 1
+                    raise AssertionError("rejected Paper candidate must not request a venue quote")
+
+                @staticmethod
+                def metrics():
+                    return {}
+
+            record = normalize_meme_row(
+                {
+                    "contractAddress": "0x" + "1" * 40,
+                    "holders": "200",
+                    "price": "1",
+                    "marketCap": "1000",
+                    "liquidity": "1000",
+                },
+                fetched_at=NOW,
+                historical_bootstrap=False,
+                chain_id="56",
+            )
+            mirror_status = ObservedField(
+                value="REJECTED",
+                source="paper_candidate_mirror",
+                source_field="status",
+                observed_at=NOW,
+                source_timestamp=None,
+                age_ms=0,
+                available=True,
+            )
+            record = replace(
+                record,
+                endpoint_type="paper_candidate_mirror",
+                fields={**record.fields, "paper_candidate_status": mirror_status},
+            )
+            connection = initialize_database(root / "live.db")
+            engine = DeterministicSimulation(
+                "live",
+                strategy=BaselineStrategy(bsc_baseline_config()),
+                ledger=SimulationLedger.recover("live", connection),
+                pricing_mode="bsc_venue_aware_executable",
+                executable_quote=True,
+                live_executor=object(),
+            )
+            quotes = _Quotes()
+            coordinator = RealtimeCoordinator(
+                source=_Source(record),
+                features=BinanceRealtimeFeatureProvider(
+                    chain_id="56",
+                    bsc_quote_provider=quotes,
+                    bsc_executable_quote_enabled=True,
+                ),
+                engines={"live": engine},
+                controls=RuntimeControl(root / "control.json"),
+                health={"live": HealthRegistry(root / "live-health.json")},
+                latency=LatencyRecorder(),
+                stores={"live": RuntimeStore(connection, "live")},
+                audits={"live": JsonlAuditWriter(root / "live.jsonl")},
+                clock=lambda: NOW,
+            )
+            coordinator._live_startup_snapshot_complete = True
+            result = coordinator.run_cycle()
+            self.assertEqual(quotes.calls, 0)
+            self.assertEqual(result.candidates, 1)
+            self.assertEqual(len(engine.ledger.candidates), 1)
+            self.assertIn("paper_candidate_not_accepted", engine.ledger.candidates[0].filter_reason)
+            connection.close()
+
+    def test_solana_local_filters_precede_jupiter_and_evaluation_is_per_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = type("Paths", (), {
+                "control_file": root / "control.json",
+                "paper_health_file": root / "paper-health.json",
+                "shadow_health_file": root / "shadow-health.json",
+                "paper_db": root / "paper.db",
+                "shadow_db": root / "shadow.db",
+                "paper_audit_log": root / "paper.jsonl",
+                "shadow_audit_log": root / "shadow.jsonl",
+            })()
+
+            class _Quotes:
+                calls: list[tuple[str, str]] = []
+
+                def quote(self, mint, side, quantity):
+                    self.calls.append((mint, side))
+                    if side == "buy":
+                        return ExecutableQuote(
+                            quote_id=f"buy:{mint}", mint=mint, side="buy",
+                            input_quantity=quantity, output_quantity=Decimal("1000"),
+                            route_fee=None, price_impact_pct=None,
+                            quoted_at=NOW + timedelta(seconds=22), age_ms=0,
+                        )
+                    return ExecutableQuote(
+                        quote_id=f"sell:{mint}", mint=mint, side="sell",
+                        input_quantity=quantity, output_quantity=Decimal("0.001"),
+                        route_fee=None, price_impact_pct=None,
+                        quoted_at=NOW + timedelta(seconds=22), age_ms=0,
+                    )
+
+            quotes = _Quotes()
+            connections = {
+                mode: initialize_database(getattr(paths, f"{mode}_db"))
+                for mode in ("paper", "shadow")
+            }
+            engines = {
+                mode: DeterministicSimulation(
+                    mode,
+                    strategy=BaselineStrategy(solana_baseline_config()),
+                    ledger=SimulationLedger.recover(mode, connections[mode]),
+                )
+                for mode in ("paper", "shadow")
+            }
+            rejected = normalize_meme_row(
+                {"contractAddress": "LocalReject", "holders": "4"},
+                fetched_at=NOW,
+                historical_bootstrap=False,
+            )
+            coordinator = RealtimeCoordinator(
+                source=_Source(rejected),
+                features=BinanceRealtimeFeatureProvider(quote_provider=quotes),
+                engines=engines,
+                controls=RuntimeControl(paths.control_file),
+                health={mode: HealthRegistry(getattr(paths, f"{mode}_health_file")) for mode in engines},
+                latency=LatencyRecorder(),
+                stores={mode: RuntimeStore(connections[mode], mode) for mode in engines},
+                audits={mode: JsonlAuditWriter(getattr(paths, f"{mode}_audit_log")) for mode in engines},
+                clock=lambda: NOW + timedelta(seconds=20),
+            )
+            coordinator._evaluate_observation(
+                PendingSignalObservation(rejected, None, NOW),
+                NOW,
+            )
+            self.assertEqual(quotes.calls, [])
+            for engine in engines.values():
+                self.assertIn("holders_below_min", engine.ledger.candidates[0].filter_reason)
+
+            accepted = normalize_meme_row(
+                {"contractAddress": "LocalPass", "holders": "21"},
+                fetched_at=NOW,
+                historical_bootstrap=False,
+            )
+            coordinator.clock = lambda: NOW + timedelta(seconds=21)
+            coordinator._evaluate_observation(
+                PendingSignalObservation(accepted, None, NOW),
+                NOW,
+            )
+            self.assertEqual(quotes.calls, [("LocalPass", "buy"), ("LocalPass", "sell")])
+            for engine in engines.values():
+                position = next(iter(engine.ledger.active_positions))
+                self.assertEqual(position.evaluated_at, NOW + timedelta(seconds=21))
+                self.assertEqual(position.entry_quote_at, NOW + timedelta(seconds=22))
+
+            expired = normalize_meme_row(
+                {"contractAddress": "QueueExpired", "holders": "21"},
+                fetched_at=NOW,
+                historical_bootstrap=False,
+            )
+            coordinator.clock = lambda: NOW + timedelta(seconds=121)
+            coordinator._evaluate_observation(
+                PendingSignalObservation(expired, None, NOW),
+                NOW,
+            )
+            self.assertEqual(quotes.calls, [("LocalPass", "buy"), ("LocalPass", "sell")])
+            for engine in engines.values():
+                self.assertIn("quote_queue_expired", engine.ledger.candidates[-1].filter_reason)
             for connection in connections.values():
                 connection.close()
 
@@ -959,65 +1310,28 @@ class Phase4Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config.update({"position_size_sol": "100"}, reason="unsafe")
             bsc_display = service.config_payload("bsc")
-            self.assertEqual(bsc_display["display_name"], "BSC 链上只读报价 Paper/Shadow 策略")
-            self.assertEqual(bsc_display["pricing"]["pricing_mode"], "bsc_executable_quote")
-            self.assertTrue(bsc_display["pricing"]["executable_quote"])
-            self.assertIn("require_readonly_buy_quote", bsc_display["strategy_config"]["entry"])
-            self.assertIn("require_readonly_sell_quote", bsc_display["strategy_config"]["entry"])
-            self.assertNotIn("require_executable_buy_route", bsc_display["strategy_config"]["entry"])
-            self.assertEqual(bsc_display["ruleset_name"], "ultra_early_selective_bsc")
-            self.assertEqual(bsc_display["ruleset_version"], "0.1.5")
-            self.assertEqual(bsc_display["strategy_config"]["entry"]["observation_delay_sec"], 60)
-            self.assertTrue(bsc_display["strategy_config"]["entry"]["require_holders_non_decreasing_after_observation"])
-            self.assertEqual(bsc_display["strategy_config"]["entry"]["min_holders"], 100)
-            self.assertTrue(bsc_display["strategy_config"]["entry"]["min_holders_inclusive"])
-            self.assertEqual(bsc_display["strategy_config"]["paper_exit"]["stop_loss_trigger_pct"], "-10.00")
-            self.assertEqual(bsc_display["strategy_config"]["shadow_exit"]["shadow_holders_drop_pct"], "10.00")
-            self.assertEqual(bsc_display["strategy_config"]["shadow_exit"]["shadow_liquidity_drop_pct"], "15.00")
-            self.assertIn(
-                "shadow_holders_drop_over_10pct",
-                bsc_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "shadow_liquidity_drop_over_15pct",
-                bsc_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "paper_take_profit",
-                bsc_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "paper_stop_loss",
-                bsc_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "paper_max_hold_timeout",
-                bsc_display["strategy_config"]["shadow_exit"]["rules"],
-            )
+            self.assertEqual(bsc_display["display_name"], "Meme Survivor Reversal V1 Paper")
+            self.assertEqual(bsc_display["strategy"], "MEME_SURVIVOR_REVERSAL_V1")
+            self.assertEqual(bsc_display["ruleset_version"], "1.0.0")
+            self.assertFalse(bsc_display["legacy_gates_enabled"])
+            self.assertEqual(bsc_display["survivor_v1"]["MIN_AGE_SECONDS"], 180)
+            self.assertEqual(bsc_display["survivor_v1"]["CANDIDATE_MIN_MC"], "250000")
+            self.assertEqual(bsc_display["survivor_v1"]["ENTRY_MIN_MC"], "300000")
+            self.assertEqual(bsc_display["survivor_v1"]["ENTRY_MAX_MC"], "2000000")
+            self.assertEqual(bsc_display["survivor_v1"]["ENTRY_MIN_LIQUIDITY"], "50000")
+            self.assertEqual(bsc_display["survivor_v1"]["ENTRY_MIN_LP_MC_RATIO"], "0.08")
+            self.assertEqual(bsc_display["survivor_v1"]["ENTRY_MIN_HOLDERS"], 350)
+            self.assertEqual(bsc_display["survivor_v1"]["MIN_SWAP_COUNT_1M"], 5)
             sol_display = service.config_payload("solana")
-            self.assertEqual(sol_display["display_name"], "Solana 超早期基线策略")
-            self.assertEqual(sol_display["pricing"]["pricing_mode"], "jupiter_quote")
-            self.assertEqual(sol_display["ruleset_version"], "0.1.1")
-            sol_entry = sol_display["strategy_config"]["entry"]
-            self.assertEqual(sol_entry["holders_policy"], "record_only")
-            self.assertEqual(sol_entry["market_cap_policy"], "record_only")
-            self.assertEqual(sol_entry["liquidity_policy"], "record_only")
-            self.assertEqual(sol_entry["observation_price_policy"], "record_only")
-            self.assertEqual(sol_entry["observation_liquidity_policy"], "record_only")
-            self.assertEqual(sol_entry["min_holders"], 5)
-            self.assertTrue(sol_entry["min_holders_inclusive"])
-            self.assertIn(
-                "paper_take_profit",
-                sol_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "paper_stop_loss",
-                sol_display["strategy_config"]["shadow_exit"]["rules"],
-            )
-            self.assertIn(
-                "paper_max_hold_timeout",
-                sol_display["strategy_config"]["shadow_exit"]["rules"],
-            )
+            self.assertEqual(sol_display["display_name"], "Meme Survivor Reversal SOL V1 Paper")
+            self.assertEqual(sol_display["strategy"], "MEME_SURVIVOR_REVERSAL_SOL_V1")
+            self.assertEqual(sol_display["survivor_v1"]["SOL_CANDIDATE_MIN_MC"], "15000")
+            self.assertEqual(sol_display["survivor_v1"]["SOL_ENTRY_MAX_MC"], "3000000")
+            self.assertEqual(sol_display["pricing"]["pricing_mode"], "solana_protocol_or_jupiter_readonly_quote")
+            self.assertEqual(sol_display["ruleset_version"], "1.0.0")
+            self.assertEqual(sol_display["config_self_check"]["status"], "OK")
+            self.assertFalse(sol_display["allow_live_trading"])
+            self.assertEqual(sol_display["execution_provider"], "paper")
 
     def test_bsc_runtime_paths_and_dashboard_are_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -93,6 +93,14 @@ class SolanaPriceMonitor:
         with self._lock:
             return tuple(market.binding for market in self._markets.values())
 
+    def binding_for_account(self, address: str) -> SolanaPriceBinding | None:
+        """Resolve only accounts already registered for tracked Mints."""
+        with self._lock:
+            for market in self._markets.values():
+                if address in market.binding.account_addresses:
+                    return market.binding
+        return None
+
     def subscriptions(self) -> tuple[tuple[str, list[object]], ...]:
         with self._lock:
             result: list[tuple[str, list[object]]] = []

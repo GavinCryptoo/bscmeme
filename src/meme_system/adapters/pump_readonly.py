@@ -194,12 +194,18 @@ class PumpProtocolReadOnlyQuoteProvider:
             output_raw = (Decimal(curve.virtual_token_reserves) * net / (Decimal(curve.virtual_sol_reserves) + net)).to_integral_value()
             input_display = Decimal(input_raw) / Decimal(10**9)
             output_display = Decimal(output_raw) / Decimal(10**decimals)
+            spot = (Decimal(curve.virtual_sol_reserves) / Decimal(10**9)) / (Decimal(curve.virtual_token_reserves) / Decimal(10**decimals))
+            effective = input_display / output_display if output_display > 0 else None
+            impact_pct = ((effective / spot) - Decimal("1")) * Decimal("100") if effective is not None and spot > 0 else None
         elif side == "sell":
             input_raw = int(input_quantity * Decimal(10**decimals))
             net = Decimal(input_raw) * fee_factor
             output_raw = (Decimal(curve.virtual_sol_reserves) * net / (Decimal(curve.virtual_token_reserves) + net)).to_integral_value()
             input_display = Decimal(input_raw) / Decimal(10**decimals)
             output_display = Decimal(output_raw) / Decimal(10**9)
+            spot = (Decimal(curve.virtual_sol_reserves) / Decimal(10**9)) / (Decimal(curve.virtual_token_reserves) / Decimal(10**decimals))
+            effective = output_display / input_display if input_display > 0 else None
+            impact_pct = (Decimal("1") - (effective / spot)) * Decimal("100") if effective is not None and spot > 0 else None
         else:
             raise ValueError("side must be buy or sell")
         now = datetime.now(timezone.utc)
@@ -210,7 +216,7 @@ class PumpProtocolReadOnlyQuoteProvider:
             input_quantity=input_display,
             output_quantity=output_display,
             route_fee=None,
-            price_impact_pct=None,
+            price_impact_pct=max(Decimal("0"), impact_pct) if impact_pct is not None else None,
             quoted_at=now,
             age_ms=0,
             provider="pump_bonding_curve_quote",

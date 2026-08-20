@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BSC Balanced Live</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">BSC / BALANCED LIVE</div>
+        <h1>实盘持仓</h1>
+      </div>
+      <div class="topbar-actions">
+        <div class="updated" id="updated">读取中…</div>
+        <button id="refresh" type="button">手动刷新</button>
+      </div>
+    </header>
+
+    <section class="status-grid" id="status"></section>
+    <section class="notice" id="notice" hidden></section>
+    <section id="positions" class="positions"></section>
+    <section class="closed-section">
+      <h2>已平仓记录</h2>
+      <section id="closed-positions" class="closed-positions"></section>
+    </section>
+  </main>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

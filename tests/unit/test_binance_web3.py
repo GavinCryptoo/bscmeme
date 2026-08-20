@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,11 +15,12 @@ from meme_system.adapters.binance_web3.errors import BinanceWeb3Error, Unsupport
 from meme_system.adapters.binance_web3.kline import BinanceWeb3KlineAdapter
 from meme_system.adapters.binance_web3.market_data import BinanceWeb3MarketDataAdapter
 from meme_system.adapters.binance_web3.redaction import contains_sensitive_patterns, redact_payload
-from meme_system.adapters.binance_web3.signal_source import BinanceWeb3SignalSource
+from meme_system.adapters.binance_web3.signal_source import BscPaperCandidateMirrorSource, BinanceWeb3SignalSource
 from meme_system.adapters.binance_web3.smart_money import BinanceWeb3SmartMoneyAdapter
 from meme_system.adapters.binance_web3.normalizer import normalize_meme_row
 from meme_system.adapters.binance_web3.normalizer import normalize_dynamic, normalize_smart_money_row
 from meme_system.config.data_source import DataSourceConfig
+from meme_system.storage.database import initialize_database
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "binance_web3"
@@ -125,14 +127,14 @@ class BinanceWeb3ClientTests(unittest.TestCase):
 
 
 class BinanceWeb3NormalizerTests(unittest.TestCase):
-    def test_meme_row_preserves_missing_timestamp_as_unavailable(self) -> None:
+    def test_meme_row_normalizes_documented_millisecond_timestamp(self) -> None:
         row = load_fixture("meme_rush_normal.json")["data"][0]
         now = datetime.now(timezone.utc)
         record = normalize_meme_row(row, fetched_at=now, historical_bootstrap=True)
         self.assertEqual(record.signal.mint, row["contractAddress"])
         self.assertTrue(record.historical_bootstrap)
-        self.assertFalse(record.fields["token_created_at"].available)
-        self.assertEqual(record.fields["token_created_at"].parse_error, "timestamp_unit_unknown")
+        self.assertTrue(record.fields["token_created_at"].available)
+        self.assertEqual(record.fields["token_created_at"].value.isoformat(), "2026-08-01T04:03:20+00:00")
         self.assertEqual(record.fields["count_buy_24h"].value, 12)
 
     def test_dynamic_maps_windows_without_filling_missing_fields(self) -> None:
@@ -144,12 +146,12 @@ class BinanceWeb3NormalizerTests(unittest.TestCase):
         self.assertIsNone(snapshot.value("net_buy_usd_1h"))
         self.assertFalse(snapshot.fields["net_buy_usd_1h"].available)
 
-    def test_live_response_subsets_are_normalizable_without_promoting_unknown_time(self) -> None:
+    def test_live_response_subsets_are_normalizable_with_documented_time(self) -> None:
         now = datetime.now(timezone.utc)
         meme = load_fixture("meme_rush_live.json")
         meme_record = normalize_meme_row(meme["data"][0], fetched_at=now, historical_bootstrap=True)
         self.assertTrue(meme_record.fields["holders"].available)
-        self.assertFalse(meme_record.fields["token_created_at"].available)
+        self.assertTrue(meme_record.fields["token_created_at"].available)
 
         smart = load_fixture("smart_money_live.json")
         smart_record = normalize_smart_money_row(smart["data"][0], fetched_at=now, historical_bootstrap=True)
@@ -191,6 +193,41 @@ class BinanceWeb3AdapterTests(unittest.TestCase):
         self.assertTrue(all(row.historical_bootstrap for row in first))
         self.assertEqual(len(second), 1)
         self.assertFalse(second[0].historical_bootstrap)
+
+    def test_bsc_live_mirror_consumes_only_new_paper_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "paper.db"
+            connection = initialize_database(database)
+
+            def insert_candidate(suffix: str) -> None:
+                signal_id = f"bsc:meme-rush:{suffix}"
+                mint = "0x" + suffix.rjust(40, "0")
+                connection.execute(
+                    "INSERT INTO signals(signal_id, chain, mint, source, observed_at, raw_payload_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                    (signal_id, "bsc", mint, "binance_web3:meme_rush", "2026-08-04T00:00:00+00:00", None),
+                )
+                connection.execute(
+                    "INSERT INTO candidates(candidate_id, signal_id, mint, mode, strategy_name, ruleset_name, ruleset_version, config_version, status, rule_checks_json, soft_features_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"paper:{suffix}", signal_id, mint, "paper", "bsc", "baseline", "0.1.5", "0.1.5", "ACCEPTED", "[]",
+                        json.dumps({"holders": 120, "market_cap_usd": "1200", "liquidity_usd": "150", "protocol": 2002, "migrate_status": 0, "token_decimals": 18}),
+                    ),
+                )
+                connection.commit()
+
+            insert_candidate("1")
+            source = BscPaperCandidateMirrorSource(database)
+            self.assertEqual(source.fetch_once(), ())
+            insert_candidate("2")
+            records = source.fetch_once()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].endpoint_type, "paper_candidate_mirror")
+            self.assertEqual(records[0].fields["paper_candidate_status"].value, "ACCEPTED")
+            self.assertEqual(records[0].fields["holders"].value, 120)
+            self.assertEqual(source.stats()["last_fetched"], 1)
+            self.assertEqual(source.fetch_once(), ())
+            connection.close()
 
     def test_smart_money_is_shadow_only(self) -> None:
         transport = QueueTransport(json_response(load_fixture("smart_money_normal.json")))

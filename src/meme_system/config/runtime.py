@@ -59,18 +59,19 @@ class RuntimePaths:
             live_archive_name = "BSC_LIVE_ARCHIVE_DIR"
             live_lock_name = "BSC_LIVE_LOCK_DIR"
         else:
-            paper_db = path("PAPER_DB_PATH", str(cls.paper_db))
-            shadow_db = path("SHADOW_DB_PATH", str(cls.shadow_db))
+            root = os.environ.get("SOL_SURVIVOR_DATA_DIR", "data/solana").strip() or "data/solana"
+            paper_db = path("PAPER_DB_PATH", f"{root}/paper/runtime.db")
+            shadow_db = path("SHADOW_DB_PATH", f"{root}/shadow/runtime.db")
             paper_audit_name = "PAPER_AUDIT_LOG_PATH"
             shadow_audit_name = "SHADOW_AUDIT_LOG_PATH"
             control_name = "RUNTIME_CONTROL_PATH"
-            control_default = "data/solana/runtime_control.json"
+            control_default = f"{root}/runtime_control.json"
             paper_health_name = "PAPER_HEALTH_PATH"
             shadow_health_name = "SHADOW_HEALTH_PATH"
             paper_archive_name = "PAPER_ARCHIVE_DIR"
             shadow_archive_name = "SHADOW_ARCHIVE_DIR"
             lock_name = "RUNTIME_LOCK_DIR"
-            lock_default = "data/solana/locks"
+            lock_default = f"{root}/locks"
             live_db = cls.live_db
             live_audit_name = "BSC_LIVE_AUDIT_LOG_PATH"
             live_control_name = "BSC_LIVE_CONTROL_PATH"

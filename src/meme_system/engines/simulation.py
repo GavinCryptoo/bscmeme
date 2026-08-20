@@ -10,6 +10,7 @@ import uuid
 
 from meme_system.domain.models import (
     Candidate,
+    CostBreakdown,
     EntryDecision,
     EntryFeatures,
     ExecutionRecord,
@@ -23,6 +24,16 @@ from meme_system.domain.models import (
 )
 from meme_system.engines.ledger import SimulationLedger
 from meme_system.strategies.baseline import BaselineStrategy
+
+
+def _safe_live_error_code(exc: Exception) -> str:
+    """Expose only controlled BSC Live reason codes in runtime notifications."""
+
+    if type(exc).__name__ == "BscLiveError":
+        code = str(exc)
+        if 0 < len(code) <= 120 and all(character.islower() or character.isdigit() or character in {"_", ":", "-"} for character in code):
+            return code
+    return type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -79,8 +90,14 @@ class DeterministicSimulation:
         candidate_id: str,
         position_id: str,
         block_reason: str | None = None,
+        *,
+        local_only: bool = False,
     ) -> EntryResult:
-        decision = self.strategy.evaluate_entry(features)
+        decision = (
+            self.strategy.evaluate_local_entry(features)
+            if local_only
+            else self.strategy.evaluate_entry(features)
+        )
         checks = list(decision.checks)
         if block_reason is not None:
             block_reason_zh = {
@@ -93,6 +110,8 @@ class DeterministicSimulation:
                 "liquidity_below_first_discovery_after_observation": "观察期后的流动性低于首次发现值，跳过开仓",
                 "holders_observation_unavailable": "观察期后的持币地址数不可用，拒绝开仓",
                 "holders_below_first_discovery_after_observation": "观察期后的持币地址数低于首次发现值，跳过开仓",
+                "quote_queue_expired": "候选等待报价超过现有新鲜度上限，拒绝使用旧信号开仓",
+                "paper_candidate_not_accepted": "Paper 候选未通过同一策略筛选，拒绝实盘开仓",
             }.get(block_reason, "入场观察条件未满足，拒绝开仓")
             checks.append(
                 self._check(
@@ -104,9 +123,9 @@ class DeterministicSimulation:
                     block_reason_zh,
                 )
             )
-        if decision.accepted and block_reason is None:
+        if decision.accepted and block_reason is None and not local_only:
             checks.extend(self._lifecycle_checks(signal, features))
-        accepted = all(check.passed for check in checks)
+        accepted = not local_only and all(check.passed for check in checks)
         final_decision = EntryDecision(
             accepted=accepted,
             identity=decision.identity,
@@ -160,6 +179,7 @@ class DeterministicSimulation:
                 actual_quote = execution.quote
                 actual_received = execution.actual_received
             except Exception as exc:
+                error_code = _safe_live_error_code(exc)
                 self.ledger.record_event(
                     position_id,
                     "LIVE_ENTRY_FAILED",
@@ -169,6 +189,7 @@ class DeterministicSimulation:
                         "token_name": features.token_name,
                         "strategy_name": final_decision.identity.strategy_name,
                         "error_class": type(exc).__name__,
+                        "error_code": error_code,
                     },
                 )
                 return EntryResult(candidate=candidate, decision=final_decision, position=None)
@@ -322,12 +343,21 @@ class DeterministicSimulation:
         exit_holders_loader: Callable[[], int | None] | None = None,
         price_snapshot: PriceSnapshot | None = None,
         pricing_mode: str | None = None,
+        partial_sell_quote=None,
     ) -> ExitResult:
         if self.mode != "paper":
             raise ValueError("process_paper_exit requires paper mode")
         resolved_pricing_mode = pricing_mode or self.pricing_mode
         position = self.ledger.positions[position_id]
-        self.ledger.record_observation(position_id, now, sell_quote)
+        self.ledger.record_observation(
+            position_id,
+            now,
+            sell_quote,
+            # Solana persists the latest position snapshot but does not add
+            # an immutable lifecycle event for every two-second monitoring
+            # quote. Exit transitions and executions remain fully audited.
+            record_event=self._native_symbol() != "SOL",
+        )
         position = self.ledger.positions[position_id]
         decision = self.strategy.evaluate_paper_exit(
             position,
@@ -359,6 +389,16 @@ class DeterministicSimulation:
         if not decision.triggered:
             self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             return ExitResult(position, decision, None)
+        if decision.reason in {"take_profit_1", "take_profit_2"}:
+            return self._process_staged_take_profit(
+                position,
+                decision,
+                now,
+                partial_sell_quote,
+                pricing_mode=resolved_pricing_mode,
+                estimated_network_fee_sol=estimated_network_fee_sol,
+                estimated_priority_fee_sol=estimated_priority_fee_sol,
+            )
         if decision.cost is None:
             self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             if self._is_bsc_executable_mode():
@@ -496,6 +536,7 @@ class DeterministicSimulation:
         executable_quote: bool,
         local_observation: bool = False,
         price_snapshot: PriceSnapshot | None = None,
+        partial_sell_quote=None,
     ) -> ExitResult:
         """Settle a TP/SL trigger using Jupiter or a bounded local valuation."""
         if self.mode not in {"paper", "shadow"}:
@@ -517,6 +558,19 @@ class DeterministicSimulation:
                     settlement_quote,
                 )
             position = self.ledger.positions[position_id]
+        if reason in {"take_profit_1", "take_profit_2"}:
+            decision = self.strategy.evaluate_paper_exit(position, now, settlement_quote)
+            if decision.reason not in {"take_profit_1", "take_profit_2"}:
+                return ExitResult(position, decision, None)
+            return self._process_staged_take_profit(
+                position,
+                decision,
+                now,
+                partial_sell_quote,
+                pricing_mode=pricing_mode,
+                estimated_network_fee_sol=None,
+                estimated_priority_fee_sol=None,
+            )
         cost = self.strategy._cost_breakdown(position, settlement_quote, None, None) if settlement_quote is not None else None
         return_pct = cost.gross_pnl_pct if cost is not None else position.local_return_pct
         decision = ExitDecision(True, position.identity, reason, max(0, int((now - position.opened_at).total_seconds())), return_pct, settlement_quote, cost)
@@ -782,7 +836,12 @@ class DeterministicSimulation:
         if self.mode != "live":
             raise ValueError("process_live_exit requires live mode")
         position = self.ledger.positions[position_id]
-        self.ledger.record_observation(position_id, now, sell_quote)
+        self.ledger.record_observation(
+            position_id,
+            now,
+            sell_quote,
+            record_event=self._native_symbol() != "SOL",
+        )
         position = self.ledger.positions[position_id]
         decision = self.strategy.evaluate_paper_exit(position, now, sell_quote)
         if exit_holders is not None:
@@ -802,6 +861,7 @@ class DeterministicSimulation:
                 expected_quote=sell_quote,
             )
         except Exception as exc:
+            error_code = _safe_live_error_code(exc)
             self.ledger.record_event(
                 position_id,
                 "LIVE_EXIT_FAILED",
@@ -812,6 +872,7 @@ class DeterministicSimulation:
                     "strategy_name": position.identity.strategy_name,
                     "reason": decision.reason,
                     "error_class": type(exc).__name__,
+                    "error_code": error_code,
                 },
             )
             return ExitResult(position, decision, None)
@@ -893,12 +954,18 @@ class DeterministicSimulation:
         exit_holders_loader: Callable[[], int | None] | None = None,
         price_snapshot: PriceSnapshot | None = None,
         pricing_mode: str | None = None,
+        partial_sell_quote=None,
     ) -> ExitResult:
         if self.mode != "shadow":
             raise ValueError("process_shadow_exit requires shadow mode")
         resolved_pricing_mode = pricing_mode or self.pricing_mode
         position = self.ledger.positions[position_id]
-        self.ledger.record_observation(position_id, now, sell_quote)
+        self.ledger.record_observation(
+            position_id,
+            now,
+            sell_quote,
+            record_event=self._native_symbol() != "SOL",
+        )
         position = self.ledger.positions[position_id]
         features = replace(features, mfe_pct=position.mfe_pct)
         decision = self.strategy.evaluate_shadow_exit(
@@ -926,6 +993,16 @@ class DeterministicSimulation:
         if not decision.triggered:
             self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             return ExitResult(position, decision, None)
+        if decision.reason in {"take_profit_1", "take_profit_2"}:
+            return self._process_staged_take_profit(
+                position,
+                decision,
+                now,
+                partial_sell_quote,
+                pricing_mode=resolved_pricing_mode,
+                estimated_network_fee_sol=estimated_network_fee_sol,
+                estimated_priority_fee_sol=estimated_priority_fee_sol,
+            )
         if decision.cost is None:
             self._record_exit_attempt(position, decision, now, pricing_mode=resolved_pricing_mode)
             if self._is_bsc_executable_mode() and decision.reason not in {
@@ -1003,6 +1080,100 @@ class DeterministicSimulation:
             )
         self.ledger.record_shadow_outcome(outcome)
         return ExitResult(position, decision, closed, outcome)
+
+    def _process_staged_take_profit(
+        self,
+        position: VirtualPosition,
+        decision: ExitDecision,
+        now: datetime,
+        sell_quote,
+        *,
+        pricing_mode: str,
+        estimated_network_fee_sol: Decimal | None,
+        estimated_priority_fee_sol: Decimal | None,
+    ) -> ExitResult:
+        """Settle one TP ladder step from an exact half-balance quote."""
+        assert decision.reason in {"take_profit_1", "take_profit_2"}
+        stage = 1 if decision.reason == "take_profit_1" else 2
+        expected_quantity = (
+            position.active_quantity_token
+            * self.strategy.config.partial_take_profit_sell_pct
+        )
+        quote_error = (
+            "partial_sell_quote_unavailable"
+            if sell_quote is None
+            else sell_quote.unusable_reason(now)
+        )
+        if quote_error is None and (
+            sell_quote.mint != position.mint
+            or sell_quote.side != "sell"
+            or sell_quote.output_quantity <= 0
+        ):
+            quote_error = "partial_sell_quote_invalid"
+        if quote_error is None and sell_quote.input_quantity != expected_quantity:
+            quote_error = "partial_sell_quote_quantity_mismatch"
+        if quote_error is not None:
+            unavailable = replace(decision, reason=quote_error, quote=sell_quote, cost=None)
+            self._record_exit_attempt(position, unavailable, now, pricing_mode=pricing_mode)
+            return ExitResult(position, unavailable, None)
+
+        assert sell_quote is not None
+        allocated_entry_cost = (
+            position.quantity_sol
+            * sell_quote.input_quantity
+            / position.entry_quantity_token
+        )
+        gross_pnl_sol = sell_quote.output_quantity - allocated_entry_cost
+        route_fee = sell_quote.route_fee
+        known_costs = (route_fee or Decimal("0")) + (estimated_network_fee_sol or Decimal("0")) + (
+            estimated_priority_fee_sol or Decimal("0")
+        )
+        partial_cost = CostBreakdown(
+            gross_pnl_sol=gross_pnl_sol,
+            gross_pnl_pct=(gross_pnl_sol / allocated_entry_cost),
+            route_fee_sol=route_fee,
+            estimated_network_fee_sol=estimated_network_fee_sol,
+            estimated_priority_fee_sol=estimated_priority_fee_sol,
+            net_pnl_estimated_sol=gross_pnl_sol - known_costs,
+            net_pnl_is_estimated=(
+                route_fee is None
+                or estimated_network_fee_sol is None
+                or estimated_priority_fee_sol is None
+            ),
+        )
+        executed_at = self._quote_lifecycle_timestamp(sell_quote) or now
+        updated = self.ledger.record_partial_take_profit(
+            position.position_id,
+            sell_quote,
+            executed_at,
+            stage=stage,
+            estimated_network_fee_sol=estimated_network_fee_sol,
+            estimated_priority_fee_sol=estimated_priority_fee_sol,
+        )
+        self.ledger.record_execution(
+            ExecutionRecord(
+                execution_id=f"{position.position_id}:tp{stage}:{uuid.uuid4().hex}",
+                position_id=position.position_id,
+                mode=self.mode,
+                action="partial_exit",
+                reason=decision.reason,
+                quote_id=sell_quote.quote_id,
+                quote_age_ms=sell_quote.age_ms,
+                cost=partial_cost,
+                quote_input_quantity=sell_quote.input_quantity,
+                quote_output_quantity=sell_quote.output_quantity,
+                price_impact_pct=sell_quote.price_impact_pct,
+                quote_quoted_at=sell_quote.quoted_at,
+                quote_source=sell_quote.quote_source or sell_quote.provider,
+                quote_route=sell_quote.route,
+                recorded_at=now,
+                pricing_mode=pricing_mode,
+                executable_quote=self.executable_quote,
+                exit_status="partial",
+                pnl_status="estimated",
+            )
+        )
+        return ExitResult(updated, replace(decision, quote=sell_quote, cost=partial_cost), None)
 
     def _lifecycle_checks(
         self,

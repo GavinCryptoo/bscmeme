@@ -20,6 +20,16 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Mapping
 
+from eth_abi import encode as abi_encode
+from eth_utils import keccak
+
+from meme_system.adapters.bsc_quote import (
+    BscQuoteUnavailable,
+    BscReadOnlyQuoteProvider,
+    DEFAULT_BSC_RPC_URLS,
+    FlapContext,
+    ZERO_ADDRESS,
+)
 from meme_system.adapters.protocols import ExecutableQuote
 
 
@@ -74,6 +84,7 @@ def _bounded_int(values: Mapping[str, str], name: str, default: str, *, minimum:
 @dataclass(frozen=True)
 class BscLiveConfig:
     rpc_url: str
+    broadcast_rpc_urls: tuple[str, ...]
     private_key: str
     trade_amount_bnb: Decimal
     max_positions: int
@@ -102,8 +113,14 @@ class BscLiveConfig:
             raise BscLiveError("invalid_integer_config:BSC_LIVE_MAX_ENTRIES") from exc
         if max_entries < 0:
             raise BscLiveError("invalid_non_negative_config:BSC_LIVE_MAX_ENTRIES")
+        rpc_url = _required(values, "BSC_RPC_URL")
+        broadcast_rpc_urls = tuple(dict.fromkeys((rpc_url, *DEFAULT_BSC_RPC_URLS)))[:2]
         return cls(
-            rpc_url=_required(values, "BSC_RPC_URL"),
+            rpc_url=rpc_url,
+            # A transaction is signed only once.  These are bounded official
+            # BSC broadcast endpoints for delivering that exact same hash if
+            # the primary transport fails before returning a response.
+            broadcast_rpc_urls=broadcast_rpc_urls,
             private_key=private_key,
             trade_amount_bnb=_positive_decimal(values, "BSC_TRADE_AMOUNT_BNB"),
             max_positions=_positive_int(values, "BSC_MAX_POSITIONS"),
@@ -185,10 +202,20 @@ ERC20_ABI = [
 ]
 
 
+_FLAP_SWAP_EXACT_INPUT_SELECTOR = "0x" + keccak(
+    text="swapExactInput((address,address,uint256,uint256,bytes))"
+)[:4].hex()
+
+
 class BscLiveExecutor:
     """Execute one exact-input swap at a time, with no automatic retry."""
 
-    def __init__(self, config: BscLiveConfig) -> None:
+    def __init__(
+        self,
+        config: BscLiveConfig,
+        *,
+        quote_provider: BscReadOnlyQuoteProvider | None = None,
+    ) -> None:
         try:
             from web3 import Web3
             from eth_account import Account
@@ -198,11 +225,23 @@ class BscLiveExecutor:
         self._Web3 = Web3
         self._account_type = Account
         self._web3 = Web3(Web3.HTTPProvider(config.rpc_url, request_kwargs={"timeout": 15}))
+        self._broadcast_web3s = tuple(
+            Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 15}))
+            for url in config.broadcast_rpc_urls
+        )
         try:
             self._account = Account.from_key(config.private_key)
         except Exception as exc:
             raise BscLiveError("invalid_bsc_private_key") from exc
         self._private_key = config.private_key
+        self._quote_provider = quote_provider or BscReadOnlyQuoteProvider(
+            rpc_url=config.rpc_url,
+            helper_path=config.helper_path,
+            node_binary=config.node_binary,
+            slippage_bps=config.slippage_bps,
+            deadline_sec=config.deadline_sec,
+        )
+        self._owns_quote_provider = quote_provider is None
 
     @property
     def account_address(self) -> str:
@@ -228,17 +267,22 @@ class BscLiveExecutor:
 
     def quote(self, token: str, side: str, input_quantity: Decimal) -> ExecutableQuote:
         self.verify_chain()
-        decimals = self.token_decimals(token)
-        input_raw = self._quantity_to_raw(input_quantity, 18 if side == "buy" else decimals)
-        plan = self._router_plan(token, side, input_raw, decimals, build=False)
-        return self._quote_from_plan(token, side, input_quantity, decimals, plan)
+        quote, _venue, _context = self._venue_quote(token, side, input_quantity)
+        return quote
 
     def buy(self, token: str, amount_bnb: Decimal, *, expected_quote: ExecutableQuote | None = None) -> LiveTradeResult:
         self.verify_chain()
         decimals = self.token_decimals(token)
         amount_raw = self._quantity_to_raw(amount_bnb, 18)
-        plan = self._router_plan(token, "buy", amount_raw, decimals, build=True)
-        quote = self._quote_from_plan(token, "buy", amount_bnb, decimals, plan)
+        venue_quote, venue, context = self._venue_quote(token, "buy", amount_bnb)
+        self._validate_expected_quote(expected_quote, venue_quote, venue)
+        if venue == "flap_portal":
+            assert isinstance(context, FlapContext)
+            plan = self._flap_plan(context, "buy", amount_raw, venue_quote)
+            quote = venue_quote
+        else:
+            plan = self._router_plan(token, "buy", amount_raw, decimals, build=True)
+            quote = self._quote_from_plan(token, "buy", amount_bnb, decimals, plan)
         tx, gas_price = self._transaction_from_plan(plan)
         if int(tx["value"]) != amount_raw:
             raise BscLiveError("native_input_amount_mismatch")
@@ -270,20 +314,35 @@ class BscLiveExecutor:
         amount_raw = self._quantity_to_raw(amount_token, decimals)
         if amount_raw <= 0:
             raise BscLiveError("sell_amount_must_be_positive")
-        plan = self._router_plan(token, "sell", amount_raw, decimals, build=True)
-        quote = self._quote_from_plan(token, "sell", amount_token, decimals, plan)
+        venue_quote, venue, context = self._venue_quote(token, "sell", amount_token)
+        self._validate_expected_quote(expected_quote, venue_quote, venue)
+        if venue == "flap_portal":
+            assert isinstance(context, FlapContext)
+            plan = self._flap_plan(context, "sell", amount_raw, venue_quote)
+            quote = venue_quote
+        else:
+            plan = self._router_plan(token, "sell", amount_raw, decimals, build=True)
+            quote = self._quote_from_plan(token, "sell", amount_token, decimals, plan)
         token_contract = self._token_contract(token)
         token_balance = int(token_contract.functions.balanceOf(self.account_address).call())
         if token_balance < amount_raw:
             raise BscLiveError("token_balance_below_sell_amount")
-        router = self._checksum(plan["to"])
-        allowance = int(token_contract.functions.allowance(self.account_address, router).call())
+        spender = self._checksum(plan["to"])
+        allowance = int(token_contract.functions.allowance(self.account_address, spender).call())
         nonce = int(self._web3.eth.get_transaction_count(self.account_address, "pending"))
         if allowance < amount_raw:
-            nonce = self._approve_exact(token_contract, router, amount_raw, nonce)
+            nonce = self._approve_exact(token_contract, spender, amount_raw, nonce)
             # Approval is a separate transaction; use a fresh quote before the swap.
-            plan = self._router_plan(token, "sell", amount_raw, decimals, build=True)
-            quote = self._quote_from_plan(token, "sell", amount_token, decimals, plan)
+            venue_quote, refreshed_venue, refreshed_context = self._venue_quote(token, "sell", amount_token)
+            if refreshed_venue != venue:
+                raise BscLiveError("execution_venue_changed_after_approval")
+            if refreshed_venue == "flap_portal":
+                assert isinstance(refreshed_context, FlapContext)
+                plan = self._flap_plan(refreshed_context, "sell", amount_raw, venue_quote)
+                quote = venue_quote
+            else:
+                plan = self._router_plan(token, "sell", amount_raw, decimals, build=True)
+                quote = self._quote_from_plan(token, "sell", amount_token, decimals, plan)
         tx, gas_price = self._transaction_from_plan(plan, nonce=nonce)
         gas_estimate = self._estimate_gas(tx)
         bnb_balance = int(self._web3.eth.get_balance(self.account_address))
@@ -304,6 +363,110 @@ class BscLiveExecutor:
             gas_fee_native=self._raw_to_quantity(gas_fee, 18),
             settlement_verified=True,
         )
+
+    def close(self) -> None:
+        """Release only an internally-created read-only quote provider."""
+
+        if self._owns_quote_provider:
+            self._quote_provider.close()
+
+    def _venue_quote(
+        self,
+        token: str,
+        side: str,
+        input_quantity: Decimal,
+    ) -> tuple[ExecutableQuote, str, object]:
+        """Fetch a fresh quote and fail closed unless its venue is executable."""
+
+        try:
+            quote, context = self._quote_provider.quote_with_venue(token, side, input_quantity)
+        except BscQuoteUnavailable as exc:
+            raise BscLiveError("bsc_executable_quote_unavailable") from exc
+        if (
+            quote.mint.lower() != token.lower()
+            or quote.side != side
+            or quote.input_quantity != input_quantity
+            or quote.output_quantity <= 0
+            or quote.unusable_reason(_utc_now()) is not None
+        ):
+            raise BscLiveError("bsc_executable_quote_invalid")
+        source = quote.quote_source or quote.provider
+        if isinstance(context, FlapContext) and not context.migrated:
+            if source != "flap_bonding_curve_quote":
+                raise BscLiveError("quote_execution_venue_mismatch")
+            if not (context.fundraising_is_native or context.native_to_quote_swap_enabled):
+                raise BscLiveError("flap_native_input_unavailable")
+            return quote, "flap_portal", context
+        if getattr(context, "migrated", False):
+            if source != "pancakeswap_quote":
+                raise BscLiveError("quote_execution_venue_mismatch")
+            return quote, "pancakeswap_smart_router", context
+        raise BscLiveError("unsupported_execution_venue")
+
+    @staticmethod
+    def _execution_venue_from_quote(quote: ExecutableQuote) -> str:
+        source = quote.quote_source or quote.provider
+        if source == "flap_bonding_curve_quote":
+            return "flap_portal"
+        if source == "pancakeswap_quote":
+            return "pancakeswap_smart_router"
+        return "unsupported"
+
+    def _validate_expected_quote(
+        self,
+        expected_quote: ExecutableQuote | None,
+        fresh_quote: ExecutableQuote,
+        venue: str,
+    ) -> None:
+        """Permit a fresh re-quote, but never a venue or trade-shape switch."""
+
+        if expected_quote is None:
+            return
+        if (
+            expected_quote.mint.lower() != fresh_quote.mint.lower()
+            or expected_quote.side != fresh_quote.side
+            or expected_quote.input_quantity != fresh_quote.input_quantity
+        ):
+            raise BscLiveError("expected_quote_invalid_or_expired")
+        if self._execution_venue_from_quote(expected_quote) != venue:
+            raise BscLiveError("quote_execution_venue_changed")
+
+    def _flap_plan(
+        self,
+        context: FlapContext,
+        side: str,
+        input_raw: int,
+        quote: ExecutableQuote,
+    ) -> dict[str, object]:
+        """Build the current official Flap Portal exact-input transaction."""
+
+        if side not in {"buy", "sell"}:
+            raise BscLiveError("unsupported_trade_side")
+        if context.migrated or context.status != 1:
+            raise BscLiveError("flap_curve_no_longer_tradable")
+        if not (context.fundraising_is_native or context.native_to_quote_swap_enabled):
+            raise BscLiveError("flap_native_input_unavailable")
+        output_decimals = context.token_decimals if side == "buy" else 18
+        quoted_raw = self._quantity_to_raw(quote.output_quantity, output_decimals)
+        minimum_output = (quoted_raw * (10_000 - self.config.slippage_bps)) // 10_000
+        if minimum_output <= 0:
+            raise BscLiveError("minimum_output_must_be_positive")
+        input_token = ZERO_ADDRESS if side == "buy" else context.mint
+        output_token = context.mint if side == "buy" else ZERO_ADDRESS
+        data = _FLAP_SWAP_EXACT_INPUT_SELECTOR + abi_encode(
+            ["(address,address,uint256,uint256,bytes)"],
+            [(input_token, output_token, input_raw, minimum_output, b"")],
+        ).hex()
+        return {
+            "venue": "flap_portal",
+            "to": self._checksum(context.launchpad),
+            "data": data,
+            "value": str(input_raw if side == "buy" else 0),
+            "minimumOutputRaw": str(minimum_output),
+            # Portal exact-input has no deadline argument.  This local expiry
+            # caps quote-to-broadcast time and is checked before estimate/send.
+            "deadline": int(time.time()) + self.config.deadline_sec,
+        }
 
     def _router_plan(self, token: str, side: str, amount_raw: int, decimals: int, *, build: bool) -> dict[str, object]:
         if side not in {"buy", "sell"}:
@@ -357,12 +520,13 @@ class BscLiveExecutor:
             quoted_at=quoted_at,
             age_ms=0,
             expires_at=quoted_at + timedelta(seconds=self.config.deadline_sec),
-            provider="pancakeswap_smart_router",
+            provider="pancakeswap_quote",
             route=(str(plan["routerAddress"]),),
             executable_style=True,
             confidence="verified",
             requested_at=quoted_at,
             received_at=quoted_at,
+            quote_source="pancakeswap_quote",
         )
 
     def _transaction_from_plan(self, plan: Mapping[str, object], *, nonce: int | None = None) -> tuple[dict[str, object], int]:
@@ -372,6 +536,8 @@ class BscLiveExecutor:
             data = str(plan["data"])
             if int(plan["minimumOutputRaw"]) <= 0:
                 raise BscLiveError("minimum_output_must_be_positive")
+            if int(plan["deadline"]) <= int(time.time()):
+                raise BscLiveError("trade_deadline_expired")
         except (KeyError, TypeError, ValueError) as exc:
             raise BscLiveError("smart_router_transaction_invalid") from exc
         gas_price = int(self._web3.eth.gas_price)
@@ -406,23 +572,74 @@ class BscLiveExecutor:
         return nonce + 1
 
     def _send_once(self, tx: Mapping[str, object], gas_estimate: int, gas_price: int):
+        """Sign once and use bounded delivery for that exact transaction hash."""
+
         transaction = dict(tx)
         transaction["gas"] = gas_estimate
         transaction["gasPrice"] = gas_price
         try:
-            signed = self._account.sign_transaction(transaction, self._private_key)
+            # LocalAccount already owns the key supplied at construction.
+            # Passing it again is treated as an unsupported second positional
+            # argument by current eth-account versions and aborts before any
+            # RPC broadcast.
+            signed = self._account.sign_transaction(transaction)
             raw = getattr(signed, "raw_transaction", getattr(signed, "rawTransaction", None))
             if raw is None:
                 raise BscLiveError("signed_transaction_unavailable")
-            tx_hash = self._web3.eth.send_raw_transaction(raw)
-            receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120, poll_latency=2)
         except BscLiveError:
             raise
         except Exception as exc:
-            raise BscLiveError("transaction_send_or_receipt_failed") from exc
+            raise BscLiveError("transaction_sign_failed") from exc
+        tx_hash = self._broadcast_once(raw)
+        receipt = self._wait_for_transaction_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise BscLiveError("transaction_receipt_failed")
-        return receipt, tx_hash.hex()
+        return receipt, "0x" + bytes(tx_hash).hex()
+
+    def _broadcast_once(self, raw: object):
+        """Broadcast one raw transaction across at most two official RPCs.
+
+        Re-broadcasting the identical signed byte sequence cannot create a
+        second order: it has the same sender, nonce and transaction hash.
+        There is no fee bump, rebuilt transaction, or unbounded retry.
+        """
+
+        expected_hash = self._web3.keccak(raw)
+        rejected = False
+        for web3 in self._broadcast_web3s:
+            try:
+                received_hash = web3.eth.send_raw_transaction(raw)
+            except ValueError as exc:
+                if self._already_known_transaction(exc):
+                    return expected_hash
+                rejected = True
+                continue
+            except Exception:
+                continue
+            if bytes(received_hash) != bytes(expected_hash):
+                raise BscLiveError("transaction_hash_mismatch")
+            return received_hash
+        if rejected:
+            raise BscLiveError("transaction_broadcast_rejected")
+        raise BscLiveError("transaction_broadcast_unavailable")
+
+    @staticmethod
+    def _already_known_transaction(exc: ValueError) -> bool:
+        message = str(exc).lower()
+        return "already known" in message or "known transaction" in message
+
+    def _wait_for_transaction_receipt(self, tx_hash: object):
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            for web3 in self._broadcast_web3s:
+                try:
+                    receipt = web3.eth.get_transaction_receipt(tx_hash)
+                except Exception:
+                    continue
+                if receipt is not None:
+                    return receipt
+            time.sleep(2.0)
+        raise BscLiveError("transaction_receipt_timeout")
 
     def _estimate_gas(self, tx: Mapping[str, object]) -> int:
         try:

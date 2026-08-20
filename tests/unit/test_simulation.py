@@ -17,6 +17,7 @@ from meme_system.strategies.baseline import (
     BaselineStrategy,
     SOLANA_SHADOW_MIN_LIQUIDITY_USD,
     bsc_baseline_config,
+    solana_baseline_config,
 )
 from meme_system.storage.database import initialize_database
 from meme_system.storage.queries import LedgerQueries
@@ -94,13 +95,13 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(solana_config.position_size_sol, Decimal("0.001"))
 
     def test_updated_baseline_risk_and_quote_limits_are_frozen(self) -> None:
-        config = DeterministicSimulation("paper").strategy.config
+        config = solana_baseline_config()
         self.assertEqual(config.max_buy_price_impact_pct, Decimal("10"))
         self.assertEqual(config.max_immediate_exit_impact_pct, Decimal("15"))
         self.assertEqual(config.initial_virtual_balance_sol, Decimal("1"))
         self.assertEqual(config.position_size_sol, Decimal("0.001"))
         self.assertEqual(config.max_open_positions, 50)
-        self.assertEqual(config.pause_new_entries_after_large_losses, 50)
+        self.assertEqual(config.pause_new_entries_after_large_losses, 1000)
         self.assertEqual(config.observation_delay_sec, 15)
         self.assertEqual(config.shadow_holders_drop_pct, Decimal("0.10"))
         self.assertEqual(config.shadow_liquidity_drop_pct, Decimal("0.15"))
@@ -108,7 +109,9 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(config.min_liquidity_usd, Decimal("100"))
         self.assertEqual(config.large_loss_threshold_pct, Decimal("-0.40"))
         self.assertEqual(config.daily_full_loss_sol_limit, Decimal("0.01"))
-        self.assertFalse(config.enforce_holders)
+        self.assertTrue(config.enforce_holders)
+        self.assertEqual(config.min_holders, 20)
+        self.assertFalse(config.min_holders_inclusive)
         self.assertFalse(config.enforce_market_cap)
         self.assertFalse(config.enforce_liquidity)
         self.assertFalse(config.require_observation_price)
@@ -270,27 +273,27 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertTrue(accepted.decision.accepted)
 
-    def test_solana_holders_is_record_only_and_bsc_remains_hard(self) -> None:
-        engine = DeterministicSimulation("paper")
+    def test_solana_and_bsc_holders_are_hard_entry_filters(self) -> None:
+        engine = DeterministicSimulation("paper", strategy=BaselineStrategy(solana_baseline_config()))
         missing = engine.process_entry(
             make_signal("holders-missing"),
             replace(make_entry_features(), holders=None),
             candidate_id="candidate-holders-missing",
             position_id="position-holders-missing",
         )
-        self.assertTrue(missing.decision.accepted)
-        self.assertNotIn("holders_unavailable", missing.decision.failed_reason_codes)
+        self.assertFalse(missing.decision.accepted)
+        self.assertIn("holders_unavailable", missing.decision.failed_reason_codes)
 
-        below_min = DeterministicSimulation("paper").process_entry(
+        below_min = DeterministicSimulation("paper", strategy=BaselineStrategy(solana_baseline_config())).process_entry(
             make_signal("holders-low", "MintB"),
             replace(make_entry_features(buy_quote=make_buy_quote("MintB"), sell_quote=make_sell_quote("0.001", mint="MintB")), holders=20),
             candidate_id="candidate-holders-low",
             position_id="position-holders-low",
         )
-        self.assertTrue(below_min.decision.accepted)
-        self.assertNotIn("holders_below_min", below_min.decision.failed_reason_codes)
+        self.assertFalse(below_min.decision.accepted)
+        self.assertIn("holders_below_min", below_min.decision.failed_reason_codes)
 
-        accepted = DeterministicSimulation("paper").process_entry(
+        accepted = DeterministicSimulation("paper", strategy=BaselineStrategy(solana_baseline_config())).process_entry(
             make_signal("holders-min", "MintA"),
             replace(make_entry_features(), holders=21),
             candidate_id="candidate-holders-min",
@@ -322,7 +325,7 @@ class SimulationTests(unittest.TestCase):
         self.assertIn("runtime_paused", result.candidate.filter_reason)
 
     def test_solana_holder_threshold_can_be_inclusive(self) -> None:
-        strategy = BaselineStrategy(BaselineConfig(min_holders=5, min_holders_inclusive=True))
+        strategy = BaselineStrategy(BaselineConfig(enforce_holders=True, min_holders=5, min_holders_inclusive=True))
         engine = DeterministicSimulation("paper", strategy=strategy)
         accepted = engine.process_entry(
             make_signal("holders-inclusive", "MintInclusive"),
@@ -419,6 +422,86 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(result.decision.cost.net_pnl_is_estimated)
         self.assertEqual(result.closed_position.status, "CLOSED")
         self.assertEqual(engine.ledger.executions[-1].action, "exit")
+
+    def test_solana_staged_take_profit_keeps_a_runner_and_breakeven_close_includes_realized_proceeds(self) -> None:
+        engine = DeterministicSimulation(
+            "paper",
+            strategy=BaselineStrategy(solana_baseline_config()),
+        )
+        engine.process_entry(
+            make_signal("staged-tp", "MintStaged"),
+            make_entry_features(
+                buy_quote=make_buy_quote("MintStaged"),
+                sell_quote=make_sell_quote("0.001", mint="MintStaged"),
+            ),
+            candidate_id="staged-tp-candidate",
+            position_id="staged-tp-position",
+        )
+
+        tp1 = engine.process_paper_exit(
+            "staged-tp-position",
+            NOW + timedelta(seconds=20),
+            make_sell_quote("0.0012", mint="MintStaged", quote_id="tp1-mark"),
+            partial_sell_quote=replace(
+                make_sell_quote("0.0006", mint="MintStaged", quote_id="tp1-fill"),
+                input_quantity=Decimal("500"),
+            ),
+        )
+        self.assertEqual(tp1.decision.reason, "take_profit_1")
+        self.assertIsNone(tp1.closed_position)
+        after_tp1 = engine.ledger.positions["staged-tp-position"]
+        self.assertEqual(after_tp1.remaining_quantity_token, Decimal("500"))
+        self.assertEqual(after_tp1.realized_proceeds_sol, Decimal("0.0006"))
+
+        tp2 = engine.process_paper_exit(
+            "staged-tp-position",
+            NOW + timedelta(seconds=40),
+            replace(make_sell_quote("0.00065", mint="MintStaged", quote_id="tp2-mark"), input_quantity=Decimal("500")),
+            partial_sell_quote=replace(
+                make_sell_quote("0.000325", mint="MintStaged", quote_id="tp2-fill"),
+                input_quantity=Decimal("250"),
+            ),
+        )
+        self.assertEqual(tp2.decision.reason, "take_profit_2")
+        self.assertIsNone(tp2.closed_position)
+        after_tp2 = engine.ledger.positions["staged-tp-position"]
+        self.assertEqual(after_tp2.remaining_quantity_token, Decimal("250"))
+
+        breakeven = engine.process_paper_exit(
+            "staged-tp-position",
+            NOW + timedelta(seconds=60),
+            replace(make_sell_quote("0.00025", mint="MintStaged", quote_id="breakeven"), input_quantity=Decimal("250")),
+        )
+        self.assertEqual(breakeven.decision.reason, "tp2_breakeven_exit")
+        self.assertIsNotNone(breakeven.closed_position)
+        self.assertEqual(breakeven.decision.return_pct, Decimal("0"))
+        self.assertEqual(breakeven.decision.cost.gross_pnl_sol, Decimal("0.000175"))
+        self.assertEqual(
+            [execution.action for execution in engine.ledger.executions[-3:]],
+            ["partial_exit", "partial_exit", "exit"],
+        )
+
+    def test_solana_staged_take_profit_uses_minus_thirty_percent_stop_loss(self) -> None:
+        engine = DeterministicSimulation(
+            "paper",
+            strategy=BaselineStrategy(solana_baseline_config()),
+        )
+        engine.process_entry(
+            make_signal("sol-stop", "MintSolStop"),
+            make_entry_features(
+                buy_quote=make_buy_quote("MintSolStop"),
+                sell_quote=make_sell_quote("0.001", mint="MintSolStop"),
+            ),
+            candidate_id="sol-stop-candidate",
+            position_id="sol-stop-position",
+        )
+        result = engine.process_paper_exit(
+            "sol-stop-position",
+            NOW + timedelta(seconds=20),
+            make_sell_quote("0.0007", mint="MintSolStop"),
+        )
+        self.assertEqual(result.decision.reason, "stop_loss")
+        self.assertIsNotNone(result.closed_position)
 
     def test_solana_timeout_enters_exit_triggered_before_quote_is_available(self) -> None:
         engine = DeterministicSimulation("paper")
@@ -974,6 +1057,37 @@ class SimulationTests(unittest.TestCase):
         )
         self.assertEqual(result.decision.reason, "stop_loss")
 
+    def test_solana_non_triggering_position_quote_updates_snapshot_without_event_growth(self) -> None:
+        engine = DeterministicSimulation(
+            "paper",
+            strategy=BaselineStrategy(solana_baseline_config()),
+        )
+        entry = engine.process_entry(
+            make_signal("solana-monitoring", "MintMonitor"),
+            replace(
+                make_entry_features(
+                    buy_quote=make_buy_quote("MintMonitor"),
+                    sell_quote=make_sell_quote("0.001", mint="MintMonitor"),
+                ),
+                holders=21,
+            ),
+            candidate_id="solana-monitoring-candidate",
+            position_id="solana-monitoring-position",
+        )
+        self.assertIsNotNone(entry.position)
+        event_count = len(engine.ledger.lifecycle_events)
+        result = engine.process_paper_exit(
+            "solana-monitoring-position",
+            NOW + timedelta(seconds=1),
+            make_sell_quote("0.001", mint="MintMonitor"),
+        )
+        self.assertIsNone(result.closed_position)
+        self.assertEqual(len(engine.ledger.lifecycle_events), event_count)
+        self.assertEqual(
+            engine.ledger.positions["solana-monitoring-position"].last_observed_at,
+            NOW + timedelta(seconds=1),
+        )
+
     def test_position_limit_and_one_trade_per_mint_are_per_mode(self) -> None:
         paper = DeterministicSimulation("paper")
         shadow = DeterministicSimulation("shadow")
@@ -1184,6 +1298,8 @@ class SimulationTests(unittest.TestCase):
             candidates = queries.candidates()
             self.assertEqual(candidates[0]["candidate_id"], "candidate-b")
             self.assertIsInstance(candidates[0]["rule_checks"], list)
+            self.assertNotIn("reason_zh", candidates[0]["rule_checks"][0])
+            self.assertIn("name", candidates[0]["rule_checks"][0])
             events = queries.lifecycle_events(position_id="position-a")
             event_types = [event["event_type"] for event in events]
             self.assertIn("POSITION_CREATED", event_types)

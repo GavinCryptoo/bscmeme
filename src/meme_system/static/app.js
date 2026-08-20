@@ -60,7 +60,12 @@
   };
   const nativeSymbol = () => state.chain === 'bsc' ? 'BNB' : 'SOL';
   const nativeField = (item, nativeName, legacySolName) => item[nativeName] ?? item[legacySolName];
-  const displayTokenName = (item) => [item.symbol, item.display_name, shortMint(item.mint)].filter(Boolean).join(' · ') || '未命名代币';
+  const displayTokenName = (item) => {
+    const symbol = String(item.symbol || '').trim();
+    if (symbol) return symbol;
+    const legacyName = String(item.token_name || '').trim();
+    return legacyName && legacyName.length <= 24 ? legacyName : (shortMint(item.mint) || '未命名代币');
+  };
   const priceSourceText = (snapshot) => ({ jupiter_quote: 'Jupiter 可执行报价', pump_bonding_curve_quote: 'Pump Bonding Curve 报价', bonding_curve_quote: 'bonding_curve_quote', flap_bonding_curve_quote: 'flap_bonding_curve_quote', pancakeswap_quote: 'pancakeswap_quote', binance_indicative_reference: 'binance_indicative_reference', pool_wss: '池内实时价格', binance_indicative: 'Binance 兜底价', timeout_fallback: 'Binance 兜底价' }[snapshot?.price_source] || '历史口径不完整');
   const snapshotPrice = (snapshot, legacyValue) => {
     if (state.chain === 'solana' && state.priceUnit === 'usd') return snapshot?.price_usd ?? null;
@@ -138,6 +143,7 @@
     no_route: '没有有效路线',
     no_liquidity: '没有可用流动性',
     quote_expired: 'Quote 已过期',
+    quote_queue_expired: '报价排队超出新鲜度上限',
     buy_quote_mint_mismatch: '买入 Quote 的 Mint 不匹配',
     sell_quote_mint_mismatch: '卖出 Quote 的 Mint 不匹配',
     sell_quote_quantity_mismatch: '卖出 Quote 数量不匹配',
@@ -147,7 +153,18 @@
     flow_window_negative: '资金流窗口为负',
     creator_confirmed_sold: '已确认创建者卖出',
     token_age_out_of_range: '币龄超出范围',
+    AGE_ABOVE_3600S: '币龄超过 1 小时',
     max_open_positions_reached: '已达到最大持仓数',
+    MAX_OPEN_POSITIONS_REACHED: '已达到并发持仓上限',
+    ENTRY_PAUSED: '新开仓已暂停',
+    HARD_STOP_80PCT: '正常止损：跌幅达到 80%',
+    TP1_STOP_50PCT: '止盈一后止损：跌至买入价下方 50%',
+    TP2_RETRACE_TO_ENTRY: '止盈二后回落至买入价，全部卖出',
+    TP3_RETRACE_TO_TP1: '止盈三后回落至止盈一价格，全部卖出',
+    HOLDER_DROP_20PCT_2M: '2 分钟内持有人下降 20%，全部卖出',
+    TP1_PLUS_50: '止盈一：上涨 50%，卖出初始仓位 30%',
+    TP2_PLUS_100: '止盈二：上涨 100%，卖出初始仓位 30%',
+    TP3_PLUS_200: '止盈三：上涨 200%，卖出初始仓位 40%',
     mint_lifecycle_exists: '该 Mint 已存在生命周期',
     same_name_cooldown: '同名代币仍在冷却期',
     daily_full_loss_limit: '已达到每日亏损上限',
@@ -469,8 +486,10 @@
     $('#position-body').innerHTML = visible.length ? visible.map((item) => {
       const source = isBsc ? bscPriceSourceLabel(item.price_source) : 'pool_wss_indicative';
       const executable = isBsc ? source : 'jupiter_quote';
-      return `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td><strong>${escapeHtml(tokenPriceText(item.local_price_sol_per_token))}</strong><small class="table-subtext">${escapeHtml(source)}</small></td><td><strong>${escapeHtml(tokenPriceText(item.jupiter_price_sol_per_token))}</strong><small class="table-subtext">${escapeHtml(executable)}</small></td><td>${escapeHtml(signedDecimalText(item.price_delta_pct, 2))}%</td><td>${escapeHtml(dateText(item.local_price_observed_at))}</td><td>${escapeHtml(dateText(item.jupiter_price_observed_at))}</td><td>${escapeHtml(countText(item.holders))}</td><td>${escapeHtml(marketText(item.market_cap_usd))}</td><td>${escapeHtml(marketText(item.liquidity_usd))}</td></tr>`;
-    }).join('') : '<tr><td colspan="9" class="empty-state">暂无虚拟持仓</td></tr>';
+      const holders = `${countText(item.current_holders)} / ${countText(item.entry_holders)}`;
+      const holderChange = item.holders_change == null ? '—' : `${signedDecimalText(item.holders_change, 0)} (${signedDecimalText(item.holders_change_pct, 2)}%)`;
+      return `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td><strong>${escapeHtml(tokenPriceText(item.local_price_sol_per_token))}</strong><small class="table-subtext">${escapeHtml(source)}</small></td><td><strong>${escapeHtml(tokenPriceText(item.jupiter_price_sol_per_token))}</strong><small class="table-subtext">${escapeHtml(executable)}</small></td><td>${escapeHtml(signedDecimalText(item.price_delta_pct, 2))}%</td><td>${escapeHtml(dateText(item.local_price_observed_at))}</td><td>${escapeHtml(dateText(item.jupiter_price_observed_at))}</td><td>${escapeHtml(holders)}<small class="table-subtext">${escapeHtml(dateText(item.holders_observed_at))}</small></td><td>${escapeHtml(holderChange)}</td><td>${escapeHtml(marketText(item.market_cap_usd))}</td><td>${escapeHtml(marketText(item.liquidity_usd))}</td></tr>`;
+    }).join('') : '<tr><td colspan="10" class="empty-state">暂无虚拟持仓</td></tr>';
   }
 
   function bscPriceSourceLabel(source) {
@@ -501,9 +520,15 @@
         const buySource = snapshotStatusText(item, item.entry_price_snapshot);
         const sellSource = snapshotStatusText(item, item.exit_price_snapshot);
         const pnl = nativeField(item, 'pnl_bnb', 'pnl_sol');
-        return `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td>${escapeHtml(tradeTimeText(item.signal_observed_at, item.signal_observed_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.evaluated_at, item.evaluated_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.entry_quote_at, item.entry_time_status))}</td><td>${escapeHtml(tradeTimeText(item.opened_at, item.opened_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.exit_quote_at, item.exit_time_status))}</td><td>${escapeHtml(tradeTimeText(item.closed_at, item.closed_at ? 'known' : 'unknown'))}</td><td><strong>${escapeHtml(tokenPriceText(buyPrice))}</strong><small class="table-subtext">${escapeHtml(buySource)}</small></td><td><strong>${escapeHtml(tokenPriceText(sellPrice))}</strong><small class="table-subtext">${escapeHtml(sellSource)}</small></td><td><span class="${pnlClass(pnl)}">${escapeHtml(pnlAmountText(pnl))}</span></td><td><span class="${pnlClass(item.pnl_rate_pct)}">${escapeHtml(pnlRateText(item.pnl_rate_pct))}</span></td><td>${escapeHtml(countText(item.entry_holders ?? item.holders))}</td><td>${escapeHtml(exitHoldersText(item))}</td><td>${escapeHtml(marketText(item.entry_market_cap_usd))}</td><td>${escapeHtml(marketText(item.exit_market_cap_usd))}</td><td>${escapeHtml(marketText(item.entry_liquidity_usd))}</td><td>${escapeHtml(marketText(item.exit_liquidity_usd))}</td></tr>`;
+        return `<tr><td><span class="mint">${escapeHtml(displayTokenName(item))}</span>${copyControl(item.mint)}</td><td>${escapeHtml(tradeTimeText(item.signal_observed_at, item.signal_observed_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.evaluated_at, item.evaluated_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.entry_quote_at, item.entry_time_status))}</td><td>${escapeHtml(quoteQueueWaitText(item.quote_queue_wait_ms))}</td><td>${escapeHtml(tradeTimeText(item.opened_at, item.opened_at ? 'known' : 'unknown'))}</td><td>${escapeHtml(tradeTimeText(item.exit_quote_at, item.exit_time_status))}</td><td>${escapeHtml(tradeTimeText(item.closed_at, item.closed_at ? 'known' : 'unknown'))}</td><td><strong>${escapeHtml(tokenPriceText(buyPrice))}</strong><small class="table-subtext">${escapeHtml(buySource)}</small></td><td><strong>${escapeHtml(tokenPriceText(sellPrice))}</strong><small class="table-subtext">${escapeHtml(sellSource)}</small></td><td><span class="${pnlClass(pnl)}">${escapeHtml(pnlAmountText(pnl))}</span></td><td><span class="${pnlClass(item.pnl_rate_pct)}">${escapeHtml(pnlRateText(item.pnl_rate_pct))}</span></td><td>${escapeHtml(countText(item.entry_holders ?? item.holders))}</td><td>${escapeHtml(exitHoldersText(item))}</td><td>${escapeHtml(marketText(item.entry_market_cap_usd))}</td><td>${escapeHtml(marketText(item.exit_market_cap_usd))}</td><td>${escapeHtml(marketText(item.entry_liquidity_usd))}</td><td>${escapeHtml(marketText(item.exit_liquidity_usd))}</td></tr>`;
       }).join('')
-      : '<tr><td colspan="17" class="empty-state">暂无已平仓记录</td></tr>';
+      : '<tr><td colspan="18" class="empty-state">暂无已平仓记录</td></tr>';
+  }
+
+  function quoteQueueWaitText(value) {
+    const milliseconds = Number(value);
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) return '—';
+    return milliseconds < 1000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds / 1000).toFixed(2)} 秒`;
   }
 
   function exitHoldersText(item) {
@@ -524,7 +549,7 @@
     const observation = observationWindowText();
     $('#strategy-summary').innerHTML = isBsc
       ? `<div class="summary-line"><span>定价模式</span><strong>BSC 链上可执行只读报价</strong></div><div class="summary-line"><span>执行报价</span><strong>可执行只读 Quote · 不广播</strong></div><div class="summary-line"><span>参考价格</span><strong>Binance 仅作 Dashboard 对照，不参与 PnL</strong></div><div class="summary-line"><span>观察期</span><strong>${escapeHtml(observation)}后价格必须上涨，持币地址数不得低于首次发现</strong></div><div class="summary-line"><span>Paper / Shadow退出</span><strong>止盈 +${escapeHtml(paper.take_profit_pct || '10')}% / 止损 ${escapeHtml(paper.stop_loss_trigger_pct || '-10')}% / 超时 ${escapeHtml(paper.max_hold_sec || 600)} 秒</strong></div><div class="summary-line"><span>虚拟仓位</span><strong>${escapeHtml(config.strategy_config?.risk?.position_size_bnb || '0.001')} BNB</strong></div>`
-      : `<div class="summary-line"><span>入场窗口</span><strong>${escapeHtml(age[0])}–${escapeHtml(age[1])} 秒</strong></div><div class="summary-line"><span>观察期</span><strong>${escapeHtml(observation)}；价格、持币地址、市值、流动性仅记录</strong></div><div class="summary-line"><span>买家门槛</span><strong>≥ ${escapeHtml(entry.unique_buyers_15s_min || 6)} / 15 秒</strong></div><div class="summary-line"><span>止盈 / 止损</span><strong>+${escapeHtml(paper.take_profit_pct || '10')}% / ${escapeHtml(paper.stop_loss_trigger_pct || '-20')}%</strong></div><div class="summary-line"><span>最长持仓</span><strong>${escapeHtml(paper.max_hold_sec || 600)} 秒</strong></div>`;
+      : `<div class="summary-line"><span>入场窗口</span><strong>${escapeHtml(age[0])}–${escapeHtml(age[1])} 秒</strong></div><div class="summary-line"><span>观察期</span><strong>${escapeHtml(observation)}；价格、持币地址、市值、流动性仅记录</strong></div><div class="summary-line"><span>买家门槛</span><strong>≥ ${escapeHtml(entry.unique_buyers_15s_min || 6)} / 15 秒</strong></div><div class="summary-line"><span>止盈 / 止损</span><strong>${paper.partial_take_profit_enabled ? `TP1 +${escapeHtml(paper.take_profit_1_pct)}% 卖剩余 ${escapeHtml(paper.take_profit_1_sell_pct)}% · TP2 +${escapeHtml(paper.take_profit_2_pct)}% 再卖剩余 ${escapeHtml(paper.take_profit_2_sell_pct)}% · TP2 后回成本清仓 / 止损 ${escapeHtml(paper.stop_loss_trigger_pct)}%` : `+${escapeHtml(paper.take_profit_pct || '10')}% / ${escapeHtml(paper.stop_loss_trigger_pct || '-20')}%`}</strong></div><div class="summary-line"><span>最长持仓</span><strong>${escapeHtml(paper.max_hold_sec || 600)} 秒</strong></div>`;
   }
 
   function openModal() {
@@ -545,7 +570,7 @@
     const labels = { entry: isBsc ? 'BSC 入场与定价规则' : '入场硬条件', paper_exit: 'Paper 退出规则', shadow_exit: 'Shadow 规则', risk: '虚拟风控' };
     const textFor = (key, value) => {
       const names = {
-        token_age_sec: `币龄 ${value[0]}–${value[1]} 秒`, unique_buyers_15s_min: `15 秒独立买家数 ≥ ${value}`, buy_sell_count_ratio_15s_min: `15 秒买卖笔数比 ≥ ${value}`, net_buy_15s: `15 秒净买入 > 0`, require_two_non_negative_flow_windows: '两个短窗口净流量均非负', creator_confirmed_sold_at_entry: '创建者确认卖出必须为否', require_executable_buy_route: '必须存在可执行买入 Quote', require_executable_sell_route: '必须存在可执行卖出 Quote', max_buy_price_impact_pct: `买入价格影响 ≤ ${value}%`, max_immediate_exit_impact_pct: `即时卖出价格影响 ≤ ${value}%`, min_holders: `${groups.entry?.holders_policy === 'record_only' ? '持币地址数仅记录' : `${groups.entry?.min_holders_inclusive ? '入场时持币地址数 ≥' : '入场时持币地址数 >'} ${value}`}`, min_market_cap_usd: groups.entry?.market_cap_policy === 'record_only' ? '市值仅记录' : `入场时市值 ≥ ${value} USD`, min_liquidity_usd: groups.entry?.liquidity_policy === 'record_only' ? '流动性仅记录' : `入场时流动性 ≥ ${value} USD`, take_profit_pct: `止盈 ≥ ${value}% · 全部退出`, stop_loss_trigger_pct: `止损 ≤ ${value}% · 全部退出`, max_hold_sec: `最长持仓 ${value} 秒`, take_profit_sell_pct: `止盈卖出 ${value}%`, stop_loss_sell_pct: `止损卖出 ${value}%`, partial_take_profit_enabled: '不启用分批止盈', moving_stop_enabled: '不启用移动止损', shadow_holders_drop_pct: `Shadow 持币地址数下降超过 ${value}% 时提前退出`, shadow_liquidity_drop_pct: `Shadow 流动性下降超过 ${value}% 时提前退出`, shadow_defense_pct: `防御退出收益率 ≤ ${value}%`, shadow_time_sec: `Shadow 时间退出 ≥ ${value} 秒`, shadow_mfe_pct: `Shadow MFE 门槛 ${value}%`, rules: 'Shadow 规则组', position_size_sol: `单笔虚拟仓位 ${value} SOL`, initial_virtual_balance_sol: `初始虚拟余额 ${value} SOL`, max_open_positions: `最大同时持仓 ${value}`, same_name_cooldown_sec: `同名冷却 ${value} 秒`, one_trade_per_mint: '同一 Mint 只允许一个生命周期', daily_full_loss_sol_limit: `每日完整亏损上限 ${value} SOL`, pause_new_entries_after_large_losses: `大亏 ${value} 次后暂停新入场`, large_loss_threshold_pct: `大亏阈值 ${value}%`,
+        token_age_sec: `币龄 ${value[0]}–${value[1]} 秒`, unique_buyers_15s_min: `15 秒独立买家数 ≥ ${value}`, buy_sell_count_ratio_15s_min: `15 秒买卖笔数比 ≥ ${value}`, net_buy_15s: `15 秒净买入 > 0`, require_two_non_negative_flow_windows: '两个短窗口净流量均非负', creator_confirmed_sold_at_entry: '创建者确认卖出必须为否', require_executable_buy_route: '必须存在可执行买入 Quote', require_executable_sell_route: '必须存在可执行卖出 Quote', max_buy_price_impact_pct: `买入价格影响 ≤ ${value}%`, max_immediate_exit_impact_pct: `即时卖出价格影响 ≤ ${value}%`, min_holders: `${groups.entry?.holders_policy === 'record_only' ? '持币地址数仅记录' : `${groups.entry?.min_holders_inclusive ? '入场时持币地址数 ≥' : '入场时持币地址数 >'} ${value}`}`, min_market_cap_usd: groups.entry?.market_cap_policy === 'record_only' ? '市值仅记录' : `入场时市值 ≥ ${value} USD`, min_liquidity_usd: groups.entry?.liquidity_policy === 'record_only' ? '流动性仅记录' : `入场时流动性 ≥ ${value} USD`, take_profit_pct: `最终止盈 ≥ ${value}%`, take_profit_1_pct: `TP1 ≥ ${value}%`, take_profit_1_sell_pct: `TP1 卖出当前剩余仓位 ${value}%`, take_profit_2_pct: `TP2 ≥ ${value}%`, take_profit_2_sell_pct: `TP2 卖出当前剩余仓位 ${value}%`, tp2_breakeven_exit_enabled: 'TP2 后跌回成本价清仓', stop_loss_trigger_pct: `止损 ≤ ${value}% · 全部退出`, max_hold_sec: `最长持仓 ${value} 秒`, take_profit_sell_pct: `止盈卖出 ${value}%`, stop_loss_sell_pct: `止损卖出 ${value}%`, partial_take_profit_enabled: '启用分批止盈', moving_stop_enabled: '启用 TP2 后成本价保护', shadow_holders_drop_pct: `Shadow 持币地址数下降超过 ${value}% 时提前退出`, shadow_liquidity_drop_pct: `Shadow 流动性下降超过 ${value}% 时提前退出`, shadow_defense_pct: `防御退出收益率 ≤ ${value}%`, shadow_time_sec: `Shadow 时间退出 ≥ ${value} 秒`, shadow_mfe_pct: `Shadow MFE 门槛 ${value}%`, rules: 'Shadow 规则组', position_size_sol: `单笔虚拟仓位 ${value} SOL`, initial_virtual_balance_sol: `初始虚拟余额 ${value} SOL`, max_open_positions: `最大同时持仓 ${value}`, same_name_cooldown_sec: `同名冷却 ${value} 秒`, one_trade_per_mint: '同一 Mint 只允许一个生命周期', daily_full_loss_sol_limit: `每日完整亏损上限 ${value} SOL`, pause_new_entries_after_large_losses: `大亏 ${value} 次后暂停新入场`, large_loss_threshold_pct: `大亏阈值 ${value}%`,
         pricing_mode: '定价模式：BSC 链上只读报价', executable_quote: value ? '可执行只读报价：是（不广播）' : '可执行报价：否', require_readonly_buy_quote: '必须取得非零链上买入 Quote', require_readonly_sell_quote: '必须取得非零链上即时卖出 Quote', binance_indicative_reference_only: 'Binance 指示价仅作 Dashboard 对照，不参与 PnL', observation_delay_sec: `观察期 ${observation}`, observation_price_rise_required: value ? `${observation}观察后价格必须高于首次发现价格` : `${observation}观察后价格仅记录`, observation_price_policy: value === 'hard' ? `${observation}观察后价格为硬条件` : `${observation}观察后价格仅记录，不阻断入场`, observation_liquidity_policy: value === 'hard' ? `${observation}观察后流动性为硬条件` : `${observation}观察后流动性仅记录，不阻断入场`, holders_policy: value === 'hard' ? '持币地址数为硬条件' : '持币地址数仅记录，不阻断入场', market_cap_policy: value === 'hard' ? '市值为硬条件' : '市值仅记录，不阻断入场', liquidity_policy: value === 'hard' ? '流动性为硬条件' : '流动性仅记录，不阻断入场', require_holders_non_decreasing_after_observation: value ? `${observation}观察后持币地址数不得低于首次发现值` : '观察后持币地址数仅记录，不设下降门槛', optional_unavailable_fields: `不可用字段（仅记录、不阻断）：${Array.isArray(value) ? value.join('、') : value}`, position_size_bnb: `单笔虚拟仓位 ${value} BNB`, initial_virtual_balance_bnb: `初始虚拟余额 ${value} BNB`, daily_full_loss_bnb: `每日完整亏损上限 ${value} BNB`,
       };
       if (key === 'rules') {

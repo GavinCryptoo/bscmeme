@@ -1,0 +1,17 @@
+ALTER TABLE survivor_positions ADD COLUMN entry_order_id TEXT;
+ALTER TABLE survivor_positions ADD COLUMN entry_tx_hash TEXT;
+ALTER TABLE survivor_positions ADD COLUMN entry_swap_status TEXT;
+ALTER TABLE survivor_positions ADD COLUMN entry_submitted_at TEXT;
+ALTER TABLE survivor_positions ADD COLUMN entry_confirmed_at TEXT;
+ALTER TABLE survivor_positions ADD COLUMN actual_entry_quantity_token TEXT;
+ALTER TABLE survivor_positions ADD COLUMN actual_entry_spend_bnb TEXT;
+ALTER TABLE survivor_positions ADD COLUMN actual_entry_price_native TEXT;
+ALTER TABLE survivor_positions ADD COLUMN entry_fee_bnb TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_order_id TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_tx_hash TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_swap_status TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_submitted_at TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_confirmed_at TEXT;
+ALTER TABLE survivor_positions ADD COLUMN actual_exit_quantity_token TEXT;
+ALTER TABLE survivor_positions ADD COLUMN actual_exit_proceeds_bnb TEXT;
+ALTER TABLE survivor_positions ADD COLUMN exit_fee_bnb TEXT;

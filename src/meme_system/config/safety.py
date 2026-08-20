@@ -80,3 +80,12 @@ class SafetyConfig:
             raise SafetyViolation("BSC Live switches require --chain bsc --mode live")
         if not self.paper_only or self.wallet_enabled or self.signing_enabled or self.broadcast_enabled:
             raise SafetyViolation("Paper/Shadow require PAPER_ONLY=true and execution capabilities disabled")
+        if chain == "solana":
+            sol_signing = os.environ.get("SOL_SIGNING_ENABLED", "false").strip().lower()
+            sol_broadcast = os.environ.get("SOL_BROADCAST_ENABLED", "false").strip().lower()
+            allow_live = os.environ.get("ALLOW_LIVE_TRADING", "false").strip().lower()
+            if sol_signing != "false" or sol_broadcast != "false" or allow_live != "false":
+                raise SafetyViolation(
+                    "Solana Paper requires ALLOW_LIVE_TRADING=false, "
+                    "SOL_SIGNING_ENABLED=false and SOL_BROADCAST_ENABLED=false"
+                )

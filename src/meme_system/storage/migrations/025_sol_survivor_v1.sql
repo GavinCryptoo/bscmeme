@@ -1,0 +1,11 @@
+ALTER TABLE survivor_candidates ADD COLUMN canonical_strategy_price TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN canonical_price_source TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN protocol_state TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN source_switch_at TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN old_price_source TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN new_price_source TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN source_switch_old_price TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN source_switch_new_price TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN source_switch_gap_pct TEXT;
+ALTER TABLE survivor_candidates ADD COLUMN source_switch_safe INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE survivor_positions ADD COLUMN structure_stop_native TEXT;

@@ -62,6 +62,11 @@ class BaselineConfig:
     position_size_sol: Decimal = Decimal("0.001")
     take_profit_pct: Decimal = Decimal("0.10")
     stop_loss_trigger_pct: Decimal = Decimal("-0.20")
+    partial_take_profit_enabled: bool = False
+    take_profit_1_pct: Decimal = Decimal("0.10")
+    take_profit_2_pct: Decimal = Decimal("0.10")
+    partial_take_profit_sell_pct: Decimal = Decimal("1")
+    tp2_breakeven_exit_enabled: bool = False
     max_hold_sec: int = 600
     daily_full_loss_sol_limit: Decimal = Decimal("0.01")
     pause_new_entries_after_large_losses: int = 50
@@ -77,14 +82,22 @@ def solana_baseline_config() -> BaselineConfig:
     """Return the single Solana Paper/Shadow entry configuration.
 
     These are the existing runner values, centralized so the runner and
-    Dashboard cannot silently advertise different controls.  Record-only
-    fields deliberately retain their historical values but have no reject
-    effect unless an explicit enforcement flag is enabled.
+    Dashboard cannot silently advertise different controls.  Holders is the
+    configured Solana hard gate; the remaining market-data fields stay
+    record-only unless explicitly enabled.
     """
     return BaselineConfig(
-        min_holders=5,
-        min_holders_inclusive=True,
+        enforce_holders=True,
+        min_holders=20,
+        min_holders_inclusive=False,
         pause_new_entries_after_large_losses=1000,
+        take_profit_pct=Decimal("0.30"),
+        stop_loss_trigger_pct=Decimal("-0.30"),
+        partial_take_profit_enabled=True,
+        take_profit_1_pct=Decimal("0.20"),
+        take_profit_2_pct=Decimal("0.30"),
+        partial_take_profit_sell_pct=Decimal("0.50"),
+        tp2_breakeven_exit_enabled=True,
     )
 
 
@@ -184,6 +197,17 @@ class BaselineStrategy:
         """Check all non-quote gates before an expensive BSC quote request."""
 
         return all(check.passed for check in self._local_entry_checks(features))
+
+    def evaluate_local_entry(self, features: EntryFeatures) -> EntryDecision:
+        """Record a pre-quote decision without fabricating quote failures."""
+
+        checks = self._local_entry_checks(features)
+        return EntryDecision(
+            accepted=all(check.passed for check in checks),
+            identity=self.config.identity,
+            checks=tuple(checks),
+            soft_features=dict(features.soft_features or {}),
+        )
 
     def evaluate_entry(self, features: EntryFeatures) -> EntryDecision:
         checks = self._local_entry_checks(features)
@@ -392,13 +416,14 @@ class BaselineStrategy:
             estimated_network_fee_sol,
             estimated_priority_fee_sol,
         )
-        reason = self._paper_exit_reason(cost.gross_pnl_pct, age_sec)
+        price_return_pct = self._price_return_pct(position, sell_quote)
+        reason = self._paper_exit_reason(position, price_return_pct, age_sec)
         return ExitDecision(
             triggered=reason is not None,
             identity=position.identity,
             reason=reason,
             position_age_sec=age_sec,
-            return_pct=cost.gross_pnl_pct,
+            return_pct=price_return_pct,
             quote=sell_quote,
             cost=cost,
         )
@@ -465,7 +490,8 @@ class BaselineStrategy:
                 estimated_priority_fee_sol,
             )
             reason = self._paper_exit_reason(
-                cost.gross_pnl_pct,
+                position,
+                self._price_return_pct(position, sell_quote),
                 features.position_age_sec,
             )
 
@@ -475,7 +501,11 @@ class BaselineStrategy:
                 identity=position.identity,
                 reason=None,
                 position_age_sec=features.position_age_sec,
-                return_pct=cost.gross_pnl_pct if cost is not None else features.return_pct,
+                return_pct=(
+                    self._price_return_pct(position, sell_quote)
+                    if cost is not None and sell_quote is not None
+                    else features.return_pct
+                ),
                 quote=sell_quote,
                 cost=cost,
             )
@@ -506,15 +536,36 @@ class BaselineStrategy:
             identity=position.identity,
             reason=reason,
             position_age_sec=features.position_age_sec,
-            return_pct=cost.gross_pnl_pct,
+            return_pct=self._price_return_pct(position, sell_quote),
             quote=sell_quote,
             cost=cost,
         )
 
-    def _paper_exit_reason(self, gross_pnl_pct: Decimal, age_sec: int) -> str | None:
-        if gross_pnl_pct <= self.config.stop_loss_trigger_pct:
+    def _paper_exit_reason(
+        self,
+        position: VirtualPosition,
+        price_return_pct: Decimal,
+        age_sec: int,
+    ) -> str | None:
+        if price_return_pct <= self.config.stop_loss_trigger_pct:
             return "stop_loss"
-        if gross_pnl_pct >= self.config.take_profit_pct:
+        if (
+            self.config.partial_take_profit_enabled
+            and position.tp2_executed_at is not None
+            and self.config.tp2_breakeven_exit_enabled
+            and price_return_pct <= ZERO
+        ):
+            return "tp2_breakeven_exit"
+        if self.config.partial_take_profit_enabled:
+            if position.tp1_executed_at is None and price_return_pct >= self.config.take_profit_1_pct:
+                return "take_profit_1"
+            if (
+                position.tp1_executed_at is not None
+                and position.tp2_executed_at is None
+                and price_return_pct >= self.config.take_profit_2_pct
+            ):
+                return "take_profit_2"
+        elif price_return_pct >= self.config.take_profit_pct:
             return "take_profit"
         if age_sec >= self.config.max_hold_sec:
             return "max_hold_timeout"
@@ -703,22 +754,39 @@ class BaselineStrategy:
         estimated_network_fee_sol: Decimal | None,
         estimated_priority_fee_sol: Decimal | None,
     ) -> CostBreakdown:
-        gross_pnl_sol = sell_quote.output_quantity - position.quantity_sol
+        gross_proceeds = position.realized_proceeds_sol + sell_quote.output_quantity
+        gross_pnl_sol = gross_proceeds - position.quantity_sol
         gross_pnl_pct = gross_pnl_sol / position.quantity_sol
-        route_fee = sell_quote.route_fee
-        known_costs = (route_fee or ZERO) + (
-            estimated_network_fee_sol or ZERO
-        ) + (estimated_priority_fee_sol or ZERO)
+        route_fee = position.realized_route_fee_sol + (sell_quote.route_fee or ZERO)
+        network_fee = position.realized_network_fee_sol + (estimated_network_fee_sol or ZERO)
+        priority_fee = position.realized_priority_fee_sol + (estimated_priority_fee_sol or ZERO)
+        known_costs = route_fee + network_fee + priority_fee
         return CostBreakdown(
             gross_pnl_sol=gross_pnl_sol,
             gross_pnl_pct=gross_pnl_pct,
             route_fee_sol=route_fee,
-            estimated_network_fee_sol=estimated_network_fee_sol,
-            estimated_priority_fee_sol=estimated_priority_fee_sol,
+            estimated_network_fee_sol=network_fee,
+            estimated_priority_fee_sol=priority_fee,
             net_pnl_estimated_sol=gross_pnl_sol - known_costs,
             net_pnl_is_estimated=(
-                route_fee is None
+                sell_quote.route_fee is None
                 or estimated_network_fee_sol is None
                 or estimated_priority_fee_sol is None
             ),
         )
+
+    @staticmethod
+    def _price_return_pct(position: VirtualPosition, sell_quote: ExecutableQuote) -> Decimal:
+        """Mark the current unit price against entry, excluding prior TP proceeds."""
+        if (
+            position.entry_quantity_token <= ZERO
+            or position.quantity_sol <= ZERO
+            or sell_quote.input_quantity <= ZERO
+        ):
+            return ZERO
+        marked_value = (
+            sell_quote.output_quantity
+            * position.entry_quantity_token
+            / sell_quote.input_quantity
+        )
+        return (marked_value - position.quantity_sol) / position.quantity_sol
