@@ -64,6 +64,7 @@ from meme_system.adapters.protocols import ExecutableQuote
 from meme_system.analytics.live_entry_outcomes import build_report
 from meme_system.domain.models import BALANCED_SURVIVOR_REVERSAL_IDENTITY, SURVIVOR_REVERSAL_IDENTITY, StrategyIdentity
 from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, RuntimeControl
+from meme_system.runtime_logging import runtime_log_event
 from meme_system.storage.runtime_store import RuntimeStore
 
 
@@ -2393,7 +2394,7 @@ class SurvivorReversalEngine:
                     "stage": "venue_result_apply",
                     "elapsed_ms": round(apply_ms, 3),
                 }
-                print("SLOW_VENUE_RESULT_APPLY", json.dumps(self._last_slow_venue_apply, ensure_ascii=False), flush=True)
+                runtime_log_event("SLOW_VENUE_RESULT_APPLY", **self._last_slow_venue_apply)
         self._record_stage_metric("venue_result_apply", (time.monotonic() - started) * 1000, applied)
         return applied
 
@@ -3675,21 +3676,25 @@ class SurvivorReversalEngine:
 
     def _ensure_factory_cursors(self) -> None:
         """Production-start bootstrap; runs on the Balanced owner thread."""
-        print("FACTORY_CURSOR_BOOTSTRAP_ENTER", flush=True)
-        print(f"FACTORY_CURSOR_DB_READ v2={self._factory_cursor[V2_POOL_TYPE]} v3={self._factory_cursor[V3_POOL_TYPE]}", flush=True)
+        runtime_log_event("FACTORY_CURSOR_BOOTSTRAP_ENTER")
+        runtime_log_event(
+            "FACTORY_CURSOR_DB_READ",
+            v2=self._factory_cursor[V2_POOL_TYPE],
+            v3=self._factory_cursor[V3_POOL_TYPE],
+        )
         if self._factory_cursor[V2_POOL_TYPE] is not None and self._factory_cursor[V3_POOL_TYPE] is not None:
             self._factory_gap_required = True
-            print("FACTORY_CURSOR_BOOTSTRAP_DONE existing", flush=True)
+            runtime_log_event("FACTORY_CURSOR_BOOTSTRAP_DONE", state="existing")
             return
         if self.resolver is None:
-            print("FACTORY_CURSOR_BOOTSTRAP_DONE resolver_unconfigured", flush=True)
+            runtime_log_event("FACTORY_CURSOR_BOOTSTRAP_DONE", state="resolver_unconfigured")
             return
         head = self.resolver.logs_rpc.call("eth_blockNumber", ())
         try:
             block = int(str(head), 16)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("FACTORY_CURSOR_BOOTSTRAP head_block_failed") from exc
-        print(f"FACTORY_CURSOR_INITIALIZE block={block}", flush=True)
+        runtime_log_event("FACTORY_CURSOR_INITIALIZE", block=block)
         for pool_type in (V2_POOL_TYPE, V3_POOL_TYPE):
             if self._factory_cursor[pool_type] is None:
                 self._save_factory_cursor(pool_type, block)
@@ -3697,9 +3702,13 @@ class SurvivorReversalEngine:
         self._factory_cursor = {V2_POOL_TYPE: self._load_factory_cursor(V2_POOL_TYPE), V3_POOL_TYPE: self._load_factory_cursor(V3_POOL_TYPE)}
         if self._factory_cursor[V2_POOL_TYPE] is None or self._factory_cursor[V3_POOL_TYPE] is None:
             raise RuntimeError("FACTORY_CURSOR_BOOTSTRAP persistence_failed")
-        print(f"FACTORY_CURSOR_PERSISTED v2={self._factory_cursor[V2_POOL_TYPE]} v3={self._factory_cursor[V3_POOL_TYPE]}", flush=True)
+        runtime_log_event(
+            "FACTORY_CURSOR_PERSISTED",
+            v2=self._factory_cursor[V2_POOL_TYPE],
+            v3=self._factory_cursor[V3_POOL_TYPE],
+        )
         self._factory_gap_required = True
-        print("FACTORY_CURSOR_BOOTSTRAP_DONE initialized", flush=True)
+        runtime_log_event("FACTORY_CURSOR_BOOTSTRAP_DONE", state="initialized")
 
     def _save_factory_cursor(self, pool_type: str, block: int) -> None:
         self._factory_cursor[pool_type] = block
@@ -5655,7 +5664,7 @@ class SurvivorReversalEngine:
                     "stage": "venue_result_apply",
                     "elapsed_ms": round(apply_ms, 3),
                 }
-                print("SLOW_VENUE_RESULT_APPLY", json.dumps(self._last_slow_venue_apply, ensure_ascii=False), flush=True)
+                runtime_log_event("SLOW_VENUE_RESULT_APPLY", **self._last_slow_venue_apply)
         self._record_stage_metric("venue_result_apply", (time.monotonic() - started) * 1000, applied)
         return applied
 

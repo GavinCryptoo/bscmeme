@@ -41,6 +41,7 @@ SQLite WAL、审计日志、Dashboard
 价格职责保持分离：Binance 价格是发现/诊断参考；策略规范价来自已验证的链上 Venue/WSS 或协议实时数据；Quote 是可执行性检查；真实 Entry/Exit 价格只能来自已确认订单、receipt 和余额对账。
 
 详细模块职责见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+运行日志格式与保留规则见 [`docs/RUNTIME_LOGGING.md`](docs/RUNTIME_LOGGING.md)。
 
 ## Paper / Shadow / Live
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -59,6 +60,7 @@ from meme_system.engines.ledger import SimulationLedger
 from meme_system.engines.simulation import DeterministicSimulation
 from meme_system.realtime import BinanceRealtimeFeatureProvider, RealtimeCoordinator
 from meme_system.runtime_ops import HealthRegistry, JsonlAuditWriter, LatencyRecorder, RuntimeControl, SingleInstanceLock
+from meme_system.runtime_logging import configure_runtime_logging, shutdown_runtime_logging
 
 
 class _AsyncReadOnlySource:
@@ -192,6 +194,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.strategy_profile == "balanced" and (args.chain != "bsc" or args.mode not in {"paper", "live"}):
         _parser().error("--strategy-profile balanced requires --chain bsc --mode paper or live")
     _configure_balanced_bsc_isolation(args.strategy_profile)
+    runtime_logger = configure_runtime_logging(
+        os.environ.get("RUNTIME_LOG_PATH", "logs/runtime.log"),
+        strategy_mode=args.mode,
+        chain=args.chain,
+        datasource=os.environ.get("DATA_SOURCE", "fixture").strip().lower() or "fixture",
+    )
+
+    def emit_status(payload: Mapping[str, object], *, level: int = logging.INFO) -> None:
+        runtime_logger.record(payload, level=level)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), flush=True)
+
+    runtime_logger.event("runtime_starting", runner="run_realtime")
     try:
         safety = SafetyConfig.from_env()
         safety.validate_for_mode(chain=args.chain, mode=args.mode)
@@ -199,10 +213,12 @@ def main(argv: list[str] | None = None) -> int:
         paths = RuntimePaths.from_env(args.chain)
         paths.validate_isolation()
     except (ValueError, RuntimeError) as exc:
-        print(json.dumps({"status": "blocked", "error_class": type(exc).__name__, "message": str(exc)[:300]}, ensure_ascii=False))
+        emit_status({"status": "blocked", "error_class": type(exc).__name__, "message": str(exc)[:300]}, level=logging.ERROR)
+        shutdown_runtime_logging()
         return 2
     if data_source.data_source != "binance_web3":
-        print(json.dumps({"status": "blocked", "error_class": "realtime_requires_binance_web3", "data_source": data_source.data_source}, ensure_ascii=False))
+        emit_status({"status": "blocked", "error_class": "realtime_requires_binance_web3", "data_source": data_source.data_source}, level=logging.ERROR)
+        shutdown_runtime_logging()
         return 2
     bsc_executable_quote_enabled = (
         args.chain == "bsc"
@@ -243,15 +259,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     survivor_only = survivor_config is not None and survivor_config.enabled
     if args.chain == "bsc" and args.mode == "paper" and not survivor_only:
-        print(json.dumps({"status": "blocked", "error_class": "survivor_v1_required", "message": "BSC Paper requires MEME_SURVIVOR_REVERSAL_V1"}, ensure_ascii=False))
+        emit_status({"status": "blocked", "error_class": "survivor_v1_required", "message": "BSC Paper requires MEME_SURVIVOR_REVERSAL_V1"}, level=logging.ERROR)
+        shutdown_runtime_logging()
         return 2
     if args.chain == "solana" and args.mode == "paper" and not survivor_only:
-        print(json.dumps({"status": "blocked", "error_class": "sol_survivor_v1_required", "message": "Solana Paper requires MEME_SURVIVOR_REVERSAL_SOL_V1"}, ensure_ascii=False))
+        emit_status({"status": "blocked", "error_class": "sol_survivor_v1_required", "message": "Solana Paper requires MEME_SURVIVOR_REVERSAL_SOL_V1"}, level=logging.ERROR)
+        shutdown_runtime_logging()
         return 2
     if survivor_config is not None and survivor_config.enabled:
         survivor_config.validate()
         self_check = survivor_config.self_check()
-        print(json.dumps({"event": "SURVIVOR_CONFIG_SELF_CHECK", **self_check}, ensure_ascii=False, sort_keys=True), flush=True)
+        emit_status({"event": "SURVIVOR_CONFIG_SELF_CHECK", **self_check})
     connections = {}
     engines = {}
     stores = {}
@@ -793,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
         started = time.monotonic()
         if args.once:
             result = coordinator.run_cycle()
-            print(json.dumps({"status": "ok", "once": True, "chain": args.chain, **result.__dict__}, ensure_ascii=False, default=str))
+            emit_status({"status": "ok", "once": True, "chain": args.chain, **result.__dict__})
         elif args.chain == "bsc":
             # Signal discovery keeps its configured cadence. Existing BSC
             # holdings use a separate 2-second Binance indicative-price
@@ -826,7 +844,7 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator.wait_for_position_refresh(stop_event, wait_for)
             if bsc_wss_monitor is not None:
                 coordinator.update_bsc_wss_status(bsc_wss_monitor.safe_status())
-            print(json.dumps({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes}, ensure_ascii=False))
+            emit_status({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes})
         else:
             # Solana holdings retain the established 2-second Jupiter quote
             # refresh, with account WSS able to trigger earlier processing.
@@ -848,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
                     while not stop_event.is_set() and time.monotonic() < wait_deadline:
                         coordinator.process_solana_wss_events()
                         stop_event.wait(min(0.2, max(0.0, wait_deadline - time.monotonic())))
-                print(json.dumps({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes}, ensure_ascii=False))
+                emit_status({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes})
                 return 0
 
             def run_solana_control_heartbeat() -> None:
@@ -883,10 +901,10 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator.run_cycle()
                 refresh_wss_subscriptions()
                 stop_event.wait(max(0.1, poll_sec))
-            print(json.dumps({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes}, ensure_ascii=False))
+            emit_status({"status": "stopped", "bounded": args.duration > 0, "chain": args.chain, "modes": modes})
         return 0
     except (ValueError, OSError, BscLiveError) as exc:
-        print(json.dumps({"status": "blocked", "error_class": type(exc).__name__, "message": str(exc)[:300]}, ensure_ascii=False))
+        emit_status({"status": "blocked", "error_class": type(exc).__name__, "message": str(exc)[:300]}, level=logging.ERROR)
         return 2
     finally:
         if live_telegram_started and telegram is not None:
@@ -917,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
             control_thread.join(timeout=5.0)
         for connection in connections.values():
             connection.close()
+        shutdown_runtime_logging()
 
 
 def run_with_lock(argv: list[str] | None = None) -> int:
