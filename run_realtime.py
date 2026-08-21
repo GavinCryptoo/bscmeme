@@ -192,18 +192,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.strategy_profile == "balanced" and (args.chain != "bsc" or args.mode not in {"paper", "live"}):
         _parser().error("--strategy-profile balanced requires --chain bsc --mode paper or live")
     _configure_balanced_bsc_isolation(args.strategy_profile)
-    safety = SafetyConfig.from_env()
     try:
+        safety = SafetyConfig.from_env()
         safety.validate_for_mode(chain=args.chain, mode=args.mode)
+        data_source = DataSourceConfig.from_env()
+        paths = RuntimePaths.from_env(args.chain)
+        paths.validate_isolation()
     except (ValueError, RuntimeError) as exc:
         print(json.dumps({"status": "blocked", "error_class": type(exc).__name__, "message": str(exc)[:300]}, ensure_ascii=False))
         return 2
-    data_source = DataSourceConfig.from_env()
     if data_source.data_source != "binance_web3":
         print(json.dumps({"status": "blocked", "error_class": "realtime_requires_binance_web3", "data_source": data_source.data_source}, ensure_ascii=False))
         return 2
-    paths = RuntimePaths.from_env(args.chain)
-    paths.validate_isolation()
     bsc_executable_quote_enabled = (
         args.chain == "bsc"
         and (

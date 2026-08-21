@@ -46,13 +46,23 @@ class SafetyConfig:
         return cls.from_mapping(os.environ)
 
     def validate(self) -> None:
-        required_safe_values = {
-            "PAPER_ONLY": self.paper_only,
-        }
-        invalid = [name for name, safe in required_safe_values.items() if not safe]
+        if self.paper_only and self.live_trading:
+            raise SafetyViolation(
+                "PAPER_ONLY=true conflicts with LIVE_TRADING=true; "
+                "set PAPER_ONLY=false for BSC Live"
+            )
+        if self.paper_only and self.bsc_live_enabled:
+            raise SafetyViolation(
+                "PAPER_ONLY=true conflicts with BSC_LIVE_ENABLED=true; "
+                "set PAPER_ONLY=false for BSC Live"
+            )
+
+        invalid: list[str] = []
         if self.bsc_live_enabled != self.live_trading:
             invalid.extend(("LIVE_TRADING", "BSC_LIVE_ENABLED"))
         if not self.bsc_live_enabled:
+            if not self.paper_only:
+                invalid.append("PAPER_ONLY")
             for name, enabled in {
                 "WALLET_ENABLED": self.wallet_enabled,
                 "SIGNING_ENABLED": self.signing_enabled,
@@ -71,6 +81,11 @@ class SafetyConfig:
         if mode == "live":
             if chain != "bsc":
                 raise SafetyViolation("live mode is available only for BSC")
+            if self.paper_only:
+                raise SafetyViolation(
+                    "BSC Live requires PAPER_ONLY=false; "
+                    "PAPER_ONLY=true cannot run with LIVE_TRADING=true"
+                )
             if not self.live_trading or not self.bsc_live_enabled:
                 raise SafetyViolation("LIVE_TRADING=true and BSC_LIVE_ENABLED=true are required for BSC Live")
             return

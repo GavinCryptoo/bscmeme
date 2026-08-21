@@ -29,13 +29,18 @@ class SafetyConfigTests(unittest.TestCase):
                     SafetyConfig.from_mapping({name: "true"})
 
     def test_bsc_live_switches_must_be_enabled_together(self) -> None:
-        config = SafetyConfig.from_mapping({"LIVE_TRADING": "true", "BSC_LIVE_ENABLED": "true"})
+        config = SafetyConfig.from_mapping({
+            "PAPER_ONLY": "false",
+            "LIVE_TRADING": "true",
+            "BSC_LIVE_ENABLED": "true",
+        })
         config.validate_for_mode(chain="bsc", mode="live")
         with self.assertRaises(SafetyViolation):
             config.validate_for_mode(chain="solana", mode="live")
 
     def test_bsc_live_telegram_is_allowed_for_safe_controls(self) -> None:
         config = SafetyConfig.from_mapping({
+            "PAPER_ONLY": "false",
             "LIVE_TRADING": "true",
             "BSC_LIVE_ENABLED": "true",
             "TELEGRAM_ENABLED": "true",
@@ -43,9 +48,29 @@ class SafetyConfigTests(unittest.TestCase):
         config.validate_for_mode(chain="bsc", mode="live")
 
     def test_bsc_live_switches_cannot_start_paper(self) -> None:
-        config = SafetyConfig.from_mapping({"LIVE_TRADING": "true", "BSC_LIVE_ENABLED": "true"})
+        config = SafetyConfig.from_mapping({
+            "PAPER_ONLY": "false",
+            "LIVE_TRADING": "true",
+            "BSC_LIVE_ENABLED": "true",
+        })
         with self.assertRaises(SafetyViolation):
             config.validate_for_mode(chain="bsc", mode="paper")
+
+    def test_paper_only_and_live_trading_conflict_is_explicit(self) -> None:
+        with self.assertRaisesRegex(SafetyViolation, "PAPER_ONLY=true conflicts with LIVE_TRADING=true"):
+            SafetyConfig.from_mapping({
+                "PAPER_ONLY": "true",
+                "LIVE_TRADING": "true",
+                "BSC_LIVE_ENABLED": "true",
+            })
+
+    def test_bsc_live_requires_paper_only_false(self) -> None:
+        config = SafetyConfig.from_mapping({
+            "PAPER_ONLY": "false",
+            "LIVE_TRADING": "true",
+            "BSC_LIVE_ENABLED": "true",
+        })
+        config.validate_for_mode(chain="bsc", mode="live")
 
     def test_paper_only_false_fails_closed(self) -> None:
         with self.assertRaises(SafetyViolation):
