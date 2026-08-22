@@ -42,6 +42,7 @@ SQLite WAL、审计日志、Dashboard
 
 详细模块职责见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 运行日志格式与保留规则见 [`docs/RUNTIME_LOGGING.md`](docs/RUNTIME_LOGGING.md)。
+开发环境、测试、Dashboard 和数据源扩展见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
 
 ## Paper / Shadow / Live
 
