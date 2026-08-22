@@ -17,12 +17,15 @@ from typing import Any
 
 @dataclass(frozen=True)
 class StoredHolderSnapshot:
+    """Holder observation recovered from an already persisted event."""
+
     holders: int
     observed_at: datetime
     source: str
 
 
 def _parse_datetime(value: object) -> datetime | None:
+    """Parse an ISO timestamp, returning null for malformed input."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -32,6 +35,7 @@ def _parse_datetime(value: object) -> datetime | None:
 
 
 def _holder_value(payload: object) -> int | None:
+    """Extract an explicitly observed non-negative holder count."""
     if not isinstance(payload, dict):
         return None
     # These are explicit observed-holder fields written by existing exit
@@ -58,6 +62,7 @@ def _event_snapshots(
     start: datetime,
     end: datetime,
 ) -> list[StoredHolderSnapshot]:
+    """Read holder snapshots from persisted lifecycle or audit events."""
     if table == "lifecycle_events":
         rows = connection.execute(
             "SELECT occurred_at, payload_json FROM lifecycle_events "

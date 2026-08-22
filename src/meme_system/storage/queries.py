@@ -11,6 +11,7 @@ from meme_system.domain.naming import clean_token_name
 
 
 def _decode_json(value: str | None) -> Any:
+    """Decode persisted JSON while preserving malformed legacy text."""
     if value is None:
         return None
     try:
@@ -30,6 +31,7 @@ def _unit_price(numerator: object, denominator: object) -> str | None:
 
 
 def _percentage(numerator: object, denominator: object) -> str | None:
+    """Return a precise percentage string or null for unavailable values."""
     value = _unit_price(numerator, denominator)
     if value is None:
         return None
@@ -68,6 +70,7 @@ def _price_source_label(quote_source: object, pricing_mode: object, legacy: obje
 
 
 def _price_delta_pct(local_price: object, jupiter_price: object) -> str | None:
+    """Compare two prices without treating missing data as zero."""
     if local_price in (None, "", "0") or jupiter_price in (None, ""):
         return None
     try:
@@ -89,6 +92,7 @@ class LedgerQueries:
         mode: str,
         display_since: str | None = None,
     ) -> None:
+        """Bind read-only views to one Paper or Shadow connection."""
         if mode not in {"paper", "shadow"}:
             raise ValueError("mode must be paper or shadow")
         self.connection = connection
@@ -96,9 +100,11 @@ class LedgerQueries:
         self.display_since = display_since
 
     def _rows(self, sql: str, params: tuple[object, ...] = ()) -> tuple[dict[str, object], ...]:
+        """Execute a read-only query and convert rows to plain dictionaries."""
         return tuple(dict(row) for row in self.connection.execute(sql, params))
 
     def signals(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest normalized discovery signals."""
         self._validate_limit(limit)
         where = ""
         params: list[object] = [self.mode]
@@ -115,6 +121,7 @@ class LedgerQueries:
         )
 
     def candidates(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest candidates with decoded rule checks and features."""
         self._validate_limit(limit)
         where = "WHERE c.mode = ?"
         params: list[object] = [self.mode]
@@ -143,6 +150,7 @@ class LedgerQueries:
         limit: int = 100,
         status: str | None = None,
     ) -> tuple[dict[str, object], ...]:
+        """Return newest positions, optionally restricted to one status."""
         self._validate_limit(limit)
         where = "WHERE vp.mode = ?"
         params: list[object] = [self.mode]
@@ -348,6 +356,7 @@ class LedgerQueries:
         row["exit_liquidity_usd"] = row.get("exit_liquidity_usd")
 
     def executions(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest persisted quote and execution records."""
         self._validate_limit(limit)
         where = "WHERE e.mode = ?"
         params: list[object] = [self.mode]
@@ -364,6 +373,7 @@ class LedgerQueries:
         )
 
     def shadow_outcomes(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest Shadow-only post-exit outcome records."""
         if self.mode != "shadow":
             raise ValueError("shadow_outcomes is only available for shadow mode")
         self._validate_limit(limit)
@@ -393,6 +403,7 @@ class LedgerQueries:
         limit: int = 200,
         position_id: str | None = None,
     ) -> tuple[dict[str, object], ...]:
+        """Return newest lifecycle events, optionally for one position."""
         self._validate_limit(limit)
         where = "WHERE le.mode = ?"
         params: list[object] = [self.mode]
@@ -416,12 +427,14 @@ class LedgerQueries:
         return tuple(decoded)
 
     def runtime_state(self) -> tuple[dict[str, object], ...]:
+        """Return current JSON runtime state values for this mode."""
         return self._rows(
             "SELECT * FROM runtime_state WHERE mode = ? ORDER BY updated_at DESC",
             (self.mode,),
         )
 
     def health_events(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest component health events with decoded details."""
         self._validate_limit(limit)
         rows = self._rows(
             "SELECT * FROM health_events WHERE mode = ? ORDER BY recorded_at DESC, health_id DESC LIMIT ?",
@@ -432,6 +445,7 @@ class LedgerQueries:
         return rows
 
     def latency_events(self, limit: int = 100) -> tuple[dict[str, object], ...]:
+        """Return newest measured stage latency events."""
         self._validate_limit(limit)
         return self._rows(
             "SELECT * FROM latency_events WHERE mode = ? ORDER BY recorded_at DESC, latency_id DESC LIMIT ?",
@@ -440,5 +454,6 @@ class LedgerQueries:
 
     @staticmethod
     def _validate_limit(limit: int) -> None:
+        """Enforce the bounded result size used by Dashboard-facing queries."""
         if not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer between 1 and 1000")

@@ -26,6 +26,7 @@ class PriceSnapshot:
     price_age_ms: int | None
 
     def as_dict(self) -> dict[str, object]:
+        """Serialize the observation while preserving unavailable fields as null."""
         return {
             "price_native": str(self.price_native) if self.price_native is not None else None,
             "native_symbol": self.native_symbol,
@@ -41,12 +42,15 @@ class PriceSnapshot:
 
 @dataclass(frozen=True)
 class StrategyIdentity:
+    """Immutable identity of a strategy ruleset and its configuration version."""
+
     strategy_name: str
     ruleset_name: str
     ruleset_version: str
     config_version: str
 
     def as_dict(self) -> dict[str, str]:
+        """Serialize the identity for audit records and runtime metadata."""
         return {
             "strategy_name": self.strategy_name,
             "ruleset_name": self.ruleset_name,
@@ -55,6 +59,7 @@ class StrategyIdentity:
         }
 
     def lifecycle_key(self, mint: str) -> tuple[str, str, str]:
+        """Return the stable key used to isolate one token lifecycle."""
         return (mint, self.strategy_name, self.ruleset_version)
 
 
@@ -99,6 +104,8 @@ SOL_SURVIVOR_REVERSAL_IDENTITY = StrategyIdentity(
 
 @dataclass(frozen=True)
 class Signal:
+    """Normalized discovery signal before strategy filtering."""
+
     signal_id: str
     mint: str
     observed_at: datetime
@@ -108,6 +115,8 @@ class Signal:
 
 @dataclass(frozen=True)
 class Candidate:
+    """Token candidate plus the checks and soft features used for evaluation."""
+
     candidate_id: str
     signal_id: str
     mint: str
@@ -121,6 +130,8 @@ class Candidate:
 
 @dataclass(frozen=True)
 class VirtualPosition:
+    """Paper/Shadow position state, including price and exit observations."""
+
     position_id: str
     mint: str
     mode: str
@@ -185,6 +196,7 @@ class VirtualPosition:
 
     @property
     def active_quantity_token(self) -> Decimal:
+        """Return the remaining token quantity, falling back to entry quantity."""
         if self.remaining_quantity_token == Decimal("0"):
             return self.entry_quantity_token
         return self.remaining_quantity_token
@@ -192,6 +204,8 @@ class VirtualPosition:
 
 @dataclass(frozen=True)
 class ExitEvent:
+    """Normalized request to evaluate or execute a position exit."""
+
     exit_id: str
     position_id: str
     mode: str
@@ -202,6 +216,8 @@ class ExitEvent:
 
 @dataclass(frozen=True)
 class RuleCheck:
+    """One named strategy rule evaluation and its diagnostic values."""
+
     name: str
     passed: bool
     actual: object
@@ -212,6 +228,8 @@ class RuleCheck:
 
 @dataclass(frozen=True)
 class EntryFeatures:
+    """Immutable feature snapshot supplied to an entry decision."""
+
     token_age_sec: int | None
     unique_buyers_15s: int | None
     buy_sell_count_ratio_15s: Decimal | None
@@ -237,6 +255,8 @@ class EntryFeatures:
 
 @dataclass(frozen=True)
 class EntryDecision:
+    """Result of evaluating all entry checks for a candidate."""
+
     accepted: bool
     identity: StrategyIdentity
     checks: tuple[RuleCheck, ...]
@@ -244,6 +264,7 @@ class EntryDecision:
 
     @property
     def failed_reason_codes(self) -> tuple[str, ...]:
+        """Return reason codes for checks that rejected the candidate."""
         return tuple(
             check.reason_code
             for check in self.checks
@@ -265,6 +286,8 @@ class EntryDecision:
 
 @dataclass(frozen=True)
 class CostBreakdown:
+    """Gross and estimated net cost components for an execution."""
+
     gross_pnl_sol: Decimal
     gross_pnl_pct: Decimal
     route_fee_sol: Decimal | None
@@ -276,6 +299,8 @@ class CostBreakdown:
 
 @dataclass(frozen=True)
 class ExitDecision:
+    """Result of evaluating position age, return and exit quote conditions."""
+
     triggered: bool
     identity: StrategyIdentity
     reason: str | None
@@ -287,6 +312,8 @@ class ExitDecision:
 
 @dataclass(frozen=True)
 class ShadowExitFeatures:
+    """Shadow-only features used to compare an exit against later prices."""
+
     position_age_sec: int
     return_pct: Decimal
     mfe_pct: Decimal
@@ -300,6 +327,8 @@ class ShadowExitFeatures:
 
 @dataclass(frozen=True)
 class ShadowOutcome:
+    """Post-exit outcome measurements retained for Shadow analysis."""
+
     position_id: str
     identity: StrategyIdentity
     returns_after_exit_pct: Mapping[int, Decimal | None]
@@ -311,6 +340,8 @@ class ShadowOutcome:
 
 @dataclass(frozen=True)
 class ExecutionRecord:
+    """Persisted quote or execution observation for a position action."""
+
     execution_id: str
     position_id: str
     mode: str
@@ -335,6 +366,8 @@ class ExecutionRecord:
 
 @dataclass(frozen=True)
 class PositionObservation:
+    """One validated mark observation used to track MFE/MAE."""
+
     position_id: str
     observed_at: datetime
     quote_id: str | None
@@ -347,6 +380,8 @@ class PositionObservation:
 
 @dataclass(frozen=True)
 class LifecycleEvent:
+    """Append-only event describing a position lifecycle transition."""
+
     event_id: str
     position_id: str
     mode: str

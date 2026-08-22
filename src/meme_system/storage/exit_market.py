@@ -13,6 +13,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class StoredMarketSnapshot:
+    """Market-cap and liquidity observation recovered from stored candidates."""
+
     market_cap_usd: Decimal | None
     liquidity_usd: Decimal | None
     observed_at: datetime
@@ -20,6 +22,7 @@ class StoredMarketSnapshot:
 
 
 def _parse_datetime(value: object) -> datetime | None:
+    """Parse an ISO timestamp, returning null for malformed input."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -29,6 +32,7 @@ def _parse_datetime(value: object) -> datetime | None:
 
 
 def _decimal(value: object) -> Decimal | None:
+    """Parse a finite non-negative decimal without inventing a fallback."""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -47,6 +51,7 @@ def _candidate_snapshots(
     start: datetime,
     end: datetime,
 ) -> list[StoredMarketSnapshot]:
+    """Read candidate snapshots within a bounded pre-exit time window."""
     entry_candidate_id = (
         position_id[:-len(":position")]
         if position_id.endswith(":position")

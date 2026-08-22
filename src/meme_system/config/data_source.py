@@ -12,10 +12,13 @@ SUPPORTED_DATA_SOURCES = frozenset({"fixture", "replay", "binance_web3"})
 
 @dataclass(frozen=True)
 class DataSourceConfig:
+    """Explicit source selection used by discovery and realtime runners."""
+
     data_source: str = "fixture"
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> "DataSourceConfig":
+        """Build a validated source configuration from string settings."""
         source = values.get("DATA_SOURCE", "fixture").strip().lower()
         if source not in SUPPORTED_DATA_SOURCES:
             raise ValueError(f"DATA_SOURCE must be one of {sorted(SUPPORTED_DATA_SOURCES)}")
@@ -23,4 +26,5 @@ class DataSourceConfig:
 
     @classmethod
     def from_env(cls) -> "DataSourceConfig":
+        """Build the source configuration from the current process environment."""
         return cls.from_mapping(os.environ)

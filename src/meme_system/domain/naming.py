@@ -13,6 +13,7 @@ _BIDI_CONTROL_RANGES = (
 
 
 def clean_token_name(value: object | None) -> str | None:
+    """Return a display-safe token name without changing the raw value."""
     if not isinstance(value, str):
         return None
     cleaned = "".join(
@@ -21,4 +22,3 @@ def clean_token_name(value: object | None) -> str | None:
         if not any(start <= ord(char) <= end for start, end in _BIDI_CONTROL_RANGES)
     ).strip()
     return cleaned or None
-

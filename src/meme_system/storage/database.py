@@ -54,6 +54,7 @@ MIGRATIONS = (
 
 
 def initialize_database(path: Path) -> sqlite3.Connection:
+    """Open a WAL SQLite runtime database and apply pending migrations."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # The realtime position scheduler owns mutations through its coordinator
     # lock but runs on a dedicated thread; permit that shared connection.

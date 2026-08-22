@@ -13,6 +13,8 @@ class SafetyViolation(RuntimeError):
 
 @dataclass(frozen=True)
 class SafetyConfig:
+    """Fail-closed capability switches for wallets, signing, and broadcasts."""
+
     paper_only: bool = True
     live_trading: bool = False
     wallet_enabled: bool = False
@@ -23,7 +25,9 @@ class SafetyConfig:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> "SafetyConfig":
+        """Parse and validate boolean safety switches from a mapping."""
         def read_bool(name: str, default: str) -> bool:
+            """Parse one strict lowercase boolean capability switch."""
             raw = values.get(name, default).strip().lower()
             if raw not in {"true", "false"}:
                 raise SafetyViolation(f"{name} must be true or false")
@@ -43,9 +47,11 @@ class SafetyConfig:
 
     @classmethod
     def from_env(cls) -> "SafetyConfig":
+        """Parse safety switches from the current process environment."""
         return cls.from_mapping(os.environ)
 
     def validate(self) -> None:
+        """Reject incompatible Paper, Shadow, and BSC Live capabilities."""
         if self.paper_only and self.live_trading:
             raise SafetyViolation(
                 "PAPER_ONLY=true conflicts with LIVE_TRADING=true; "

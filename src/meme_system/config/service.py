@@ -41,6 +41,8 @@ FORBIDDEN_KEYS = frozenset({
 
 @dataclass(frozen=True)
 class ConfigVersion:
+    """Versioned snapshot of editable, non-safety runtime settings."""
+
     version: str
     mode: str
     values: Mapping[str, object]
@@ -49,13 +51,17 @@ class ConfigVersion:
 
 
 class ConfigService:
+    """Read and atomically update the whitelisted Paper/Shadow config file."""
+
     def __init__(self, path: Path, *, mode: str) -> None:
+        """Create a service bound to one mode-specific JSON path."""
         if mode not in {"paper", "shadow"}:
             raise ValueError("mode must be paper or shadow")
         self.path = path
         self.mode = mode
 
     def current(self) -> ConfigVersion:
+        """Load the current snapshot or return the immutable initial default."""
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(payload, Mapping) and isinstance(payload.get("values"), Mapping):
@@ -71,6 +77,7 @@ class ConfigService:
         return ConfigVersion("0.1.0", self.mode, {}, "", "initial")
 
     def update(self, values: Mapping[str, object], *, reason: str) -> ConfigVersion:
+        """Validate and atomically persist an editable configuration snapshot."""
         unknown = set(values) - EDITABLE_KEYS
         forbidden = set(values) & FORBIDDEN_KEYS
         if unknown or forbidden:
@@ -85,4 +92,3 @@ class ConfigService:
         temporary.write_text(json.dumps(result.__dict__, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         temporary.replace(self.path)
         return result
-

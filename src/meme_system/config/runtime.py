@@ -9,6 +9,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class RuntimePaths:
+    """Isolated database, audit, health, archive, and lock paths."""
+
     paper_db: Path = Path("data/solana/paper/runtime.db")
     shadow_db: Path = Path("data/solana/shadow/runtime.db")
     paper_audit_log: Path = Path("data/solana/paper/events.jsonl")
@@ -29,10 +31,12 @@ class RuntimePaths:
 
     @classmethod
     def from_env(cls, chain: str = "solana") -> "RuntimePaths":
+        """Resolve chain-specific paths from environment overrides."""
         if chain not in {"solana", "bsc"}:
             raise ValueError("chain must be solana or bsc")
 
         def path(name: str, default: str) -> Path:
+            """Resolve one environment path, falling back when it is blank."""
             value = os.environ.get(name, default).strip()
             return Path(value or default)
 
@@ -99,6 +103,7 @@ class RuntimePaths:
         )
 
     def validate_isolation(self) -> None:
+        """Reject paths that would mix Paper, Shadow, or BSC Live state."""
         pairs = (
             (self.paper_db, self.shadow_db, "databases"),
             (self.paper_audit_log, self.shadow_audit_log, "audit logs"),
